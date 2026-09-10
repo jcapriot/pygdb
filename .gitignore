@@ -1,0 +1,6 @@
+# All real-world sample files are intentionally NOT committed to git.
+# Provenance (exact source URL/DOI/portal, size) for every sample is
+# recorded in NOTES.md and LOG.md so they can be re-downloaded
+# independently.
+samples*
+*.pyc
