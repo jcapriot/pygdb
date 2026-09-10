@@ -1,6 +1,16 @@
-# All real-world sample files are intentionally NOT committed to git.
-# Provenance (exact source URL/DOI/portal, size) for every sample is
-# recorded in NOTES.md and LOG.md so they can be re-downloaded
-# independently.
+# All real-world sample files are intentionally NOT committed to git --
+# we may not have redistribution rights for them. Provenance (exact
+# source URL/DOI/portal, size) for every sample is recorded in
+# docs/provenance/notes.md and docs/provenance/log.md so they can be
+# re-downloaded independently.
 samples*
-*.pyc
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# MkDocs build output
+site/

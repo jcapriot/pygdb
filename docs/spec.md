@@ -4,9 +4,9 @@ This is a **reference document**: it describes the on-disk structure of
 Geosoft's `.gdb` ("Geosoft Database") binary format as currently
 understood, organized by the file's actual pieces rather than by the
 order they were discovered in. It is a distillation, not new research —
-every claim here was already established in `NOTES.md`, and every
-section below cites the `NOTES.md` section(s) with the fuller derivation,
-byte-level evidence, and cross-validation. `LOG.md` has the full
+every claim here was already established in `provenance/notes.md`, and every
+section below cites the `provenance/notes.md` section(s) with the fuller derivation,
+byte-level evidence, and cross-validation. `provenance/log.md` has the full
 chronological research trail (including dead ends) behind that.
 
 This document was produced entirely by clean-room means: vendor-published
@@ -18,7 +18,7 @@ real, publicly downloaded `.gdb` files. No Geosoft software of any kind
 or the free Geosoft Viewer) was installed, imported, or executed at any
 point, in producing this document or anything it's based on.
 
-**Confidence markers** (identical to `NOTES.md` — kept consistent
+**Confidence markers** (identical to `provenance/notes.md` — kept consistent
 deliberately):
 - **[CONFIRMED]** — verified against real file bytes, ideally
   cross-checked against two or more independent files, or independently
@@ -41,8 +41,8 @@ of Queensland, and the Ontario Geological Survey), spanning roughly
 1991–2020, 3+ airborne survey system vendors, file sizes from ~2MB to
 ~1.93GB, and all three `DB_COMP_*` modes — plus one independent, non-Geosoft cross-check via a
 paired `.geoh5` file read with the third-party `geoh5py` library. Full
-provenance for every sample file is in `NOTES.md` §5. A full-corpus
-sanity pass (`NOTES.md` §6.9) ran the complete reader — header,
+provenance for every sample file is in `provenance/notes.md` §5. A full-corpus
+sanity pass (`provenance/notes.md` §6.9) ran the complete reader — header,
 symbol table, blob-chain walk, data decoding, VA/array channels, and
 REG/IPJ registry scan — against all 22 files **together in one run**,
 not just pairwise as each piece was developed: zero exceptions, and it
@@ -67,8 +67,8 @@ scalar channels, one value per fiducial; for **VA/array channels**
 curve, or a 30-layer depth profile).
 
 This conceptual model comes from vendor documentation (S5–S8 in
-`NOTES.md` §1), not from byte analysis — but it's exactly the shape the
-byte-level structure below turned out to have. `NOTES.md` §6.4
+`provenance/notes.md` §1), not from byte analysis — but it's exactly the shape the
+byte-level structure below turned out to have. `provenance/notes.md` §6.4
 independently confirmed **column-major storage**: one channel's data
 for one line sits in one contiguous run on disk, not interleaved
 row-by-row with other channels.
@@ -78,7 +78,7 @@ row-by-row with other channels.
 ## 2. File header
 
 **[CONFIRMED]** magic; **[LIKELY]**/**[UNKNOWN]** for most individual
-fields. Full derivation: `NOTES.md` §6.1.
+fields. Full derivation: `provenance/notes.md` §6.1.
 
 All bytes below are little-endian; all offsets are absolute byte offsets
 from the start of the file.
@@ -87,7 +87,7 @@ from the start of the file.
 |---|---|---|---|---|
 | 0–3 | 4 bytes | Magic, literal ASCII `"!CBD"` (`21 43 42 44`) | **[CONFIRMED]** | Stable across every real file examined (23 files, 3 agencies, ~1991–2020). Meaning of the letters not documented anywhere found — possibly "Compressed Binary Database" or similar, unconfirmed. |
 | 4–15 | 12 bytes | Fixed sub-block, `00 00 00 00 00 00 02 10 08 01 00 00` in the common case | **[LIKELY]** format/version signature | **Real exception, seen twice, both times identical:** bytes 8–11 read `f0 f0 f0 f0` instead of zero in `DB_Mag_Elaine_1003.gdb` and `East_Isa_VTEM_Inversion.gdb` — two unrelated real deliveries. **[UNKNOWN]** what it means; recurring rather than a one-off, so plausibly a real second format-version tag. |
-| 24 | int32 | `chans_max` — channel-table capacity | **[CONFIRMED]** | Proven by the `SUPER`-anchor structural test (§3.1 below / `NOTES.md` §6.2), not just by matching a documented default. |
+| 24 | int32 | `chans_max` — channel-table capacity | **[CONFIRMED]** | Proven by the `SUPER`-anchor structural test (§3.1 below / `provenance/notes.md` §6.2), not just by matching a documented default. |
 | 40 | int32 | `users_max` — user-table capacity | **[LIKELY]** | Matches the documented default (`users=10`) in every real file seen; not independently structurally proven the way `chans_max` was. |
 | 100 | int32 | `page_size` — the paging stride used elsewhere in the file (§5, §6) | **[LIKELY]**, but strongly corroborated | Matches the documented normal value (1024) in most real files; the compressed files seen use larger values (e.g. 32768), which independently turned out to be the real on-disk paging stride for those files (§6) — strong indirect confirmation. |
 | 104 | int32 | Unconfirmed — a candidate for "index size" or similar | **[UNKNOWN]** | A red herring for the specific question of where the blob region starts (that's offset 108, not 104) — this value sits *close to* but not exactly on the end of the symbol-table region. Not otherwise resolved. |
@@ -104,7 +104,7 @@ known.
 ## 3. The symbol table
 
 **[CONFIRMED]** as the strongest single structural result on `.gdb`
-itself. Full derivation: `NOTES.md` §6.2, §6.2b, §6.3.
+itself. Full derivation: `provenance/notes.md` §6.2, §6.2b, §6.3.
 
 ### 3.0 Shared structure
 
@@ -112,19 +112,19 @@ Channel records, line records, and user records all share one
 mechanism: a sequence of **fixed 128-byte records** — **[CONFIRMED]**,
 the same stride confirmed for all three record kinds. The vendor's own
 published enum (`DB_SYMB_BLOB=0, DB_SYMB_LINE=1, DB_SYMB_CHAN=2,
-DB_SYMB_USER=3`, `NOTES.md` §2) is consistent with this being one
+DB_SYMB_USER=3`, `provenance/notes.md` §2) is consistent with this being one
 unified symbol-table scheme with (at least) four symbol *kinds*, of
 which only the LINE, CHAN, and USER regions have been located and
 decoded — the BLOB (0) kind has only been observed as an *unrelated*
 embedded projection dictionary at a different, 4096-byte stride
-(`NOTES.md` §2.3 in `LOG.md`); it is **not** the same thing as the data
+(`provenance/notes.md` §2.3 in `provenance/log.md`); it is **not** the same thing as the data
 "blobs" in §6 of this document, despite the name collision (Geosoft's
 own terminology overloads "blob" for both).
 
 **[CONFIRMED]**: the channel table is immediately followed by the user
 table (`chans_max` 128-byte channel records, then `users_max` 128-byte
 user records) — this exact adjacency was the single cleanest structural
-proof in the whole project (`NOTES.md` §6.2): the default super-user
+proof in the whole project (`provenance/notes.md` §6.2): the default super-user
 name (`"SUPER"` or, in some real files, lowercase `"super"` — both seen)
 sits at `channel_table_start + chans_max × 128`, and walking backward
 from it by `chans_max × 128` bytes lands exactly on the file's real
@@ -150,13 +150,13 @@ cleanly zeroed in some real files (the 2020 USGS samples) but to hold
 genuine leftover/uninitialized binary garbage in others (several real
 1990s GSQ files) — a real reader must sanity-check candidate records
 (NUL-terminated printable name; `dtype`/`format` codes in known valid
-ranges) rather than assume clean padding. See `NOTES.md` §6.2 for the
+ranges) rather than assume clean padding. See `provenance/notes.md` §6.2 for the
 real false-positive case this guards against.
 
 ### 3.2 Line record layout (128 bytes)
 
 **[CONFIRMED]** existence, stride, and two fields; **[UNKNOWN]** the
-rest of the layout. `NOTES.md` §6.3.
+rest of the layout. `provenance/notes.md` §6.3.
 
 | Rel. offset | Type | Field | Status |
 |---|---|---|---|
@@ -169,7 +169,7 @@ table, and — critically — this slot number is exactly the
 `line_slot_index` used in the blob-addressing formula in §6.2.
 **[CONFIRMED]** directly: physical slot 0 of the line table holds a
 real survey's actual first line name, verified independently on
-multiple real files (`NOTES.md` §6.6/§6.6d).
+multiple real files (`provenance/notes.md` §6.6/§6.6d).
 
 ### 3.3 User record layout (128 bytes)
 
@@ -180,13 +180,13 @@ both are the same structure, not a format difference). A user record
 was also observed to carry what looks like a **UTF-16LE-encoded
 embedded Windows file path** (the database's own creation path)
 immediately after the short ASCII username field — **[UNKNOWN]**,
-observed once, not investigated further (`LOG.md` Session 2 §2.3).
+observed once, not investigated further (`provenance/log.md` Session 2 §2.3).
 
 ---
 
 ## 4. Data types, formats, and dummy values
 
-Directly from vendor-published source (`NOTES.md` §2, source S3) —
+Directly from vendor-published source (`provenance/notes.md` §2, source S3) —
 **[CONFIRMED]** as literal values by definition, and independently
 **[CONFIRMED]** to appear verbatim as real on-disk type/format codes.
 
@@ -225,7 +225,7 @@ Display format codes (channel record offset `+92`):
 | 5 | `SIGDIG` |
 | 6 | `HEX` |
 
-Dummy/no-data sentinel values (vendor-published, `NOTES.md` §2) —
+Dummy/no-data sentinel values (vendor-published, `provenance/notes.md` §2) —
 **[CONFIRMED]** to appear verbatim in real decoded data:
 
 | Type | Dummy value |
@@ -242,7 +242,7 @@ Dummy/no-data sentinel values (vendor-published, `NOTES.md` §2) —
 ## 5. VA / array channels
 
 **[CONFIRMED]**, independently cross-validated against a public,
-non-Geosoft standard. `NOTES.md` §6.2b.
+non-Geosoft standard. `provenance/notes.md` §6.2b.
 
 A channel can store a fixed-size **vector** of values per fiducial
 rather than a single scalar. This is marked by the int16 field at
@@ -284,7 +284,7 @@ rising to a peak, then a smooth realistic decay — and `row_count`
 (145,408) is exactly `284 stations × 512 channels`. This channel pair
 sat unnoticed (logged only as an ordinary scalar `GS_USHORT` channel)
 from Session 1 until a full-corpus sanity pass re-decoded every
-channel of every file at once (`NOTES.md` §6.9). No layout difference
+channel of every file at once (`provenance/notes.md` §6.9). No layout difference
 from the `GS_DOUBLE`/`GS_FLOAT` case was needed to decode it correctly
 — same `array_width` field, same flattened `row_count × array_width`
 storage. **Open gap:** a string array channel has still not been
@@ -297,7 +297,7 @@ found in any real sample.
 This is the format's core random-access mechanism, and the single
 biggest structural question this project answered. **[CONFIRMED]**
 end-to-end, for locating data in **every** compression mode.
-`NOTES.md` §6.6/§6.6b/§6.6d.
+`provenance/notes.md` §6.6/§6.6b/§6.6d.
 
 ### 6.1 The addressing formula
 
@@ -388,7 +388,7 @@ reserved/"current value" cache, possibly related to the vendor's
 
 **[CONFIRMED]** for all three modes: which algorithm, exact on-disk
 framing, and (for the common single- and multi-page cases) full
-decoding verified against real ground truth. `NOTES.md` §3, §6.5,
+decoding verified against real ground truth. `provenance/notes.md` §3, §6.5,
 §6.5b–f, §6.6b, §6.6d.
 
 The header's `comp_level` field (§2, offset 120) declares one of:
@@ -527,7 +527,7 @@ actually compressed with it.
 ## 8. Coordinate-system (IPJ) metadata
 
 **[CONFIRMED]** located; **[UNKNOWN]** for the full record format.
-`NOTES.md` §6.7.
+`provenance/notes.md` §6.7.
 
 Per-database map-projection metadata is **not** a separate structure —
 it lives inside the same "reserved/administrative blob" mechanism
@@ -587,7 +587,7 @@ northing at consecutive small byte deltas).
 ## 9. The `"REG "` registry: settings and processing-history log
 
 **[CONFIRMED]** rich real content, on all 3 agencies this project has
-files from; **[UNKNOWN]** exact binary framing. `NOTES.md` §6.8.
+files from; **[UNKNOWN]** exact binary framing. `provenance/notes.md` §6.8.
 
 The majority of "reserved/administrative" blobs (§6.4, §8) are *not*
 `IPJ` records — they start with a different 4-byte FourCC-style tag,
@@ -655,7 +655,7 @@ on every agency checked:
   some files, not a miss for the format as a whole.
 
 **Not universal — a real, patterned absence, not a scan artifact.** A
-full-corpus pass across all 22 real files (`NOTES.md` §6.9, every
+full-corpus pass across all 22 real files (`provenance/notes.md` §6.9, every
 blob-chain fully walked, no scan-depth cap) found **zero** REG or IPJ
 blobs at all in: the three 1991 Questem-era Mount Gordon files; two
 Melinda Downs magnetic-data files whose **AGG siblings from the
@@ -679,7 +679,7 @@ unidentified third administrative-blob tag variant (neither `REG `/
 
 ## 10. Cross-validated across an independent, non-Geosoft format
 
-**[CONFIRMED]**, `NOTES.md` §6.6c. A real `.gdb`/`.geoh5` pair for the
+**[CONFIRMED]**, `provenance/notes.md` §6.6c. A real `.gdb`/`.geoh5` pair for the
 same delivery was cross-checked: `.geoh5` is Seequent's newer, openly
 HDF5-specified successor container, read here via the independent
 open-source `geoh5py` library (Mira Geoscience, LGPL-3.0-or-later —
@@ -724,20 +724,20 @@ but their actual meaning is genuinely **[UNKNOWN]**:
 A working Python reader implementing everything marked **[CONFIRMED]**
 above lives in this repository:
 
-- `reader/gdb_reader.py` — header parsing, full symbol-table decode
+- `pygdb/gdb_reader.py` — header parsing, full symbol-table decode
   (channels, with VA/array width; lines), and the complete blob-index
   reader: `blob_region_start()`, `iter_blobs()`, `find_blob(line_slot,
   channel_slot)`, `read_blob_values()` (handles all three compression
   modes, single- and multi-page, and auto-detects the "bare blob"
   variant).
-- `reader/lzrw1.py` — the from-scratch canonical LZRW1 decoder
+- `pygdb/lzrw1.py` — the from-scratch canonical LZRW1 decoder
   (`DB_COMP_SPEED`), including both the compressed and stored-raw
   chunk cases.
-- `reader/grd_reader.py` — a fully solved reader for the sibling `.grd`
+- `pygdb/grd_reader.py` — a fully solved reader for the sibling `.grd`
   grid format (not `.gdb`, but the same container family, and the
   first place the shared 16-byte page-primitive magic was found).
 
-Run `python reader/gdb_reader.py <path-to.gdb>` for a demo: header
+Run `python -m pygdb.gdb_reader <path-to.gdb>` for a demo: header
 fields, the full channel list, and a decoded sample of real data from
 the blob chain.
 
@@ -754,7 +754,7 @@ well-defined `LZRW1DecodeError` for an undecodable chunk rather than a
 bare `AssertionError`/`IndexError`. Verified directly against
 deliberately truncated/corrupted real files, and against the full
 22-file corpus (unchanged output, zero spurious warnings). See
-`NOTES.md` section 6.10.
+`provenance/notes.md` section 6.10.
 
 ---
 
@@ -767,5 +767,5 @@ describes reading an existing file only.
 Also not attempted or only partially done: full decoding of the
 REG/coordinate-system record format beyond what §8 covers, and full
 decoding of the line-table record layout beyond the two fields in
-§3.2. See `NOTES.md`'s "Natural next steps" section for the current,
+§3.2. See `provenance/notes.md`'s "Natural next steps" section for the current,
 prioritized view on what (if anything) is worth pursuing next.

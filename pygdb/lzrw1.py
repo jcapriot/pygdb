@@ -5,7 +5,7 @@ public-domain reference C source
 explicitly marked "This code is public domain" in its own header
 comment), used here to decode Geosoft `.gdb` DB_COMP_SPEED page data.
 
-[CONFIRMED] finding (see ../NOTES.md section 6.5c/6.5d for the full
+[CONFIRMED] finding (see ../docs/provenance/notes.md section 6.5c/6.5d for the full
 derivation): Geosoft's DB_COMP_SPEED mode wraps *exactly* Ross Williams'
 canonical LZRW1 byte stream -- the same 2-byte control word + 1-byte
 literal / 2-byte nibble-packed copy-item scheme as his original
@@ -158,7 +158,7 @@ class LZRW1DecodeError(Exception):
     `struct.error` grab-bag) so callers -- notably
     `gdb_reader.read_blob_values` -- can catch exactly this and fail
     gracefully (return whatever was already decoded elsewhere, emit a
-    clear warning) instead of crashing. See NOTES.md's "reader
+    clear warning) instead of crashing. See docs/provenance/notes.md's "reader
     robustness" notes for the design rationale; this reader is not meant
     to hard-crash on a truncated download or an unrecognized real-world
     variant, per an explicit engineering request from the coordinator.

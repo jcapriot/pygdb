@@ -6,10 +6,11 @@ tables, and reads real channel data for every compression mode
 (DB_COMP_NONE, DB_COMP_SPEED/LZRW1, DB_COMP_SIZE/zlib, single- or
 multi-page blobs, and the "bare"/uncompressed-blob-inside-a-compressed-
 file variant) via iter_blobs()/find_blob()/read_blob_values() -- see
-NOTES.md sections 6.6/6.6b/6.6d for the full derivation. Still open:
-REG/IPJ registry content is only partially decoded (section 6.7/6.8),
-and a handful of header/record fields remain [UNKNOWN] -- see
-../NOTES.md and ../SPEC.md for the complete, current picture.
+docs/provenance/notes.md sections 6.6/6.6b/6.6d for the full derivation.
+Still open: REG/IPJ registry content is only partially decoded (section
+6.7/6.8), and a handful of header/record fields remain [UNKNOWN] -- see
+docs/spec.md and docs/provenance/notes.md for the complete, current
+picture.
 
 Robustness: this reader is designed to degrade gracefully rather than
 hard-crash on a blob/chunk/record it can't parse -- a truncated file
@@ -20,14 +21,15 @@ structure. Functions return whatever they successfully decoded up to
 the point of trouble (an empty list/dict in the worst case) rather than
 raising, and always pair that with a `GDBParseWarning` (see its
 docstring) identifying what couldn't be decoded and why. This is a
-deliberate engineering choice, not new format research -- see NOTES.md
-for the design rationale and LOG.md for when/why it was added.
+deliberate engineering choice, not new format research -- see docs/provenance/notes.md
+for the design rationale and docs/provenance/log.md for when/why it was added.
 
-Confidence markers below mirror ../NOTES.md: [CONFIRMED] = verified
-against two independent real files with a falsifiable structural test;
-[LIKELY] = passed one real test but not independently cross-checked;
-[GUESS] = plausible pattern, not tested; values otherwise unlabeled in
-comments are the [UNKNOWN] raw offsets, kept for whoever continues this.
+Confidence markers below mirror docs/provenance/notes.md: [CONFIRMED] =
+verified against two independent real files with a falsifiable
+structural test; [LIKELY] = passed one real test but not independently
+cross-checked; [GUESS] = plausible pattern, not tested; values otherwise
+unlabeled in comments are the [UNKNOWN] raw offsets, kept for whoever
+continues this.
 
 Every numeric constant used for interpretation (GS_* type codes,
 DB_CHAN_FORMAT_*, DB_SYMB_NAME_SIZE, etc.) comes from reading Geosoft's
@@ -46,8 +48,9 @@ import warnings
 import zlib
 from dataclasses import dataclass
 
-import lzrw1 as _lzrw1
 from typing import List, Optional
+
+from . import lzrw1 as _lzrw1
 
 
 class GDBParseWarning(RuntimeWarning):
@@ -64,7 +67,7 @@ class GDBParseWarning(RuntimeWarning):
     an empty result) instead of raising, and a `GDBParseWarning`
     describing what couldn't be decoded and why is always issued
     alongside, so a caller can tell a clean, complete result from a
-    partial one and go investigate. See NOTES.md's "reader robustness"
+    partial one and go investigate. See docs/provenance/notes.md's "reader robustness"
     notes for the design rationale (an explicit engineering request,
     not new format research).
 
@@ -82,7 +85,7 @@ def _warn(msg: str) -> None:
 MAGIC = b"!CBD"
 # The 16-byte header opening was found byte-identical across both real
 # sample files (Magnetic_Data.gdb and Radiometric_Data.gdb) -- see
-# NOTES.md 6.1. Treated here as a fixed format/version signature.
+# docs/provenance/notes.md 6.1. Treated here as a fixed format/version signature.
 HEADER_SIGNATURE = bytes.fromhex("21434244000000000000021008010000".replace(" ", ""))[:16]
 
 SYMBOL_RECORD_SIZE = 128  # [CONFIRMED] -- constant stride of every symbol
@@ -110,7 +113,7 @@ GS_TYPE_NAMES = {
 }
 
 # numpy-less struct format codes for each GS_* type, for whoever wants to
-# extend this to actually decode data once the indexing question (NOTES.md
+# extend this to actually decode data once the indexing question (docs/provenance/notes.md
 # section 6.4/8) is solved.
 GS_TYPE_STRUCT = {
     0: "b",   # GS_BYTE (signed, per GS_S1* constants)
@@ -137,7 +140,7 @@ DB_CHAN_FORMAT_NAMES = {
 
 # Vendor-published DB_ARRAY_BASETYPE_* constants (geosoft/gxapi/__init__.py).
 # [LIKELY] match for the int16 field at relative offset +86 -- see
-# NOTES.md "VA / array channels" section. Confirmed to hold value 1
+# docs/provenance/notes.md "VA / array channels" section. Confirmed to hold value 1
 # (TIME_WINDOWS) on real multi-gate TEM decay-curve array channels, but
 # also seen as a constant non-zero value across *every* channel (including
 # obviously-scalar ones) in three older real files, so treat this field's
@@ -173,10 +176,10 @@ class ChannelRecord:
                               # file's plain-text ASCII sibling (.dfn) format,
                               # which spells out "30F10.4" (Fortran-style: 30
                               # repetitions of a float field) for the exact same
-                              # channel name -- see NOTES.md.
+                              # channel name -- see docs/provenance/notes.md.
     array_basetype_code: int = 0  # [LIKELY] relative offset +86, int16.
     name_is_clean: bool = True  # False = name field was NUL-unterminated / had
-                                 # non-printable bytes -- see NOTES.md re: older
+                                 # non-printable bytes -- see docs/provenance/notes.md re: older
                                  # (pre-2020, e.g. 1990s GEOTEM) files sometimes
                                  # leaving unused capacity slots un-zeroed rather
                                  # than clean, unlike the 2020 USGS samples.
@@ -215,7 +218,7 @@ class ChannelRecord:
         """
         Heuristic sanity check distinguishing a real channel record from
         leftover-garbage bytes that happen to decode a clean printable
-        name (observed for real in DB_Mag_833.gdb -- see NOTES.md). Real
+        name (observed for real in DB_Mag_833.gdb -- see docs/provenance/notes.md). Real
         records seen so far always have dtype either a known GS_* code
         (0-13) or a small negative string width, and a format code in the
         known DB_CHAN_FORMAT_* range (0-6).
@@ -262,7 +265,7 @@ def check_magic(data: bytes) -> bool:
     file is otherwise structurally normal (chans_max/users_max/page_size
     all decode sanely), so this looks like a real, if rare, variation in
     that sub-block rather than a different format entirely -- flagged
-    [UNKNOWN] in NOTES.md. Only the 4-byte magic is treated as a hard
+    [UNKNOWN] in docs/provenance/notes.md. Only the 4-byte magic is treated as a hard
     requirement here; the rest of the signature is reported separately.
     """
     return data[:4] == MAGIC
@@ -276,7 +279,7 @@ def magic_signature_matches_common_case(data: bytes) -> bool:
 def header_fields(data: bytes) -> dict:
     """
     Extract the header int32 fields whose approximate meaning we have
-    some confidence in. See NOTES.md section 6.1 for the full table
+    some confidence in. See docs/provenance/notes.md section 6.1 for the full table
     including the still-unknown offsets, and for why each confidence
     label was assigned.
 
@@ -299,7 +302,7 @@ def header_fields(data: bytes) -> dict:
             )
             result[name] = None
     # comp_level==1 (DB_COMP_SPEED) does NOT mean the payload is zlib --
-    # confirmed it is NOT (NOTES.md section 6.5b), it's canonical LZRW1
+    # confirmed it is NOT (docs/provenance/notes.md section 6.5b), it's canonical LZRW1
     # (section 6.5c). comp_level==2 (DB_COMP_SIZE) IS confirmed real zlib.
     return result
 
@@ -325,7 +328,7 @@ def find_channel_table(data: bytes, search_window=(0, None)) -> int:
 
     Strategy [CONFIRMED against 2 real 2020 USGS files, RE-CONFIRMED --
     with one revision -- against 5 more real 1990s-2020s GSQ files, see
-    NOTES.md/LOG.md "pressure test" round]: search for the default
+    docs/provenance/notes.md/docs/provenance/log.md "pressure test" round]: search for the default
     super-user name (from GXDB.create()'s documented default
     `super="SUPER"`). The channel table is found to occupy exactly
     `chans_max` consecutive 128-byte records immediately before the user
@@ -395,7 +398,7 @@ def read_channels(path: str) -> List[ChannelRecord]:
     with open(path, "rb") as f:
         # Reading the whole file is wasteful for a 700MB+ real survey
         # database, but the symbol table's exact byte extent isn't fully
-        # pinned down yet (NOTES.md 6.1), so for correctness this reads
+        # pinned down yet (docs/provenance/notes.md 6.1), so for correctness this reads
         # generously. A production version should read a memory-mapped
         # view instead -- left as a TODO once the header's table-size
         # field (offset 104, currently [UNKNOWN]) is confirmed.
@@ -443,7 +446,7 @@ def read_channels(path: str) -> List[ChannelRecord]:
         if not rec.name_is_clean:
             # Unused capacity slot with leftover/uninitialized bytes rather
             # than a clean NUL name -- observed in at least one real 1990s
-            # file (see _read_name docstring / NOTES.md). Not a real channel.
+            # file (see _read_name docstring / docs/provenance/notes.md). Not a real channel.
             continue
         if not rec.looks_sane:
             # A NUL-terminated printable "name" can still show up by pure
@@ -453,19 +456,19 @@ def read_channels(path: str) -> List[ChannelRecord]:
             # to land in unused channel-table capacity). Real channel
             # records always have a dtype matching a known GS_* code or a
             # small negative string width, and a format code in the known
-            # DB_CHAN_FORMAT_* range -- garbage doesn't. See NOTES.md.
+            # DB_CHAN_FORMAT_* range -- garbage doesn't. See docs/provenance/notes.md.
             continue
         channels.append(rec)
     return channels
 
 
 BLOB_MAGIC = b"\xcc\xcc\x00\xff"
-BLOB_HEADER_SIZE = 48  # [CONFIRMED] -- see NOTES.md section 6.6
+BLOB_HEADER_SIZE = 48  # [CONFIRMED] -- see docs/provenance/notes.md section 6.6
 
-# [CONFIRMED] (NOTES.md section 6.6b): for COMPRESSED blobs specifically
+# [CONFIRMED] (docs/provenance/notes.md section 6.6b): for COMPRESSED blobs specifically
 # (DB_COMP_SPEED or DB_COMP_SIZE), the blob header is 56 bytes, not 48 --
 # the extra 8 bytes hold a preview of the first chunk's decompressed
-# length and total on-disk span (not fully decoded, see NOTES.md section
+# length and total on-disk span (not fully decoded, see docs/provenance/notes.md section
 # 6.5e). The already-known 16-byte page-primitive chunk magic
 # (lzrw1.CHUNK_MAGIC) sits immediately after these 56 bytes, verified
 # directly against real ground truth on AG106386 (DB_COMP_SIZE): the
@@ -481,7 +484,7 @@ class BlobHeader:
     The per-channel-per-line data block header. [CONFIRMED] for fields
     up to and including `blob_index` (verified byte-exact on 5 real
     DB_COMP_NONE files via a whole-file, zero-error chain walk that
-    lands exactly on each file's true size -- see NOTES.md section 6.6).
+    lands exactly on each file's true size -- see docs/provenance/notes.md section 6.6).
     Fields from `timestamp` onward are only [LIKELY]/[UNKNOWN] and are
     known NOT to decode sensibly at these byte offsets in at least one
     real older (1991 GSQ) file -- kept here for the modern (2020 USGS)
@@ -503,11 +506,11 @@ class BlobHeader:
     def line_channel(self, chans_max: int):
         """
         Decompose blob_index into (line_slot_index, channel_slot_index)
-        via the formula [CONFIRMED] in NOTES.md section 6.6:
+        via the formula [CONFIRMED] in docs/provenance/notes.md section 6.6:
             blob_index == line_slot_index * chans_max + channel_slot_index
         Both are 0-based physical slot numbers in their respective
         symbol tables (same indexing as ChannelRecord.index and the
-        line table walked ad hoc in NOTES.md section 6.3).
+        line table walked ad hoc in docs/provenance/notes.md section 6.3).
         """
         return divmod(self.blob_index, chans_max)
 
@@ -540,7 +543,7 @@ def blob_region_start(data: bytes) -> Optional[int]:
     Absolute byte offset of the first real blob header.
 
     [CONFIRMED] on 20+ real files (every compression mode, chans_max
-    20-500, ~1991-2020, all 3 agencies) -- see NOTES.md section 6.6/
+    20-500, ~1991-2020, all 3 agencies) -- see docs/provenance/notes.md section 6.6/
     6.6b. Header offset 108 (int32) is a PAGE NUMBER; multiplying by
     page_size (header offset 100) lands exactly on the CC CC 00 FF
     magic every time. (Header offset 104, an earlier "live lead" for
@@ -573,7 +576,7 @@ def iter_blobs(path: str, max_blobs: Optional[int] = None):
     [CONFIRMED] end-to-end (zero framing errors, landing exactly on the
     true file size) on 20 real files spanning all 3 agencies this
     project has files from and all three `DB_COMP_*` compression modes,
-    2MB to 1.93GB -- see NOTES.md section 6.6b/6.6d/6.9.
+    2MB to 1.93GB -- see docs/provenance/notes.md section 6.6b/6.6d/6.9.
 
     As a generator, this already "returns partial results" in the most
     natural way possible: whatever's been yielded before a problem is
@@ -638,7 +641,7 @@ def iter_blobs(path: str, max_blobs: Optional[int] = None):
                         f"the chain walk here and returning the {n} blob(s) "
                         f"already yielded; this may be a real structural "
                         f"anomaly or an administrative-blob variant not yet "
-                        f"understood (NOTES.md section 6.4/6.9)"
+                        f"understood (docs/provenance/notes.md section 6.4/6.9)"
                     )
                 return
             if blob.n_pages <= 0:
@@ -687,7 +690,7 @@ def iter_blobs(path: str, max_blobs: Optional[int] = None):
             # Loop condition failed (off + 48 > size) but we're not exactly
             # at the true end either -- real leftover bytes, less than one
             # full header's worth. Every real file checked in this project
-            # (NOTES.md section 6.6b/6.9) ends with an EXACT match, so any
+            # (docs/provenance/notes.md section 6.6b/6.9) ends with an EXACT match, so any
             # slack here is new/unusual and worth flagging, not silently
             # accepted.
             _warn(
@@ -704,7 +707,7 @@ def find_blob(path: str, line_slot: int, channel_slot: int, chans_max: Optional[
     """
     Locate the blob for a specific (line, channel) pair by walking the
     chain (see iter_blobs) and computing the target blob_index via the
-    formula [CONFIRMED] in NOTES.md section 6.6. Returns `None` if the
+    formula [CONFIRMED] in docs/provenance/notes.md section 6.6. Returns `None` if the
     chain ends (or breaks -- see `iter_blobs`'s `GDBParseWarning`s for
     why) before the target is found, or if `chans_max` can't be
     determined at all (bad magic / truncated header) -- never raises
@@ -741,7 +744,7 @@ def _element_width(channel: ChannelRecord) -> Optional[int]:
     type this reader doesn't know how to decode -- e.g. one of the
     multi-dimensional `GS_FLOAT3D`/`GS_DOUBLE3D`/`GS_FLOAT2D`/
     `GS_DOUBLE2D` types, none of which have been seen in any real
-    sample yet (NOTES.md section 4). Callers should check for `None`
+    sample yet (docs/provenance/notes.md section 4). Callers should check for `None`
     and warn/return gracefully rather than assume a format exists.
     """
     if channel.is_string:
@@ -795,10 +798,10 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
                       comp_level: int = 0, page_size: Optional[int] = None):
     """
     Decode a found blob's real row data using the owning channel's
-    already-known type (from the symbol table, NOTES.md section 6.2).
+    already-known type (from the symbol table, docs/provenance/notes.md section 6.2).
 
     [CONFIRMED] against real ground truth for GS_DOUBLE data and for
-    fixed-width strings, for DB_COMP_NONE (NOTES.md section 6.6: a real
+    fixed-width strings, for DB_COMP_NONE (docs/provenance/notes.md section 6.6: a real
     `fid` blob decoded this way reproduces the exact CSV ground-truth
     value, and a real `line`-channel blob decodes to the correct real
     line name repeated once per row).
@@ -809,18 +812,18 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
     DB_COMP_SIZE (a real single-page blob_index=0 decodes to the known
     constant 5027; a real 36-page array-channel blob decodes to
     `LEI_Depth`'s exact known real depth profile, `0.0, 3.0, 6.3, 9.9,
-    ...`, repeated once per station -- both matching NOTES.md section
+    ...`, repeated once per station -- both matching docs/provenance/notes.md section
     6.5/6.2b's independently-established ground truth exactly) and for
     both single- and multi-page DB_COMP_SPEED (a real 2-page
     `Northing_AMGz55` blob decodes to sane real coordinates with real
-    `rDUMMY` sentinels). See NOTES.md section 6.6d: a multi-page blob is
+    `rDUMMY` sentinels). See docs/provenance/notes.md section 6.6d: a multi-page blob is
     simply one continuous compressed stream spanning the whole
     `n_pages*page_size` span, not one independently-framed chunk per
     page -- no special multi-page logic was actually needed once this
     was verified, just reading the full span instead of one page.
 
     **A real third on-disk variant, auto-detected here rather than
-    assumed away (NOTES.md section 6.6b):** even inside a file that
+    assumed away (docs/provenance/notes.md section 6.6b):** even inside a file that
     genuinely declares (and elsewhere uses) DB_COMP_SPEED, some
     individual blobs turn out to carry no chunk wrapper at all -- just
     the plain 48-byte DB_COMP_NONE-style header with real, directly
@@ -834,7 +837,7 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
     decodes the blob exactly like a DB_COMP_NONE one.
 
     **Fails gracefully, per an explicit engineering request:** a
-    negative `row_count` (a reserved/administrative blob, NOTES.md
+    negative `row_count` (a reserved/administrative blob, docs/provenance/notes.md
     section 6.4/6.9, not real data), a channel type this reader can't
     decode, a truncated read (file cut off mid-blob), an unrecognized
     chunk subtype, or a chunk that fails to decompress (corrupt/
@@ -855,7 +858,7 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
             _warn(
                 f"blob_index={blob.blob_index}: negative row_count "
                 f"({blob.row_count}) -- this is one of the reserved/"
-                f"administrative blobs flagged [UNKNOWN] in NOTES.md "
+                f"administrative blobs flagged [UNKNOWN] in docs/provenance/notes.md "
                 f"section 6.4/6.9, not a real data blob; returning no values"
             )
             return []
@@ -872,7 +875,7 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
         return _decode_numeric_or_string(raw, channel, blob.row_count)
 
     # comp_level != 0: could still be any of three real on-disk variants
-    # (NOTES.md section 6.6b) -- check which one this specific blob
+    # (docs/provenance/notes.md section 6.6b) -- check which one this specific blob
     # actually is rather than assuming from the file-level comp_level.
     with open(path, "rb") as f:
         f.seek(blob.offset + COMPRESSED_BLOB_HEADER_SIZE)
@@ -893,7 +896,7 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
             _warn(
                 f"blob_index={blob.blob_index}: negative row_count "
                 f"({blob.row_count}) -- this is one of the reserved/"
-                f"administrative blobs flagged [UNKNOWN] in NOTES.md "
+                f"administrative blobs flagged [UNKNOWN] in docs/provenance/notes.md "
                 f"section 6.4/6.9, not a real data blob; returning no values"
             )
             return []
@@ -911,7 +914,7 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
 
     # Compressed (DB_COMP_SPEED / DB_COMP_SIZE): 56-byte blob header,
     # then the shared 16-byte page-primitive chunk magic -- see
-    # COMPRESSED_BLOB_HEADER_SIZE and NOTES.md section 6.6b/6.6d.
+    # COMPRESSED_BLOB_HEADER_SIZE and docs/provenance/notes.md section 6.6b/6.6d.
     #
     # Multi-page blobs (blob.n_pages > 1) are [CONFIRMED] (section 6.6d)
     # to be a SINGLE continuous compressed stream spanning the whole
@@ -987,7 +990,7 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) != 2:
-        print("usage: python gdb_reader.py <path-to.gdb>")
+        print("usage: python -m pygdb.gdb_reader <path-to.gdb>")
         raise SystemExit(1)
 
     path = sys.argv[1]
@@ -998,7 +1001,7 @@ if __name__ == "__main__":
     elif not magic_signature_matches_common_case(header):
         print(
             "NOTE: '!CBD' magic OK, but bytes 8-15 differ from the common "
-            f"case (got {header[4:16].hex()}) -- see NOTES.md, seen once before"
+            f"case (got {header[4:16].hex()}) -- see docs/provenance/notes.md, seen once before"
         )
     fields = header_fields(header)
     print(f"header fields: {fields}")
@@ -1021,7 +1024,7 @@ if __name__ == "__main__":
     print(
         f"\nWalking the blob chain (comp_level={comp_level}) looking for "
         "the first blob that decodes to real data (the first few are "
-        "often reserved/administrative ones, see NOTES.md section 6.6)..."
+        "often reserved/administrative ones, see docs/provenance/notes.md section 6.6)..."
     )
     shown = 0
     for blob in iter_blobs(path, max_blobs=50):
@@ -1050,5 +1053,5 @@ if __name__ == "__main__":
     print(
         "\nUse iter_blobs()/find_blob()/read_blob_values() to read real "
         "channel data for any (line, channel) pair, single- or multi-page, "
-        "any compression mode -- see NOTES.md section 6.6/6.6b/6.6d."
+        "any compression mode -- see docs/provenance/notes.md section 6.6/6.6b/6.6d."
     )

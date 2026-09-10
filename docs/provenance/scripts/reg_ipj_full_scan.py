@@ -1,6 +1,5 @@
 import glob, os, re, struct, sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "reader"))
-import gdb_reader as G
+from pygdb import gdb_reader as G
 
 def reg_ipj_scan_full(path, chans_max, page_size):
     n_reg = n_ipj = n_other = 0

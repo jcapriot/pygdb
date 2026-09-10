@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# Distribution name is "python-gdb" (PyPI already has an unrelated
+# package named "pygdb" -- a GNU Debugger extension), but the
+# importable package is still named "pygdb": `pip install python-gdb`,
+# then `import pygdb`.
+[project]
+name = "python-gdb"
+version = "0.1.0"
+description = "A clean-room Python reader for Geosoft .gdb database and .grd grid files"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Joseph Capriotti", email = "josephrcapriotti@gmail.com" },
+]
+requires-python = ">=3.12"
+dependencies = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+docs = [
+    "zensical",
+]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.setuptools]
+packages = ["pygdb"]

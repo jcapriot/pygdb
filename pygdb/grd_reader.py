@@ -10,7 +10,7 @@ Derived entirely from public information:
     per-block sub-header / zlib streams): reverse-derived and verified in
     this project by diffing a real compressed .grd against the byte-exact
     real uncompressed version of the same grid (see
-    ../samples/loop3d_grd_test/ and ../NOTES.md section 4). This
+    ../samples/loop3d_grd_test/ and ../docs/provenance/notes.md section 4). This
     implementation decompresses each block and checks the result matches
     exactly what the vendor's own documentation and the third-party
     reader implied it should -- confirmed byte-for-byte against real
@@ -56,7 +56,7 @@ _VALID_ES = (1, 2, 4, 8, 1024 + 1, 1024 + 2, 1024 + 4, 1024 + 8)
 
 # Dummy (no-data) sentinel per element type. These match the GS_*DM
 # constants read from Geosoft's own published geosoft/gxapi/__init__.py
-# (see ../NOTES.md section 2) -- an independent cross-check between two
+# (see ../docs/provenance/notes.md section 2) -- an independent cross-check between two
 # unrelated public sources (Geosoft's generated constants, and the
 # Loop3D reader's own from-scratch table) that agree exactly.
 _DUMMIES = {
@@ -154,7 +154,7 @@ def _decompress_body(body: bytes) -> bytes:
 
     Layout (all confirmed by round-tripping a real compressed file to an
     exact byte-for-byte match against its real uncompressed twin -- see
-    ../NOTES.md section 4):
+    ../docs/provenance/notes.md section 4):
 
       offset 0..7   : 8-byte signature/comp-type field (not decoded)
       offset 8      : n_blocks            (int32)
@@ -176,7 +176,7 @@ def _decompress_body(body: bytes) -> bytes:
                     length confirmed exactly (skipping exactly 16 bytes
                     always lands on a valid zlib stream, 0x78 0x01, in
                     every real block we tested). Internal meaning of the
-                    16 bytes is NOT fully understood -- see NOTES.md.
+                    16 bytes is NOT fully understood -- see docs/provenance/notes.md.
         remainder : a standalone zlib stream for that block.
     """
     try:
@@ -278,7 +278,7 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) != 2:
-        print("usage: python grd_reader.py <path-to.grd>")
+        print("usage: python -m pygdb.grd_reader <path-to.grd>")
         raise SystemExit(1)
 
     header, values = read_grd(sys.argv[1])

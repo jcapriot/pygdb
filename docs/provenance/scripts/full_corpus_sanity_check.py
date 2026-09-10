@@ -23,8 +23,7 @@ import struct
 import sys
 import traceback
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "reader"))
-import gdb_reader as G  # noqa: E402
+from pygdb import gdb_reader as G
 
 
 def full_walk(path, header, page_size):

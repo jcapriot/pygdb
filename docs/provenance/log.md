@@ -1,4 +1,13 @@
-# Research Log — pygdb-cleanroom
+# Research Log
+
+!!! note "Historical document"
+    This is the chronological research log from the original
+    investigation, preserved as-is for provenance. It predates the
+    project's reorganization into the `pygdb` package, so paths like
+    `reader/gdb_reader.py` and `scripts/` refer to that earlier layout
+    (now `pygdb/gdb_reader.py` and `docs/provenance/scripts/`
+    respectively), and its own cross-references to `NOTES.md`/`LOG.md`
+    mean [notes.md](notes.md) and this document.
 
 A running, chronological lab notebook. Each entry records what was consulted,
 what was learned (or not learned), and how it feeds into hypotheses about the

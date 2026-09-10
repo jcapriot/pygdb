@@ -13,8 +13,7 @@ against the two real USGS sample files.
 import struct
 import sys
 
-sys.path.insert(0, "reader")
-import gdb_reader as G  # noqa: E402
+from pygdb import gdb_reader as G
 
 
 def step1_confirm_header_shape(path):

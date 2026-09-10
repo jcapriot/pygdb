@@ -1,5 +1,16 @@
 # The Geosoft `.gdb` format: a clean-room investigation
 
+!!! note "Historical document"
+    This is the research write-up produced during the original
+    investigation, preserved as-is for provenance. It predates the
+    project's reorganization into the `pygdb` package, so it refers to
+    paths from that time — `reader/gdb_reader.py` is now
+    `pygdb/gdb_reader.py` at the repository root — and its own
+    cross-references to `NOTES.md`/`LOG.md`/`SPEC.md` mean this
+    document, [log.md](log.md), and [spec.md](../spec.md) respectively.
+    The current, living reference is [the format specification](../spec.md);
+    this document is the fuller derivation it distills from.
+
 This document summarizes what was learned about Geosoft's proprietary
 `.gdb` ("Geosoft Database") binary format using **only publicly available
 information**: vendor-published open-source code and documentation,

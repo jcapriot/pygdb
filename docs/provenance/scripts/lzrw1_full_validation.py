@@ -1,5 +1,5 @@
 """
-Full, non-sampled validation of reader/lzrw1.py against every DB_COMP_SPEED
+Full, non-sampled validation of pygdb/lzrw1.py against every DB_COMP_SPEED
 chunk in a given real .gdb file (not a sample of the first N chunks).
 
 For every chunk found (subtype==1 via the shared 16-byte magic), attempts
@@ -15,8 +15,7 @@ import struct
 import sys
 import time
 
-sys.path.insert(0, "reader")
-import lzrw1 as L  # noqa: E402
+from pygdb import lzrw1 as L
 
 
 def lzrw1_decompress_checked(data, start, decompressed_length):
