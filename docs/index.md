@@ -35,15 +35,30 @@ pip install python-gdb
 
 ## Quick start
 
+The `GDB` class is the recommended entry point: a name-based view over
+a single `.gdb` file.
+
 ```python
-from pygdb import read_channels, iter_blobs, find_blob, read_blob_values
+from pygdb import GDB
 
-path = "example.gdb"
+db = GDB("example.gdb")
 
-channels = read_channels(path)
-for channel in channels:
-    print(channel.index, channel.name, channel.dtype_code, channel.array_width)
+db.compression          # CompressionInfo(code=0, name='DB_COMP_NONE', ...)
+db.coordinate_systems    # ['NAD83 / UTM zone 11N', 'WGS 84'] (best-effort, may be [])
+
+db.line_names[:5]        # ['L1000', 'L1001', 'L1010', 'L1020', 'L1030']
+db.channels_on_line("L1000")  # channels that actually have data on this line
+
+db.read("L1000", "Easting")   # random access by (line name, channel name)
+
+for channel_name, values in db.iter_line("L1000"):
+    print(channel_name, values[:3])
 ```
+
+The lower-level functions `GDB` is built on (`read_channels`,
+`read_lines`, `iter_blobs`, `find_blob`, `read_blob_values`, ...) are
+also exported directly from `pygdb` for anyone who wants slot-index-
+based access or to walk the blob chain themselves.
 
 See [the format specification](spec.md) for the on-disk structure this
 library implements, with a confidence rating (confirmed / likely /

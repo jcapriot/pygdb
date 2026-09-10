@@ -36,14 +36,20 @@ is `pygdb`.
 ## Quick start
 
 ```python
-from pygdb import read_channels, iter_blobs, find_blob, read_blob_values
+from pygdb import GDB
 
-path = "example.gdb"
+db = GDB("example.gdb")
 
-channels = read_channels(path)
-for channel in channels:
-    print(channel.index, channel.name, channel.dtype_code, channel.array_width)
+db.compression           # CompressionInfo(code=0, name='DB_COMP_NONE', ...)
+db.coordinate_systems     # ['NAD83 / UTM zone 11N', 'WGS 84'] (best-effort, may be [])
+
+db.line_names[:5]         # ['L1000', 'L1001', 'L1010', 'L1020', 'L1030']
+db.channels_on_line("L1000")   # channels that actually have data on this line
+db.read("L1000", "Easting")    # random access by (line name, channel name)
 ```
+
+See [the docs](docs/index.md) for the lower-level, slot-index-based
+functions `GDB` is built on.
 
 ## Documentation
 

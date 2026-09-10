@@ -60,8 +60,8 @@ In keeping with that:
 ## Development
 
 - The reader lives in `pygdb/` at the repository root
-  (`gdb_reader.py`, `grd_reader.py`, `lzrw1.py`) and has no third-party
-  dependencies.
+  (`gdb_reader.py`, `grd_reader.py`, `lzrw1.py`, `registry.py`, `gdb.py`)
+  and has no third-party dependencies.
 - [`docs/spec.md`](spec.md) is the living reference for the on-disk
   format; it's updated as more real example files are tested against
   the reader. If your bug report changes what's known about the

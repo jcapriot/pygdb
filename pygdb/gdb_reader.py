@@ -43,12 +43,13 @@ produce this code.
 
 from __future__ import annotations
 
+import re
 import struct
 import warnings
 import zlib
 from dataclasses import dataclass
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import lzrw1 as _lzrw1
 
@@ -460,6 +461,193 @@ def read_channels(path: str) -> List[ChannelRecord]:
             continue
         channels.append(rec)
     return channels
+
+
+DB_CATEGORY_LINE_NAMES = {
+    100: "NORMAL",   # DB_CATEGORY_LINE_NORMAL / DB_CATEGORY_LINE_FLIGHT (same value)
+    200: "GROUP",    # DB_CATEGORY_LINE_GROUP
+}
+
+_LINE_TABLE_EMPTY_CATEGORY = 65536  # [CONFIRMED] sentinel seen on unused line-table
+                                     # capacity slots -- docs/spec.md section 3.2
+
+_NAME_LIKE_RE = re.compile(rb"[\x20-\x7e]{1,63}\x00")
+
+
+@dataclass
+class LineRecord:
+    """
+    One 128-byte line-table record. [LIKELY]/[UNKNOWN] -- much less firmly
+    established than ChannelRecord: only the name (relative +32) and
+    category code (relative +108) fields are decoded, and locating the
+    table itself (find_line_table below) is a heuristic scan rather than
+    the structurally-proven SUPER-anchor technique used for the channel
+    table. See docs/spec.md section 3.2 and docs/provenance/notes.md section 6.3.
+    """
+    index: int         # 0-based physical slot number -- this IS line_slot_index
+                        # in the blob_index formula (BlobHeader.line_channel)
+    offset: int
+    name: str
+    category_code: Optional[int]
+    raw: bytes
+    name_is_clean: bool = True
+
+    @property
+    def category_name(self) -> str:
+        if self.category_code is None:
+            return "unknown"
+        return DB_CATEGORY_LINE_NAMES.get(self.category_code, f"unknown({self.category_code})")
+
+
+def _parse_line_record(data: bytes, rec_start: int, index: int) -> LineRecord:
+    raw = data[rec_start : rec_start + SYMBOL_RECORD_SIZE]
+    name, is_clean = _read_name(raw, 32)
+    try:
+        category_code = struct.unpack_from("<i", raw, 108)[0]
+    except struct.error:
+        category_code = None
+    return LineRecord(
+        index=index, offset=rec_start, name=name,
+        category_code=category_code, raw=raw, name_is_clean=is_clean,
+    )
+
+
+def find_line_table(data: bytes, search_window: Tuple[int, Optional[int]] = (128, None)) -> int:
+    """
+    Locate the start of the line symbol table.
+
+    Unlike find_channel_table, there's no known default-name anchor (the
+    line table has nothing analogous to the channel table's "SUPER" user
+    record immediately after it) and no confirmed header field gives its
+    start offset directly -- reconciling one with the header's capacity
+    fields was tried and didn't cleanly round-trip (docs/provenance/log.md
+    Session 1 section 1.16, docs/provenance/notes.md section 6.3). This is
+    therefore a heuristic **[LIKELY]** scan, not the structurally-proven
+    technique used for the channel table: it looks for a run of 128-byte
+    records whose relative +32 field looks like a clean, NUL-terminated,
+    printable line name and whose relative +108 category field matches one
+    of the two confirmed real values (100=NORMAL/FLIGHT, 200=GROUP), then
+    returns the earliest such record in the run with the most hits at a
+    consistent 128-byte phase.
+
+    **Known limitation, found by real-file testing, not yet fixed here:**
+    if a table's true first slot(s) don't carry a category code in
+    {100, 200}, this returns a start that's one or more slots too late --
+    every subsequent LineRecord.index is then off by that same fixed
+    amount, which breaks blob_index lookups by line name. Observed for
+    real on a GSQ file (`rm001141`): physical slot 0 is a genuine, named
+    record (`"L0"`) with category `65636` (**[GUESS]**: `65536 + 100`,
+    plausibly "a NORMAL line that was since cleared," not confirmed),
+    which this function doesn't recognize, so it starts the table one
+    slot late. A generic backward-scan fix was tried and rejected: "keep
+    walking backward while the name field still looks clean" massively
+    over-extends on at least one real file (walked 30+ slots into what
+    turned out to be unrelated, legitimately-empty space before the real
+    table). `GDB` (in `gdb.py`) instead cross-validates and corrects this
+    against the actual blob chain, which is a strictly stronger signal
+    than anything available from the symbol-table bytes alone -- prefer
+    it over calling this function directly when correct line-indexed
+    data access matters, not just names.
+
+    `search_window` defaults to (128, end of `data`) -- callers should
+    generally narrow `hi` to `blob_region_start(data)` when known, since
+    every real file examined has its symbol tables (line, channel, user)
+    entirely before the blob region, and narrowing avoids false-positive
+    matches inside actual channel data.
+    """
+    lo, hi = search_window
+    if hi is None:
+        hi = len(data)
+
+    phase_hits = {}
+    for m in _NAME_LIKE_RE.finditer(data, lo, hi):
+        rec_start = m.start() - 32
+        if rec_start < lo or rec_start + SYMBOL_RECORD_SIZE > hi:
+            continue
+        raw = data[rec_start : rec_start + SYMBOL_RECORD_SIZE]
+        try:
+            category_code = struct.unpack_from("<i", raw, 108)[0]
+        except struct.error:
+            continue
+        if category_code not in DB_CATEGORY_LINE_NAMES:
+            continue
+        phase_hits.setdefault(rec_start % SYMBOL_RECORD_SIZE, []).append(rec_start)
+
+    if not phase_hits:
+        raise ValueError(
+            "no line-record-shaped data (clean name + a known category "
+            "code) found in the search window"
+        )
+    best_phase = max(phase_hits, key=lambda p: len(phase_hits[p]))
+    return min(phase_hits[best_phase])
+
+
+def read_lines(path: str) -> List[LineRecord]:
+    """
+    Decode the line symbol table. Heuristic (see find_line_table) --
+    less firmly established than read_channels. Fails gracefully in the
+    same style: a bad magic, truncated header, or unlocatable line table
+    all return `[]` with a `GDBParseWarning` rather than raising.
+
+    Since no confirmed header field gives the line table's slot capacity
+    (the way chans_max does for the channel table), this reads forward
+    from the located start until 8 consecutive records fail to look like
+    either a populated line record or clean unused capacity -- a
+    tolerance against one-off corruption/false-positive records, not a
+    precisely-known table boundary.
+
+    **`LineRecord.index` can be off by a small, fixed amount** on a file
+    where `find_line_table`'s heuristic starts one or more slots late --
+    see that function's docstring. This makes `.name` still correct but
+    `.index` (and therefore any blob_index lookup keyed on it) wrong.
+    `GDB` (in `gdb.py`) corrects this against the actual blob chain
+    before exposing lines by name; call it instead of this function
+    directly when you need working (line, channel) data access, not
+    just a list of names.
+    """
+    with open(path, "rb") as f:
+        header = f.read(4096)
+        if not check_magic(header):
+            _warn(f"{path}: does not start with the expected '!CBD' magic -- "
+                  f"not a recognized .gdb file, returning no lines")
+            return []
+        blob_start = blob_region_start(header)
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(0)
+        read_size = blob_start if (blob_start is not None and 0 < blob_start <= size) else min(size, 20_000_000)
+        data = f.read(read_size)
+
+    try:
+        table_start = find_line_table(data, search_window=(128, len(data)))
+    except ValueError as e:
+        _warn(f"{path}: could not locate the line symbol table ({e}) -- "
+              f"returning no lines")
+        return []
+
+    lines: List[LineRecord] = []
+    consecutive_bad = 0
+    i = 0
+    while True:
+        rec_start = table_start + i * SYMBOL_RECORD_SIZE
+        if rec_start + SYMBOL_RECORD_SIZE > len(data):
+            break
+        rec = _parse_line_record(data, rec_start, i)
+        i += 1
+        if rec.name and rec.name_is_clean and rec.category_code in DB_CATEGORY_LINE_NAMES:
+            lines.append(rec)
+            consecutive_bad = 0
+        elif not rec.name and rec.name_is_clean:
+            # Empty/unused capacity slot (matches the channel table's own
+            # zeroed-padding convention, or the 65536 empty-category
+            # sentinel confirmed in docs/spec.md section 3.2) -- keep
+            # scanning past it, it doesn't count as "bad".
+            consecutive_bad = 0
+        else:
+            consecutive_bad += 1
+            if consecutive_bad >= 8:
+                break
+    return lines
 
 
 BLOB_MAGIC = b"\xcc\xcc\x00\xff"

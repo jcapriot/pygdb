@@ -161,15 +161,37 @@ rest of the layout. `provenance/notes.md` §6.3.
 | Rel. offset | Type | Field | Status |
 |---|---|---|---|
 | `+32` | up to 64 bytes | NUL-padded line name (note: **not** at `+8` the way channel names are — line records reserve more leading fields) | **[CONFIRMED]** |
-| `+108` | int32 | Category code — `100` matches `DB_CATEGORY_LINE_NORMAL` exactly on every real normal line seen; a `65536` sentinel value seen on unused capacity slots | **[CONFIRMED]** |
+| `+108` | int32 | Category code — `100` matches `DB_CATEGORY_LINE_NORMAL` exactly on every real normal line seen; `200` (`DB_CATEGORY_LINE_GROUP`) also seen; a `65536` sentinel value seen on unused capacity slots | **[CONFIRMED]** |
 | everything else | — | Not decoded | **[UNKNOWN]** |
 
 Line-table physical slot numbering is 0-based, exactly like the channel
 table, and — critically — this slot number is exactly the
 `line_slot_index` used in the blob-addressing formula in §6.2.
 **[CONFIRMED]** directly: physical slot 0 of the line table holds a
-real survey's actual first line name, verified independently on
-multiple real files (`provenance/notes.md` §6.6/§6.6d).
+real survey's actual first line name on every file checked in the
+original investigation (`provenance/notes.md` §6.6/§6.6d) — but **not
+universally**, see the correction immediately below.
+
+**Correction, found while building a name-based reader on top of this
+table (`pygdb.GDB`, §12):** on a real GSQ file (`rm001141`), physical
+slot 0 is a genuine, named record — `"L0"` — whose category code is
+`65636`, not `100`/`200`/`65536`. **[GUESS]**: `65536 + 100`, plausibly
+"a `NORMAL` line that was since cleared/renamed" — the vendor's own
+`65536` unused-capacity sentinel plus its original category, though
+this is speculative and not independently confirmed. Whatever it
+means, this slot has **no data blob for any channel** — it's a real
+table entry, but not a usable survey line — and a scanner that only
+recognizes categories `100`/`200` (as this specification's own
+reference reader originally did) skips it, landing one slot **late**
+and silently misnumbering every subsequent line for that file (a real,
+found-by-testing bug, not a hypothetical one). `pygdb.GDB` corrects for
+this by cross-checking candidate line numbering against which slots
+actually have real blob data on disk (a strictly stronger signal than
+anything in the symbol-table bytes alone) rather than trying to
+recognize every possible category-code variant up front — see its
+`_calibrate_line_indices` for the exact method. This is confirmed to
+fix the `rm001141` case and to be a no-op (i.e. correct already) on
+the other 21 real files checked.
 
 ### 3.3 User record layout (128 bytes)
 
@@ -654,26 +676,44 @@ on every agency checked:
   the USGS file first checked, so this specific angle only pays off on
   some files, not a miss for the format as a whole.
 
-**Not universal — a real, patterned absence, not a scan artifact.** A
-full-corpus pass across all 22 real files (`provenance/notes.md` §6.9, every
-blob-chain fully walked, no scan-depth cap) found **zero** REG or IPJ
-blobs at all in: the three 1991 Questem-era Mount Gordon files; two
-Melinda Downs magnetic-data files whose **AGG siblings from the
-identical delivery do have rich REG/IPJ content**; and two
-derived/inversion-output databases (`East_Isa_VTEM_Inversion.gdb`,
-`SAMAGEM_CDI.gdb`). **[LIKELY]**: presence correlates with whether a
-database was ever interactively opened/edited in Oasis montaj (which
-is what populates the registry, per the content above) rather than
-with file age or agency alone — plausible given the pattern, not
-proven.
+**Correction — actually [CONFIRMED] universal across all 22 real files,
+not the patterned absence previously documented here.** An earlier
+draft of this section, based on `provenance/notes.md` §6.9, claimed
+**zero** REG or IPJ blobs in seven specific files (the three 1991
+Questem-era Mount Gordon files, two Melinda Downs magnetic-data files,
+and two derived/inversion-output databases). That scan (and the
+provenance script it was based on, `provenance/scripts/
+reg_ipj_full_scan.py`) identified "administrative" blobs with a
+**hardcoded** `line_slot > 700` cutoff — reasonable for the specific
+files it was tuned against, but wrong in general: administrative blobs
+in some real files sit at much lower line-slot values (e.g. `line_slot
+= 200` — suggestively the same value as the vendor's own
+`DB_CATEGORY_LINE_GROUP=200` constant, §2 — in the Mount Gordon files),
+so a fixed `700` cutoff silently skipped them without any warning.
+
+Re-scanning all 22 real files with `pygdb.registry.find_coordinate_systems`
+(and the equivalent raw-tag scan) using a **per-file** threshold —
+every line-table slot beyond that file's own highest real line index,
+from `pygdb.gdb_reader.read_lines()`, rather than one constant — finds
+**both REG and IPJ content in all 22 of 22 real files**, including
+every one of the seven previously reported as empty. This is
+[CONFIRMED] by direct re-test, not a theoretical fix. The tool-run
+records, processing formulas, and projection names described above in
+this section are present far more broadly than originally reported;
+whether truly every real `.gdb` file has REG/IPJ content, or some
+still don't (e.g. a database that really was never interactively
+opened in Oasis montaj), remains open — only that this specific
+7-file "some files have none" claim was a scan artifact, not a real
+finding.
 
 **What's still open:** the exact binary field boundaries of the `REG`/
 `VV`-tagged sub-objects; why some registry slots are populated and
 others are bare placeholders; the precise mapping from a blob's
 `channel_slot` to which real channel or tool-run instance it concerns;
-why some real files have none at all; and a small, genuinely
-unidentified third administrative-blob tag variant (neither `REG `/
-`IPJ` nor the empty-placeholder pattern) found on two real GSQ files.
+whether any real file has genuinely no REG/IPJ content at all; and a
+small, genuinely unidentified third administrative-blob tag variant
+(neither `REG `/`IPJ` nor the empty-placeholder pattern) found on two
+real GSQ files.
 
 ---
 
@@ -716,6 +756,9 @@ but their actual meaning is genuinely **[UNKNOWN]**:
 - The exact reason some whole files/blobs never engage their declared
   compression mode (§7.6) — size is ruled out; delivery/tool-version
   provenance is an untested candidate.
+- A line-record category code of `65636` (§3.2) on a real, named
+  (`"L0"`) but dataless line-table slot — seen on one real GSQ file
+  (`rm001141`), plausibly `65536 + 100` but not confirmed.
 
 ---
 
@@ -725,8 +768,9 @@ A working Python reader implementing everything marked **[CONFIRMED]**
 above lives in this repository:
 
 - `pygdb/gdb_reader.py` — header parsing, full symbol-table decode
-  (channels, with VA/array width; lines), and the complete blob-index
-  reader: `blob_region_start()`, `iter_blobs()`, `find_blob(line_slot,
+  (channels, with VA/array width; lines, §3.2 — note the known
+  indexing caveat there), and the complete blob-index reader:
+  `blob_region_start()`, `iter_blobs()`, `find_blob(line_slot,
   channel_slot)`, `read_blob_values()` (handles all three compression
   modes, single- and multi-page, and auto-detects the "bare blob"
   variant).
@@ -736,6 +780,15 @@ above lives in this repository:
 - `pygdb/grd_reader.py` — a fully solved reader for the sibling `.grd`
   grid format (not `.gdb`, but the same container family, and the
   first place the shared 16-byte page-primitive magic was found).
+- `pygdb/registry.py` — best-effort extraction of coordinate-system
+  names from REG/IPJ administrative-blob content (§8-9).
+- `pygdb/gdb.py` — `GDB`, a user-facing, name-based wrapper: list
+  lines/channels, see which channels actually have data on a given
+  line (§1's sparse (line, channel) grid), random-access reads by
+  (line name, channel name), and a description of the file's
+  compression mode and coordinate system(s). Corrects the §3.2 line-
+  indexing caveat against the real blob chain before exposing lines by
+  name.
 
 Run `python -m pygdb.gdb_reader <path-to.gdb>` for a demo: header
 fields, the full channel list, and a decoded sample of real data from

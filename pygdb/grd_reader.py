@@ -32,7 +32,6 @@ import struct
 import warnings
 import zlib
 from dataclasses import dataclass, field
-from typing import Optional
 
 
 class GRDParseWarning(RuntimeWarning):

@@ -14,36 +14,47 @@ implementation.
 Reading only: writing/mutating `.gdb` or `.grd` files is out of scope.
 """
 
+from .gdb import GDB, CompressionInfo
 from .gdb_reader import (
     BlobHeader,
     ChannelRecord,
     GDBParseWarning,
+    LineRecord,
     check_magic,
     find_blob,
     find_channel_table,
+    find_line_table,
     header_fields,
     iter_blobs,
     read_blob_values,
     read_channels,
+    read_lines,
 )
 from .grd_reader import GrdHeader, GRDParseWarning, read_grd
 from .lzrw1 import LZRW1DecodeError
+from .registry import find_coordinate_systems
 
 __all__ = [
+    "GDB",
     "BlobHeader",
     "ChannelRecord",
+    "CompressionInfo",
     "GDBParseWarning",
     "GRDParseWarning",
     "GrdHeader",
     "LZRW1DecodeError",
+    "LineRecord",
     "check_magic",
     "find_blob",
     "find_channel_table",
+    "find_coordinate_systems",
+    "find_line_table",
     "header_fields",
     "iter_blobs",
     "read_blob_values",
     "read_channels",
     "read_grd",
+    "read_lines",
 ]
 
 __version__ = "0.1.0"
