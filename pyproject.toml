@@ -39,3 +39,6 @@ dev = [
 
 [tool.setuptools]
 packages = ["pygdb"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

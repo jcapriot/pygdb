@@ -73,6 +73,21 @@ zensical serve
 - [`docs/provenance/`](docs/provenance/index.md) — the original
   research log and write-up this implementation was derived from.
 
+## Testing
+
+```sh
+pip install -e ".[dev]"
+pytest
+```
+
+Most of the suite is synthetic-fixture unit tests (`tests/test_*.py`,
+minus `test_integration_samples.py`) that build minimal `.gdb`/`.grd`
+byte layouts by hand — no sample data required, safe to run anywhere
+including CI. `tests/test_integration_samples.py` additionally
+cross-checks the reader against real files in a local, gitignored
+`samples/` directory when present, and skips (not fails) when it's
+absent.
+
 ## Sample data
 
 Real `.gdb`/`.grd` sample files used during development are **not**

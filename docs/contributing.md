@@ -70,3 +70,19 @@ In keeping with that:
   research log, write-up, and one-off investigation scripts that
   produced the original implementation. It's kept as-is for provenance
   and isn't expected to be re-run against the current package layout.
+
+## Running the tests
+
+```sh
+pip install -e ".[dev]"
+pytest
+```
+
+The suite is split into synthetic-fixture unit tests (no sample data
+needed, always run) and skip-safe integration tests in
+`tests/test_integration_samples.py` that exercise the reader against
+real files in a local, gitignored `samples/` directory when one is
+present, and skip cleanly when it isn't. If you're adding coverage for
+a new format quirk, prefer extending `tests/helpers.py`'s synthetic
+fixture builders over requiring a real sample file, so the test stays
+runnable by anyone.
