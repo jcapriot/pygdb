@@ -72,6 +72,34 @@ See [the format specification](spec.md) for the on-disk structure this
 library implements, with a confidence rating (confirmed / likely /
 guess / unknown) on every field.
 
+## Exporting to xarray
+
+```sh
+pip install python-gdb[xarray]
+```
+
+```python
+ds = db.to_xarray("L1000")  # one line -> one xarray.Dataset
+
+ds["Easting"]        # a plain (station,) DataArray
+ds["ISPD"]            # a VA/array channel -> (station, ISPD_bin), its
+                       # own dimension, not shared with other array
+                       # channels even at the same width (see below)
+```
+
+One `Dataset` per line, sharing a `"station"` dimension across every
+channel. A VA/array channel (see the format specification's [section
+5](spec.md)) gets its own second dimension named after the channel --
+deliberately not shared with any other array channel even when their
+widths happen to match, since that's a coincidence, not a guarantee
+they mean the same thing. If two channels share a name and both have
+data on the same line (rare, but structurally possible -- see
+`channel()`'s docs), the second one's variable name is disambiguated
+as `"name[1]"` rather than silently overwriting the first, with a
+warning explaining why. `xarray` is an optional dependency, imported
+only when `to_xarray()` is actually called -- importing `pygdb` itself
+never needs it.
+
 ## Optional Rust-accelerated backend
 
 The pure-Python code in `pygdb/` is always the reference implementation

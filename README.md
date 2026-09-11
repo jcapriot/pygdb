@@ -60,6 +60,11 @@ db.read("L1000", "Easting")    # random access by (line name, channel name)
 See [the docs](docs/index.md) for the lower-level, slot-index-based
 functions `GDB` is built on.
 
+`db.to_xarray("L1000")` exports one line to an `xarray.Dataset`
+(`pip install python-gdb[xarray]`, an optional dependency) — see
+[the docs](docs/index.md#exporting-to-xarray) for how VA/array channels
+and duplicate channel names come through.
+
 ## Optional Rust-accelerated backend
 
 The pure-Python code in `pygdb/` is always the reference implementation

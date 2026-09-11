@@ -522,3 +522,120 @@ class GDB:
                 file=self._file,
             )
             yield c, values
+
+    def to_xarray(self, line: LineRef) -> "xr.Dataset":
+        """
+        Build an `xarray.Dataset` for every channel that has data on
+        `line` -- one data variable per channel, sharing a common
+        `"station"` dimension. Needs the optional `xarray` dependency
+        (`pip install python-gdb[xarray]`), imported lazily here so
+        importing `pygdb` itself never requires it.
+
+        A VA/array channel (docs/spec.md section 5) gets its own
+        second dimension, `f"{name}_bin"` -- deliberately *not* shared
+        with any other array channel even when their `array_width`
+        happens to match (e.g. real `ISPD`/`ISPU` are both 512-wide in
+        a real USGS file): two channels having the same width is a
+        coincidence, not a guarantee they share a semantic axis. Align/
+        rename dimensions yourself afterward if you know two channels
+        genuinely do.
+
+        If two channels share a name and both have data on this line
+        (confirmed structurally possible -- see `channel()`'s
+        docstring -- though never yet observed with data on both), the
+        variable name for every occurrence after the first is
+        disambiguated as `f"{name}[{occurrence}]"`, `occurrence` being
+        the same 0-based index into every channel sharing that name (in
+        `.channels` order) that `channel()`'s `(name, occurrence)` form
+        uses -- so `ds["UTC[1]"]` and `db.channel(("UTC", 1))` refer to
+        the same channel. Raises a `GDBParseWarning` when this actually
+        triggers, since a caller not expecting a bracket-suffixed
+        variable name should be told why one showed up.
+
+        If channels on this line don't all decode to the same row
+        count (a truncated/corrupt file -- truncation only ever
+        shortens a channel, never lengthens it), the *shorter*
+        channel(s) keep their full (shorter) data rather than being cut
+        down further, or cutting the other channels down to match: a
+        short channel gets its own first dimension, `f"{name}_station"`,
+        instead of the shared `"station"` (the same "give it its own
+        dimension rather than lose data to fit one" principle as the
+        array-channel case above). Also raises a `GDBParseWarning`.
+
+        No channel is auto-promoted to a coordinate -- `"station"` is a
+        bare integer range index, and every channel (however
+        conventionally named) is a plain data variable; call
+        `ds.set_coords(...)` yourself if you want one -- no real file
+        names its channels consistently enough for this reader to
+        guess which one(s) you'd want without risking guessing wrong.
+        """
+        try:
+            import xarray as xr
+        except ImportError as e:
+            raise ImportError(
+                "to_xarray() needs the optional 'xarray' dependency -- "
+                "install with `pip install python-gdb[xarray]`"
+            ) from e
+
+        line_rec = self._resolve_line(line)
+        decoded = [
+            (c, read_blob_values(
+                self.path, blob, c,
+                comp_level=self.comp_level or 0, page_size=self.page_size,
+                file=self._file,
+            ))
+            for c, blob in self._channels_with_data_on_line(line_rec)
+        ]
+        if self._channels_by_name is None:
+            self.channels  # populate the cache (for occurrence numbering)
+
+        station_length = max((len(values) for _c, values in decoded), default=0)
+        name_counts: Dict[str, int] = {}
+        for c, _values in decoded:
+            name_counts[c.name] = name_counts.get(c.name, 0) + 1
+
+        data_vars = {}
+        seen_so_far: Dict[str, int] = {}
+        for c, values in decoded:
+            seen_so_far[c.name] = seen_so_far.get(c.name, 0) + 1
+            if name_counts[c.name] > 1:
+                occurrence = self._channels_by_name[c.name].index(c)
+                var_name = c.name if seen_so_far[c.name] == 1 else f"{c.name}[{occurrence}]"
+                warnings.warn(
+                    f"{self.path}: line {line_rec.name!r} has {name_counts[c.name]} "
+                    f"channels named {c.name!r} with data -- using {var_name!r} "
+                    f"for occurrence {occurrence} (pass (name, occurrence) to "
+                    f"channel() for the same numbering)",
+                    GDBParseWarning, stacklevel=2,
+                )
+            else:
+                var_name = c.name
+
+            if len(values) == station_length:
+                station_dim = "station"
+            else:
+                station_dim = f"{var_name}_station"
+                warnings.warn(
+                    f"{self.path}: line {line_rec.name!r} channel {c.name!r} "
+                    f"decoded {len(values)} row(s), expected {station_length} "
+                    f"(the max across this line's channels) -- likely "
+                    f"truncated; keeping its own {len(values)}-row dimension "
+                    f"{station_dim!r} rather than cutting other channels down "
+                    f"to match",
+                    GDBParseWarning, stacklevel=2,
+                )
+
+            dims = (station_dim, f"{var_name}_bin") if c.is_array else (station_dim,)
+            attrs = {"type_name": c.type_name, "format_name": c.format_name}
+            if c.is_array:
+                attrs["array_basetype_name"] = c.array_basetype_name
+            data_vars[var_name] = (dims, values, attrs)
+
+        return xr.Dataset(
+            data_vars,
+            attrs={
+                "line_name": line_rec.name,
+                "line_category": line_rec.category_name,
+                "path": self.path,
+            },
+        )

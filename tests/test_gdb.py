@@ -329,3 +329,133 @@ def test_gdb_iter_line_yields_both_entries_for_duplicate_channel_names(tmp_path)
 
     by_record = dict(results)
     assert len(by_record) == 3  # Fiducial + both Dup channels, keyed by record
+
+
+# -- to_xarray() ---------------------------------------------------------------
+
+def test_gdb_to_xarray_scalar_and_array_channels(db):
+    ds = db.to_xarray("L100")
+    assert set(ds.data_vars) == {"Fiducial", "Easting", "Depths"}
+    assert ds.sizes["station"] == 3
+
+    assert ds["Fiducial"].dims == ("station",)
+    npt.assert_array_equal(ds["Fiducial"].values, [1, 2, 3])
+
+    assert ds["Depths"].dims == ("station", "Depths_bin")
+    assert ds["Depths"].shape == (3, 3)
+    npt.assert_array_equal(
+        ds["Depths"].values, [[0.0, 1.5, 3.0], [4.5, 6.0, 7.5], [9.0, 10.5, 12.0]],
+    )
+
+    assert ds.attrs["line_name"] == "L100"
+    assert ds.attrs["line_category"] == "NORMAL"
+    assert ds["Fiducial"].attrs["type_name"] == "GS_LONG"
+    assert ds["Depths"].attrs["array_basetype_name"]  # present for array channels
+
+
+def test_gdb_to_xarray_no_data_on_line_returns_empty_dataset(db):
+    ds = db.to_xarray("L200")  # no Depths on L200
+    assert set(ds.data_vars) == {"Fiducial", "Easting"}
+
+
+def test_gdb_to_xarray_different_width_array_channels_get_separate_dimensions(tmp_path):
+    """
+    Two different array channels with DIFFERENT widths on the same line
+    -- confirms each gets its own {name}_bin dimension rather than
+    trying to share one (which would be a shape conflict anyway, but
+    this also covers the "coincidentally equal width" case documented
+    in to_xarray()'s docstring via a same-width real-corpus test
+    elsewhere).
+    """
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("Depths", dtype_code=5, array_width=3),
+        ChannelSpec("Gates", dtype_code=5, array_width=2),
+    ]
+    lines = [LineSpec("L100", data={
+        "Fiducial": [1, 2],
+        "Depths": [0.0, 1.5, 3.0, 4.5, 6.0, 7.5],   # 2 rows x 3
+        "Gates": [10.0, 20.0, 30.0, 40.0],           # 2 rows x 2
+    })]
+    path = tmp_path / "multi_array.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    ds = db.to_xarray("L100")
+    assert ds["Depths"].dims == ("station", "Depths_bin")
+    assert ds["Gates"].dims == ("station", "Gates_bin")
+    assert ds.sizes["Depths_bin"] == 3
+    assert ds.sizes["Gates_bin"] == 2
+
+
+def test_gdb_to_xarray_disambiguates_duplicate_channel_names(tmp_path):
+    """
+    Two channels named "Dup" both have data on the same line -- the
+    genuinely-ambiguous case read()/_resolve_channel_on_line raises
+    ValueError on. to_xarray() must not silently let the second
+    overwrite the first (an xr.Dataset is dict-like, keyed by variable
+    name): the second occurrence gets suffixed "Dup[1]" (matching
+    channel()'s (name, occurrence) numbering), and a GDBParseWarning is
+    raised noting it.
+    """
+    from pygdb import GDBParseWarning
+
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("Dup", dtype_code=5),
+        ChannelSpec("Dup", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={"Fiducial": [1, 2], "Dup": [10.0, 20.0]})]
+    path = tmp_path / "dup_xarray.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    with pytest.warns(GDBParseWarning, match=r"Dup"):
+        ds = db.to_xarray("L100")
+
+    assert {"Dup", "Dup[1]"} <= set(ds.data_vars)
+    npt.assert_array_equal(ds["Dup"].values, [10.0, 20.0])
+    npt.assert_array_equal(ds["Dup[1]"].values, [10.0, 20.0])
+    # "Dup[1]" numbering matches channel(("Dup", 1))'s own occurrence index.
+    assert db.channel(("Dup", 1)).name == "Dup"
+
+
+def test_gdb_to_xarray_row_count_mismatch_gets_its_own_dimension(tmp_path):
+    """
+    Two channels on the same line with genuinely different row counts
+    (a truncated/corrupt file, in practice -- simulated here directly
+    via a shorter value list, which exercises the same code path
+    without needing to fake real file corruption). The shorter channel
+    must keep its own full (short) data on its own dimension, not be
+    padded, and the full-length channel must not be cut down to match.
+    """
+    from pygdb import GDBParseWarning
+
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("Short", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={
+        "Fiducial": [1, 2, 3],
+        "Short": [10.0, 20.0],  # one row short of Fiducial's 3
+    })]
+    path = tmp_path / "mismatch.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    with pytest.warns(GDBParseWarning, match=r"Short"):
+        ds = db.to_xarray("L100")
+
+    assert ds["Fiducial"].dims == ("station",)
+    assert ds.sizes["station"] == 3
+    npt.assert_array_equal(ds["Fiducial"].values, [1, 2, 3])
+
+    assert ds["Short"].dims == ("Short_station",)
+    assert ds.sizes["Short_station"] == 2
+    npt.assert_array_equal(ds["Short"].values, [10.0, 20.0])
+
+
+def test_gdb_to_xarray_raises_import_error_with_install_hint(db, monkeypatch):
+    monkeypatch.setitem(__import__("sys").modules, "xarray", None)
+    with pytest.raises(ImportError, match=r"pip install python-gdb\[xarray\]"):
+        db.to_xarray("L100")

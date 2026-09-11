@@ -321,6 +321,17 @@ count that isn't a whole multiple of `array_width` (truncated/corrupt
 data) warns and drops the incomplete trailing row rather than
 returning a raggedly-shaped result.
 
+**`GDB.to_xarray(line)`** (optional `xarray` dependency) builds on this
+directly: an array channel's `array_width` becomes a real, named
+second dimension (`f"{channel}_bin"`) on that channel's `DataArray`,
+kept separate per channel even when two array channels happen to share
+a width (real example: `ISPD`/`ISPU` are both 512-wide in
+`Radiometric_Data.gdb`, but get `ISPD_bin`/`ISPU_bin` independently --
+matching widths don't imply a shared semantic axis). See `gdb.py`'s
+`to_xarray` docstring for how it handles the same-line duplicate-
+channel-name and mismatched-row-count edge cases this section already
+documents as real, if rare, possibilities.
+
 ---
 
 ## 6. The blob index: locating (line, channel) → data

@@ -64,6 +64,10 @@ In keeping with that:
   `numpy` is its one required third-party dependency, used specifically
   so VA/array channels (docs/spec.md section 5) come back as correctly-
   shaped `(n_rows, array_width)` arrays instead of one flat buffer.
+  `xarray` is optional (`pip install -e ".[xarray]"` or `.[dev]"`,
+  which already includes it) -- only `GDB.to_xarray()` needs it,
+  imported lazily inside that one method so importing `pygdb` itself
+  never requires it.
 - `rust/` holds an optional Rust extension (`pygdb._native`) that
   accelerates the reader's real CPU-bound hot paths (LZRW1
   decompression, fixed-width string decoding). This is one package,

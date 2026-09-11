@@ -111,6 +111,26 @@ def test_radiometric_data_array_channel_matches_documented_shape(samples_dir):
         assert values.dtype == np.dtype("<u2")
 
 
+def test_radiometric_data_to_xarray_gives_isp_channels_separate_dimensions(samples_dir):
+    """
+    Real-corpus confirmation of to_xarray()'s documented behavior: ISPD
+    and ISPU are both array_width=512 in this real file, but that's a
+    coincidence, not a guarantee they share a semantic axis -- they must
+    come through as separate ISPD_bin/ISPU_bin dimensions, not one
+    shared dimension.
+    """
+    pytest.importorskip("xarray")
+    path = os.path.join(samples_dir, "usgs_mojave_2020", "Radiometric_Data.gdb")
+    if not os.path.exists(path):
+        pytest.skip("Radiometric_Data.gdb not present locally")
+    db = GDB(path)
+    ds = db.to_xarray(db.line_names[0])
+    assert ds["ISPD"].dims == ("station", "ISPD_bin")
+    assert ds["ISPU"].dims == ("station", "ISPU_bin")
+    assert ds.sizes["ISPD_bin"] == 512
+    assert ds.sizes["ISPU_bin"] == 512
+
+
 def test_ag106386_matches_published_ground_truth(samples_dir):
     """
     Cross-checked in the original research against real decompressed

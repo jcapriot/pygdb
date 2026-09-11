@@ -43,6 +43,15 @@ docs = [
 ]
 dev = [
     "pytest>=7.0",
+    "xarray",
+]
+# GDB.to_xarray() -- a per-line export, lazily imported only when that
+# method is actually called (see pygdb/gdb.py), so importing pygdb
+# itself never requires xarray. Included in `dev` too, so the full test
+# suite (which exercises this path) runs with a plain `pip install
+# -e ".[dev]"`.
+xarray = [
+    "xarray",
 ]
 
 # pygdb is pure Python at heart (see pygdb/lzrw1.py's `_native`
