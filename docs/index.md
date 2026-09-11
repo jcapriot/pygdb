@@ -51,8 +51,8 @@ db.channels_on_line("L1000")  # channels that actually have data on this line
 
 db.read("L1000", "Easting")   # random access by (line name, channel name)
 
-for channel_name, values in db.iter_line("L1000"):
-    print(channel_name, values[:3])
+for channel, values in db.iter_line("L1000"):
+    print(channel.name, values[:3])
 ```
 
 The lower-level functions `GDB` is built on (`read_channels`,
@@ -63,6 +63,22 @@ based access or to walk the blob chain themselves.
 See [the format specification](spec.md) for the on-disk structure this
 library implements, with a confidence rating (confirmed / likely /
 guess / unknown) on every field.
+
+## Optional Rust-accelerated backend
+
+The pure-Python code in `pygdb/` is always the reference implementation
+and always fully correct on its own. This package is built with
+maturin so that an optional Rust extension (`pygdb._native`, source
+under `rust/` in the repository) rides along and is used automatically
+when present -- it accelerates LZRW1 decompression and fixed-width
+string decoding, the two real CPU-bound hot paths profiling found in
+this reader, roughly 3-6x on real files. A platform/Python-version
+combination with a published wheel gets it with a plain `pip install
+python-gdb`, no extra step; elsewhere `pip` falls back to building from
+source, which needs a Rust toolchain. For local development: `pip
+install -e ".[dev]"` (from the repository root) compiles it as part of
+the editable install. See `rust/src/lib.rs` for what's implemented, and
+what was tried and benchmarked as not worth keeping.
 
 ## Status
 

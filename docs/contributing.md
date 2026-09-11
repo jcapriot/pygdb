@@ -62,6 +62,23 @@ In keeping with that:
 - The reader lives in `pygdb/` at the repository root
   (`gdb_reader.py`, `grd_reader.py`, `lzrw1.py`, `registry.py`, `gdb.py`)
   and has no third-party dependencies.
+- `rust/` holds an optional Rust extension (`pygdb._native`) that
+  accelerates the reader's real CPU-bound hot paths (LZRW1
+  decompression, fixed-width string decoding). This is one package,
+  not two -- the root `pyproject.toml` is built with
+  [`maturin`](https://www.maturin.rs/), which bundles the compiled
+  extension into the same `python-gdb` wheel as the pure-Python source
+  whenever one's built for your platform, with no separate install step
+  or extra. The pure-Python code in `pygdb/` is always the reference
+  implementation and stays fully correct and usable on its own;
+  `pygdb/lzrw1.py` and `pygdb/gdb_reader.py` dispatch to `_native` when
+  it's built and fall back to plain Python otherwise, so both backends
+  need to keep agreeing. `rust/src/lib.rs`'s module doc records what was
+  tried and deliberately left out after being benchmarked as not worth
+  it -- worth reading before proposing another parallelism or I/O
+  change there, so you're not re-deriving something already tested. See
+  `.github/workflows/wheels.yml`'s comments for the released wheel
+  matrix and how to build locally.
 - [`docs/spec.md`](spec.md) is the living reference for the on-disk
   format; it's updated as more real example files are tested against
   the reader. If your bug report changes what's known about the

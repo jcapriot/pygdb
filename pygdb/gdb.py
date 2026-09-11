@@ -44,6 +44,17 @@ _DB_COMP_CODECS = {
 }
 
 
+# A plain name is ambiguous whenever a file has more than one line or
+# channel sharing it (real, if unusual -- see channel()/line()'s
+# docstrings). `(name, occurrence)` -- occurrence is a 0-based index into
+# every record sharing that name, in `.channels`/`.lines` order -- lets
+# a caller pick a specific one explicitly instead of relying on context-
+# based disambiguation (or hitting the ValueError it raises when even
+# that's ambiguous). Accepted anywhere a plain name is.
+LineRef = Union[str, Tuple[str, int], "LineRecord"]
+ChannelRef = Union[str, Tuple[str, int], "ChannelRecord"]
+
+
 @dataclass
 class CompressionInfo:
     """
@@ -80,8 +91,14 @@ class GDB:
     Channel and line tables are read once, lazily, on first access, and
     cached; the (line, channel) -> blob index used by `read()` and
     `channels_on_line()` is likewise built once (a full blob-chain walk)
-    on first use. Nothing here holds the file open between calls --
-    every read reopens `path`, consistent with the rest of this package.
+    on first use. Unlike the module-level `gdb_reader` functions this
+    class is built on (which each reopen `path` fresh, for statelessness),
+    `GDB` opens `path` once at construction and reuses that handle for
+    every `read()`/`iter_line()` call -- reopening per call was measured
+    at ~1.7-1.9x slower against this project's real sample corpus (see
+    the Rust-plan's M4 notes). Close it (`db.close()`, or use `GDB` as a
+    context manager) when done with it, or just let it get
+    garbage-collected -- `__del__` closes it too, as a safety net.
 
     Raises `ValueError` at construction time if `path` doesn't start
     with the expected `.gdb` magic -- unlike the module-level functions
@@ -92,9 +109,10 @@ class GDB:
 
     def __init__(self, path: str):
         self.path = path
-        with open(path, "rb") as f:
-            header = f.read(4096)
+        self._file = open(path, "rb")
+        header = self._file.read(4096)
         if not check_magic(header):
+            self._file.close()
             raise ValueError(
                 f"{path}: does not start with the expected '!CBD' magic -- "
                 f"not a recognized .gdb file"
@@ -102,13 +120,28 @@ class GDB:
         self._fields = header_fields(header)
         self._channels: Optional[List[ChannelRecord]] = None
         self._lines: Optional[List[LineRecord]] = None
-        self._channels_by_name: Optional[Dict[str, ChannelRecord]] = None
-        self._lines_by_name: Optional[Dict[str, LineRecord]] = None
+        self._channels_by_name: Optional[Dict[str, List[ChannelRecord]]] = None
+        self._lines_by_name: Optional[Dict[str, List[LineRecord]]] = None
         self._blob_index: Optional[Dict[Tuple[int, int], BlobHeader]] = None
         self._coordinate_systems: Optional[List[str]] = None
 
     def __repr__(self) -> str:
         return f"GDB({self.path!r})"
+
+    def close(self) -> None:
+        """Close the underlying file handle. Safe to call more than once."""
+        self._file.close()
+
+    def __enter__(self) -> "GDB":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        file = getattr(self, "_file", None)
+        if file is not None:
+            file.close()
 
     # -- header-level info -------------------------------------------------
 
@@ -155,7 +188,9 @@ class GDB:
     def channels(self) -> List[ChannelRecord]:
         if self._channels is None:
             self._channels = read_channels(self.path)
-            self._channels_by_name = {c.name: c for c in self._channels}
+            self._channels_by_name = {}
+            for c in self._channels:
+                self._channels_by_name.setdefault(c.name, []).append(c)
         return self._channels
 
     @property
@@ -166,35 +201,105 @@ class GDB:
     def lines(self) -> List[LineRecord]:
         if self._lines is None:
             self._lines = read_lines(self.path)
-            self._lines_by_name = {l.name: l for l in self._lines}
+            self._lines_by_name = {}
+            for l in self._lines:
+                self._lines_by_name.setdefault(l.name, []).append(l)
         return self._lines
 
     @property
     def line_names(self) -> List[str]:
         return [l.name for l in self.lines]
 
-    def channel(self, name: str) -> ChannelRecord:
-        """Look up a channel by name. Raises `KeyError` if it doesn't exist."""
+    def _nth_by_name(self, by_name: Dict[str, list], name: str, occurrence: int, kind: str):
+        """
+        Shared lookup for the `(name, occurrence)` form `channel()`/
+        `line()` both accept: `occurrence` is a 0-based index into every
+        record sharing `name`, in `.channels`/`.lines` order -- an
+        explicit way to pick a specific one when a plain name is
+        ambiguous, rather than raising or guessing.
+        """
+        matches = by_name.get(name)
+        if not matches:
+            raise KeyError(f"{self.path}: no {kind} named {name!r}")
+        try:
+            return matches[occurrence]
+        except IndexError:
+            raise IndexError(
+                f"{self.path}: only {len(matches)} {kind}(s) named {name!r} "
+                f"(requested occurrence {occurrence})"
+            ) from None
+
+    def channel(self, name: ChannelRef) -> ChannelRecord:
+        """
+        Look up a channel by name. Raises `KeyError` if no channel has
+        this name.
+
+        Raises `ValueError` if more than one channel shares this name --
+        a real, if unusual, on-disk possibility (confirmed for real on a
+        sample file with two channels each named `UTC`, `RADAR`, and
+        `RAWMAG`), for which there's no file-wide way to pick the
+        "right" one without a line to disambiguate against. `read()`
+        already disambiguates this automatically using line context
+        (see `_resolve_channel_on_line`).
+
+        Pass `(name, occurrence)` instead of a plain name (`occurrence`
+        a 0-based index into every channel sharing that name, in
+        `.channels` order) to pick a specific one explicitly rather than
+        relying on that, or hitting the `ValueError` above.
+        """
         if self._channels_by_name is None:
             self.channels  # populate the cache
-        try:
-            return self._channels_by_name[name]
-        except KeyError:
-            raise KeyError(f"{self.path}: no channel named {name!r}") from None
+        if isinstance(name, tuple):
+            actual_name, occurrence = name
+            return self._nth_by_name(self._channels_by_name, actual_name, occurrence, "channel")
+        matches = self._channels_by_name.get(name)
+        if not matches:
+            raise KeyError(f"{self.path}: no channel named {name!r}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"{self.path}: {len(matches)} channels are named {name!r} -- "
+                f"ambiguous without a line to disambiguate against; use "
+                f"read(line, name) (which resolves this using the line's "
+                f"own data), pass (name, occurrence) to pick a specific "
+                f"one explicitly, or pick a ChannelRecord from .channels "
+                f"yourself"
+            )
+        return matches[0]
 
-    def line(self, name: str) -> LineRecord:
-        """Look up a line by name. Raises `KeyError` if it doesn't exist."""
+    def line(self, name: LineRef) -> LineRecord:
+        """
+        Look up a line by name. Raises `KeyError` if no line has this
+        name.
+
+        Raises `ValueError` if more than one line shares this name --
+        the line table has the same on-disk shape as the channel table
+        (see `channel()`'s docstring), with nothing in the format
+        forbidding a duplicate name there either; not yet observed on a
+        real file, but handled the same way on principle rather than
+        left as a silent last-one-wins lookup.
+
+        Pass `(name, occurrence)` instead of a plain name (`occurrence`
+        a 0-based index into every line sharing that name, in `.lines`
+        order) to pick a specific one explicitly rather than hitting
+        that `ValueError`.
+        """
         if self._lines_by_name is None:
             self.lines  # populate the cache
-        try:
-            return self._lines_by_name[name]
-        except KeyError:
-            raise KeyError(f"{self.path}: no line named {name!r}") from None
+        if isinstance(name, tuple):
+            actual_name, occurrence = name
+            return self._nth_by_name(self._lines_by_name, actual_name, occurrence, "line")
+        matches = self._lines_by_name.get(name)
+        if not matches:
+            raise KeyError(f"{self.path}: no line named {name!r}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"{self.path}: {len(matches)} lines are named {name!r} -- "
+                f"ambiguous; pass (name, occurrence) to pick a specific "
+                f"one explicitly, or pick a LineRecord from .lines yourself"
+            )
+        return matches[0]
 
-    def _resolve_channel(self, channel: Union[str, ChannelRecord]) -> ChannelRecord:
-        return channel if isinstance(channel, ChannelRecord) else self.channel(channel)
-
-    def _resolve_line(self, line: Union[str, LineRecord]) -> LineRecord:
+    def _resolve_line(self, line: LineRef) -> LineRecord:
         return line if isinstance(line, LineRecord) else self.line(line)
 
     # -- data access ---------------------------------------------------------
@@ -249,41 +354,121 @@ class GDB:
             for l in lines:
                 l.index += best_offset
 
-    def channels_on_line(self, line: Union[str, LineRecord]) -> List[str]:
+    def _channels_with_data_on_line(self, line_rec: LineRecord) -> List[Tuple[ChannelRecord, BlobHeader]]:
         """
-        Names of channels that actually have a real data blob recorded
-        for `line` -- the format stores a sparse (line, channel) grid
-        (docs/spec.md section 1), so most lines only populate a subset
-        of this file's full channel list. `line` may be a line name or a
-        `LineRecord` (e.g. from `.lines`).
+        `(channel, blob)` for every channel that actually has a real data
+        blob recorded for `line_rec`, in `self.channels` order. Shared by
+        `channels_on_line` and `iter_line` so both agree on exactly which
+        channel matched -- looking a channel back up by name afterward
+        would be ambiguous for a file with duplicate channel names (real
+        channel records aren't guaranteed unique by name), so callers
+        that need the actual data should go through this, not re-resolve
+        `channels_on_line`'s returned names.
         """
-        line_rec = self._resolve_line(line)
         index = self._ensure_blob_index()
         return [
-            c.name for c in self.channels
+            (c, blob) for c in self.channels
             if (blob := index.get((line_rec.index, c.index))) is not None
             and (blob.row_count is None or blob.row_count >= 0)
         ]
 
-    def read(self, line: Union[str, LineRecord], channel: Union[str, ChannelRecord]) -> list:
+    def _resolve_channel_on_line(
+        self, line_rec: LineRecord, name: str
+    ) -> Tuple[ChannelRecord, Optional[BlobHeader]]:
+        """
+        Resolve a channel name to `(ChannelRecord, BlobHeader-or-None)`
+        for a specific line, using the line's own data to disambiguate a
+        name shared by more than one channel (see `channel()`'s
+        docstring) -- picking whichever same-named channel actually has
+        data on this line, rather than an arbitrary one. Raises
+        `KeyError` if no channel has this name at all.
+
+        If more than one same-named channel has data on this same line,
+        that's genuinely ambiguous (not just "the file happens to reuse
+        this name") and raises `ValueError` -- every real duplicate-name
+        case found so far has only one of the duplicates actually
+        populated per line, so this hasn't been observed, but there's no
+        principled way to guess if it ever is.
+        """
+        if self._channels_by_name is None:
+            self.channels  # populate the cache
+        matches = self._channels_by_name.get(name)
+        if not matches:
+            raise KeyError(f"{self.path}: no channel named {name!r}")
+        if len(matches) == 1:
+            chan_rec = matches[0]
+            blob = self._ensure_blob_index().get((line_rec.index, chan_rec.index))
+            return chan_rec, blob
+        index = self._ensure_blob_index()
+        with_data = [
+            (c, blob) for c in matches
+            if (blob := index.get((line_rec.index, c.index))) is not None
+            and (blob.row_count is None or blob.row_count >= 0)
+        ]
+        if len(with_data) > 1:
+            raise ValueError(
+                f"{self.path}: {len(with_data)} channels named {name!r} all "
+                f"have data on line {line_rec.name!r} -- genuinely "
+                f"ambiguous even with line context; pass (name, occurrence) "
+                f"to pick a specific one explicitly (occurrence is a 0-based "
+                f"index into every channel named {name!r}, in .channels "
+                f"order), or pick a ChannelRecord yourself"
+            )
+        if with_data:
+            return with_data[0]
+        # None of the same-named channels have data on this line -- report
+        # "no data" the same way an unambiguous miss would, using the
+        # first match's ChannelRecord just to name it in the warning.
+        return matches[0], None
+
+    def channels_on_line(self, line: LineRef) -> List[str]:
+        """
+        Names of channels that actually have a real data blob recorded
+        for `line` -- the format stores a sparse (line, channel) grid
+        (docs/spec.md section 1), so most lines only populate a subset
+        of this file's full channel list. `line` may be a line name, a
+        `(name, occurrence)` pair (see `line()`), or a `LineRecord`.
+
+        If two channels share a name and both have data on this line,
+        that name appears twice here (a list, so nothing is silently
+        dropped) -- use `iter_line()` instead if you need the actual
+        `ChannelRecord` for each entry, not just its name.
+        """
+        line_rec = self._resolve_line(line)
+        return [c.name for c, _blob in self._channels_with_data_on_line(line_rec)]
+
+    def read(self, line: LineRef, channel: ChannelRef) -> list:
         """
         Random access by name: decode and return every value recorded
         for `channel` on `line` (a list of numbers, or strings for a
-        string-typed channel). `line`/`channel` may be names or
+        string-typed channel). `line`/`channel` may be names,
+        `(name, occurrence)` pairs (see `line()`/`channel()`), or
         `LineRecord`/`ChannelRecord` instances.
 
         Raises `KeyError` if `line` or `channel` isn't a name this file
-        has. Returns `[]` (with a `GDBParseWarning`, per
-        `read_blob_values`) if the name is valid but this specific
-        (line, channel) pair has no data blob, or its data can't be
-        decoded -- consistent with the rest of this package's
-        degrade-gracefully philosophy for decode-time problems, as
-        opposed to a plain lookup-by-name mistake (which does raise).
+        has. If `channel` is a plain name shared by more than one
+        channel (see `channel()`'s docstring), this resolves it using
+        `line`'s own data (`_resolve_channel_on_line`) rather than
+        picking an arbitrary one -- raising `ValueError` only if that's
+        *still* ambiguous (more than one same-named channel has data on
+        this exact line); pass `(name, occurrence)` or a specific
+        `ChannelRecord` to sidestep either lookup. Returns `[]` (with a
+        `GDBParseWarning`, per `read_blob_values`) if the name is valid
+        but this specific (line, channel) pair has no data blob, or its
+        data can't be decoded -- consistent with the rest of this
+        package's degrade-gracefully philosophy for decode-time
+        problems, as opposed to a plain lookup-by-name mistake (which
+        does raise).
         """
         line_rec = self._resolve_line(line)
-        chan_rec = self._resolve_channel(channel)
-        index = self._ensure_blob_index()
-        blob = index.get((line_rec.index, chan_rec.index))
+        if isinstance(channel, ChannelRecord):
+            chan_rec = channel
+            blob = self._ensure_blob_index().get((line_rec.index, chan_rec.index))
+        elif isinstance(channel, tuple):
+            chan_rec = self.channel(channel)
+            blob = self._ensure_blob_index().get((line_rec.index, chan_rec.index))
+        else:
+            chan_rec, blob = self._resolve_channel_on_line(line_rec, channel)
         if blob is None:
             warnings.warn(
                 f"{self.path}: no data blob for line {line_rec.name!r}, "
@@ -296,14 +481,39 @@ class GDB:
         return read_blob_values(
             self.path, blob, chan_rec,
             comp_level=self.comp_level or 0, page_size=self.page_size,
+            file=self._file,
         )
 
-    def iter_line(self, line: Union[str, LineRecord]) -> Iterator[Tuple[str, list]]:
+    def iter_line(self, line: LineRef) -> Iterator[Tuple[ChannelRecord, list]]:
         """
-        Yield `(channel_name, values)` for every channel that actually
-        has data on `line`, i.e. `read(line, name)` for each name in
-        `channels_on_line(line)`.
+        Yield `(channel, values)` for every channel that actually has
+        data on `line`, via `_channels_with_data_on_line` directly
+        rather than one `read()` call per channel (saving the repeated
+        name lookups).
+
+        Yields the `ChannelRecord` itself, not just its name (`values`
+        is the same as `read(line, channel)` would give for that exact
+        channel) -- deliberately, so that if two channels share a name
+        and both have data on this line, both still come through as
+        distinct, fully-identified entries. `dict(db.iter_line(line))`
+        keyed by the records themselves preserves that; collapsing to
+        `channel.name` yourself reintroduces the same collision `read()`
+        raises on, so do that deliberately if you do it at all.
+
+        A `rayon`-based parallel batch decoder was tried for this and
+        removed: benchmarked against this project's real sample corpus,
+        it was consistently ~3x *slower* than plain sequential calls at
+        every scale tried, since this format's chunks are small enough
+        that the Rust decoder (`pygdb._native`) already finishes each one
+        in a fraction of a millisecond -- not enough work per chunk to
+        amortize rayon's per-task dispatch cost. See `rust/src/lib.rs`'s
+        module doc for the full note.
         """
         line_rec = self._resolve_line(line)
-        for name in self.channels_on_line(line_rec):
-            yield name, self.read(line_rec, name)
+        for c, blob in self._channels_with_data_on_line(line_rec):
+            values = read_blob_values(
+                self.path, blob, c,
+                comp_level=self.comp_level or 0, page_size=self.page_size,
+                file=self._file,
+            )
+            yield c, values

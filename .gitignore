@@ -12,6 +12,17 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+.venv/
 
 # MkDocs build output
 site/
+
+# Rust
+rust/target/
+rust/dist/
+pygdb/*.pyd
+pygdb/*.so
+pygdb/*.pdb
+
+# cibuildwheel local output
+wheelhouse/

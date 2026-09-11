@@ -73,6 +73,11 @@ import struct
 import warnings
 from dataclasses import dataclass
 
+try:
+    from . import _native as _native_ext
+except ImportError:
+    _native_ext = None
+
 CHUNK_MAGIC = bytes.fromhex("0f0efffe12345678")
 DB_COMP_SPEED = 1
 DB_COMP_SIZE = 2
@@ -93,6 +98,27 @@ def lzrw1_decompress(data: bytes, start: int, decompressed_length: int) -> bytes
     Decompress exactly `decompressed_length` bytes of canonical LZRW1
     data (Ross Williams' algorithm, no FLAG_BYTES prefix) starting at
     `data[start:]`. Returns the decompressed bytes.
+
+    Dispatches to the compiled `pygdb._native` extension when it's
+    available (same algorithm, ported to Rust -- see `rust/src/lib.rs`;
+    ~16x faster on real DB_COMP_SPEED data, since this per-byte loop is
+    this reader's one CPU-bound hot path), falling back to the pure-Python
+    `_lzrw1_decompress_py` below when it isn't. `_native` raises
+    `IndexError` under the same truncated/corrupt-input conditions as the
+    pure-Python version, so callers (`decode_speed_chunk`) don't need to
+    know which backend produced the error.
+    """
+    if _native_ext is not None:
+        return bytes(_native_ext.lzrw1_decompress(data, start, decompressed_length))
+    return _lzrw1_decompress_py(data, start, decompressed_length)
+
+
+def _lzrw1_decompress_py(data: bytes, start: int, decompressed_length: int) -> bytes:
+    """
+    Pure-Python reference implementation of `lzrw1_decompress` -- kept as
+    the always-available fallback when `pygdb._native` isn't built, and
+    as the documented, clean-room-derived source of truth for the
+    algorithm.
 
     This is a direct, literal port of the core loop in Ross Williams'
     own public-domain `lzrw1_decompress()` (see module docstring for the

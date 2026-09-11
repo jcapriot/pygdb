@@ -15,6 +15,7 @@ from pygdb.gdb_reader import (
     BlobHeader,
     COMPRESSED_BLOB_HEADER_SIZE,
     GDBParseWarning,
+    _decode_numeric_or_string,
     check_magic,
     find_blob,
     find_line_table,
@@ -201,6 +202,30 @@ def test_read_blob_values_uncompressed_numeric_and_string(tmp_path):
     blob = find_blob(str(path), line_slot=1, channel_slot=2)
     values = read_blob_values(str(path), blob, channels["LineName"], comp_level=0)
     assert values == ["L200", "L200"]
+
+
+def test_decode_string_channel_edge_cases(tmp_path):
+    """
+    Direct unit test for the string-decode branch's edge cases -- null
+    mid-record, exactly-width-with-no-null, and a non-ASCII byte (which
+    must become U+FFFD, matching Python's `bytes.decode("ascii",
+    errors="replace")` exactly). Exercises the dispatch to
+    `pygdb._native.decode_fixed_width_strings` when the extension is
+    built (see rust/src/lib.rs), or the pure-Python fallback otherwise --
+    both must agree with this exact expected output.
+    """
+    path = tmp_path / "test.gdb"
+    path.write_bytes(build_gdb_bytes(SIMPLE_CHANNELS, SIMPLE_LINES))
+    channel = read_channels(str(path))[2]  # LineName, string_width=8
+    assert channel.is_string
+
+    raw = (
+        b"abc\x00\x00\x00\x00\x00"              # null mid-record
+        + b"exactly8"                             # exactly width, no null at all
+        + bytes([0xC3, 0xA9]) + b"\x00" * 6       # non-ASCII bytes -> U+FFFD each
+    )
+    values = _decode_numeric_or_string(raw, channel, row_count=3)
+    assert values == ["abc", "exactly8", "��"]
 
 
 def test_iter_blobs_truncated_file_warns_and_returns_partial(tmp_path):

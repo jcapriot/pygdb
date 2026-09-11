@@ -1,0 +1,70 @@
+name: Build wheels
+
+# Builds the full release wheel matrix via cibuildwheel: one `abi3`
+# wheel per platform (from the cp312 build, covers every non-free-
+# threaded CPython >=3.12), one `abi3.abi3t` wheel per platform (from
+# the cp315t build -- PEP 803, covers *both* GIL-enabled and free-
+# threaded CPython >=3.15 with a single wheel), and one version-specific
+# wheel per platform for 3.14's free-threaded build (cp314t, which has
+# no stable-ABI option since abi3t starts at 3.15). See pyproject.toml's
+# [tool.cibuildwheel] for the exact build selector and rust/src/lib.rs's
+# module doc for what's shipped/why. Cross-arch Linux builds run under
+# QEMU emulation, which is slow -- this only runs on release tags and
+# manual dispatch, not on every push/PR (see test.yml for the fast
+# per-push feedback loop).
+#
+# This builds and uploads wheels as workflow artifacts. It does NOT
+# publish to PyPI -- that needs a PyPI "trusted publisher" configured
+# for this repository (pypi.org project settings -> Publishing), which
+# only the project owner can set up. Once that's done, add a
+# `pypa/gh-action-pypi-publish` step gated on the release-tag trigger.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+jobs:
+  build_wheels:
+    name: wheels / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        if: runner.os == 'Linux'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: all
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v4.2.1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  build_sdist:
+    name: source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist
+        run: pipx run build --sdist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz

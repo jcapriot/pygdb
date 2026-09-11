@@ -12,10 +12,13 @@ regression coverage; everyone else just doesn't run these tests.
 from __future__ import annotations
 
 import os
+import struct
 
 import pytest
 
 from pygdb import GDB
+from pygdb.gdb_reader import COMPRESSED_BLOB_HEADER_SIZE, header_fields, iter_blobs
+from pygdb.lzrw1 import CHUNK_MAGIC, DB_COMP_SPEED, _lzrw1_decompress_py, _native_ext, parse_chunk_header
 
 pytestmark = pytest.mark.usefixtures("samples_dir")
 
@@ -137,3 +140,115 @@ def test_every_line_names_channel_matches_its_own_line_name(samples_dir):
             )
     if not checked_any:
         pytest.skip("none of the line-name cross-check candidate files are present locally")
+
+
+def test_lzrw1_backends_agree_on_every_real_compressed_chunk(all_gdb_sample_paths):
+    """
+    Cross-checks pygdb._native's LZRW1 decoder against the pure-Python
+    reference implementation on every genuinely LZRW1-compressed chunk
+    in the real corpus -- not just the small hand-built fixtures in
+    test_lzrw1.py. This is the same check (originally run as a one-off
+    script) that validated the Rust port during development; captured
+    here as a permanent regression test instead of something that has to
+    be re-derived by hand if either backend ever changes.
+
+    Walks the blob chain and reads each blob's own bounded span (like
+    `read_blob_values` does) rather than loading whole files -- this
+    corpus has real files up to ~2GB, and most of the wall-clock time in
+    an earlier, cruder version of this check was `open().read()` on
+    entire files rather than actual decompression.
+
+    Skipped (not failed) if `pygdb._native` isn't built, since there's
+    nothing to cross-check against.
+    """
+    if _native_ext is None:
+        pytest.skip("pygdb._native is not built in this environment")
+
+    n_checked = 0
+    for path in all_gdb_sample_paths:
+        with open(path, "rb") as f:
+            header = f.read(128)
+            fields = header_fields(header)
+            if fields["comp_level"] != DB_COMP_SPEED:
+                continue
+            page_size = fields["page_size"]
+            if page_size is None:
+                continue
+            for blob in iter_blobs(path):
+                f.seek(blob.offset + COMPRESSED_BLOB_HEADER_SIZE)
+                probe = f.read(8)
+                if probe != CHUNK_MAGIC:
+                    continue  # "bare" blob, not a Speed chunk at all
+                f.seek(blob.offset + COMPRESSED_BLOB_HEADER_SIZE)
+                span = blob.n_pages * page_size - COMPRESSED_BLOB_HEADER_SIZE
+                raw_span = f.read(span)
+                if len(raw_span) < 16:
+                    continue
+                subtype = struct.unpack_from("<i", raw_span, 8)[0]
+                if subtype != DB_COMP_SPEED:
+                    continue
+                try:
+                    chunk = parse_chunk_header(raw_span, 0)
+                except Exception:
+                    continue
+                if not chunk.is_compressed:
+                    continue  # stored-raw -- not a decompression, nothing to cross-check
+                py_out = _lzrw1_decompress_py(raw_span, chunk.payload_offset, chunk.decompressed_length)
+                native_out = bytes(
+                    _native_ext.lzrw1_decompress(raw_span, chunk.payload_offset, chunk.decompressed_length)
+                )
+                assert native_out == py_out, (
+                    f"{os.path.basename(path)}: blob_index={blob.blob_index} backend mismatch"
+                )
+                n_checked += 1
+
+    if n_checked == 0:
+        pytest.skip("no genuinely LZRW1-compressed chunks found in the local corpus")
+
+
+def test_string_decode_backends_agree_on_every_real_string_channel(all_gdb_sample_paths):
+    """
+    Cross-checks pygdb._native's `decode_fixed_width_strings` against
+    the pure-Python reference on every real string-typed channel with
+    data in the corpus -- the same kind of permanent regression coverage
+    as the LZRW1 backend-parity check above, for the other real
+    CPU-bound hot path profiling found (see rust/src/lib.rs's module
+    doc). Skipped (not failed) if `pygdb._native` isn't built.
+    """
+    from pygdb.gdb_reader import _element_width
+    from pygdb.gdb_reader import _native_ext as gdb_reader_native_ext
+
+    if gdb_reader_native_ext is None:
+        pytest.skip("pygdb._native is not built in this environment")
+
+    n_checked = 0
+    for path in all_gdb_sample_paths:
+        db = GDB(path)
+        string_channels = [c for c in db.channels if c.is_string]
+        if not string_channels:
+            continue
+        index = db._ensure_blob_index()
+        for c in string_channels:
+            width = _element_width(c)
+            for line in db.lines:
+                blob = index.get((line.index, c.index))
+                if blob is None or blob.row_count is None or blob.row_count < 0:
+                    continue
+                with open(path, "rb") as f:
+                    f.seek(blob.data_offset)
+                    raw = f.read(blob.row_count * width)
+                n = len(raw) // width
+                if n == 0:
+                    continue
+                native_out = gdb_reader_native_ext.decode_fixed_width_strings(raw, width, n)
+                py_out = [
+                    raw[i * width:(i + 1) * width].split(b"\x00")[0].decode("ascii", errors="replace")
+                    for i in range(n)
+                ]
+                assert list(native_out) == py_out, (
+                    f"{os.path.basename(path)}: channel {c.name!r} line {line.name!r} backend mismatch"
+                )
+                n_checked += 1
+
+    if n_checked == 0:
+        pytest.skip("no real string channels with data found in the local corpus")

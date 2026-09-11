@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
 
 # Distribution name is "python-gdb" (PyPI already has an unrelated
 # package named "pygdb" -- a GNU Debugger extension), but the
@@ -26,6 +26,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: OS Independent",
 ]
 
@@ -37,8 +38,74 @@ dev = [
     "pytest>=7.0",
 ]
 
-[tool.setuptools]
-packages = ["pygdb"]
+# pygdb is pure Python at heart (see pygdb/lzrw1.py's `_native`
+# fallback) -- this package is built with maturin only so that a
+# platform/Python-version combination with a prebuilt wheel gets the
+# optional pygdb._native accelerator automatically, transparently, with
+# no extra install step. `python-source = "."` (this directory, where
+# `pygdb/` already has a real __init__.py) makes this a "mixed"
+# Rust/Python maturin project, NOT the "pure Rust" mode -- maturin
+# leaves the existing Python source alone and just adds the compiled
+# extension inside it (see maturin's project-layout docs); the auto-
+# generated-__init__.py behavior that mode is known for only applies to
+# projects with no existing Python source at all, which isn't this one.
+#
+# A platform/Python-version with no prebuilt wheel falls back to the
+# sdist, which -- being a real maturin/Cargo build -- needs a Rust
+# toolchain to build from source. That's the one real tradeoff of this
+# approach versus a pure-setuptools package: pip install python-gdb is
+# no longer *guaranteed* dependency-free on every platform, only on
+# platforms this project publishes wheels for. See rust/src/lib.rs for
+# what the accelerator actually does; the pure-Python code in pygdb/ is
+# always the reference implementation and always correct on its own.
+[tool.maturin]
+python-source = "."
+manifest-path = "rust/Cargo.toml"
+module-name = "pygdb._native"
+strip = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# cibuildwheel builds the wheel matrix described in
+# docs/contributing.md's packaging notes: one `abi3` wheel per platform
+# covering every non-free-threaded CPython >=3.12 (from the cp312 build,
+# via rust/Cargo.toml's abi3-py312 feature), one `abi3.abi3t` wheel per
+# platform covering *both* GIL-enabled and free-threaded CPython >=3.15
+# (from the cp315t build, via the abi3t-py315 feature -- PEP 803, and
+# building it specifically requires a free-threaded 3.15+ interpreter,
+# which is why cp315t stays the build identifier even though its output
+# isn't 3.15t-specific), and one version-specific, non-abi3 wheel per
+# platform for 3.14's free-threaded build (cp314t -- abi3t doesn't exist
+# before 3.15, so this one has no stable-ABI option). See
+# .github/workflows/wheels.yml for the CI matrix and rust/src/lib.rs's
+# module doc for what's actually shipped.
+[tool.cibuildwheel]
+build = "cp312-* cp314t-* cp315t-*"
+# Rust has no Cargo for musllinux 32-bit -- the one combination in this
+# matrix that's simply not buildable (confirmed in cibuildwheel's own
+# docs), not a gap in this config.
+skip = ["*-musllinux_i686"]
+test-command = "python -c \"import pygdb; from pygdb import _native; print('native backend:', _native.ping())\""
+
+[tool.cibuildwheel.linux]
+# manylinux/musllinux images come with a full C toolchain but not Rust;
+# install it fresh per build container. This is cibuildwheel's own
+# documented pattern for Rust extensions (see its FAQ's "cross-language"
+# section), not something invented here.
+before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal"
+environment = { PATH = "$HOME/.cargo/bin:$PATH" }
+archs = ["x86_64", "i686", "aarch64", "ppc64le", "s390x", "armv7l"]
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal"
+environment = { PATH = "$HOME/.cargo/bin:$PATH", MACOSX_DEPLOYMENT_TARGET = "10.12" }
+
+[tool.cibuildwheel.windows]
+# GitHub-hosted Windows runners already ship a Rust toolchain (cibuildwheel's
+# own FAQ example for Windows only adds extra targets, not a fresh
+# install) -- ARM64/i686 need their own target added on top of the
+# runner's default host target.
+before-all = "rustup target add aarch64-pc-windows-msvc i686-pc-windows-msvc"
+archs = ["AMD64", "x86", "ARM64"]

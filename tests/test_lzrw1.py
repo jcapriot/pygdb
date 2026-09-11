@@ -14,6 +14,7 @@ import struct
 
 import pytest
 
+import pygdb.lzrw1 as lzrw1_module
 from pygdb.lzrw1 import (
     CHUNK_MAGIC,
     LZRW1DecodeError,
@@ -28,26 +29,46 @@ from pygdb.lzrw1 import (
 from helpers import encode_lzrw1_literal, encode_lzrw1_literal_then_copy, pack_speed_chunk_wrapper
 
 
-def test_lzrw1_decompress_all_literal():
+@pytest.fixture(params=["python", "native"])
+def backend(request, monkeypatch):
+    """
+    Forces `lzrw1_decompress` through a specific backend for the
+    duration of a test, regardless of which one this environment would
+    pick automatically. Without this, whichever tests use it would only
+    ever exercise ONE backend per test run -- in particular, the
+    pure-Python `_lzrw1_decompress_py` fallback would never run at all
+    in any environment (this dev machine, or CI, since GitHub-hosted
+    runners ship a Rust toolchain) where `pygdb._native` happens to be
+    built, silently losing regression coverage on the reference
+    implementation every other backend is validated against.
+    """
+    if request.param == "native" and lzrw1_module._native_ext is None:
+        pytest.skip("pygdb._native is not built in this environment")
+    if request.param == "python":
+        monkeypatch.setattr(lzrw1_module, "_native_ext", None)
+    return request.param
+
+
+def test_lzrw1_decompress_all_literal(backend):
     payload = encode_lzrw1_literal(b"hello")
     assert lzrw1_decompress(payload, 0, 5) == b"hello"
 
 
-def test_lzrw1_decompress_copy_item_backreference():
+def test_lzrw1_decompress_copy_item_backreference(backend):
     # "AB" written as literals, then a copy item reaching back 2 bytes
     # for 2 bytes -- reproduces "AB" again, giving "ABAB" overall.
     payload = encode_lzrw1_literal_then_copy(b"AB", copy_offset=2, copy_length=2)
     assert lzrw1_decompress(payload, 0, 4) == b"ABAB"
 
 
-def test_lzrw1_decompress_self_overlapping_copy_is_rle_like():
+def test_lzrw1_decompress_self_overlapping_copy_is_rle_like(backend):
     # Offset 1, length 4 after a single literal 'A' is a classic LZ77
     # run-length trick: each copied byte becomes available for the next.
     payload = encode_lzrw1_literal_then_copy(b"A", copy_offset=1, copy_length=4)
     assert lzrw1_decompress(payload, 0, 5) == b"AAAAA"
 
 
-def test_lzrw1_decompress_multiple_groups():
+def test_lzrw1_decompress_multiple_groups(backend):
     # 16 literal items (one full group), then a second group with more
     # literals -- exercises the control-word-per-16-items boundary.
     first = encode_lzrw1_literal(bytes(range(16)))
@@ -59,7 +80,7 @@ def test_lzrw1_decompress_multiple_groups():
 
 # -- chunk-level parsing --------------------------------------------------------
 
-def test_parse_chunk_header_and_decode_compressed():
+def test_parse_chunk_header_and_decode_compressed(backend):
     payload = encode_lzrw1_literal(struct.pack("<2i", 1, 2))
     wrapper = pack_speed_chunk_wrapper(payload, decompressed_length=8, marker=MARKER_COMPRESSED)
 

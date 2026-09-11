@@ -1,0 +1,39 @@
+[package]
+name = "pygdb-native"
+version = "0.1.0"
+edition = "2021"
+description = "Optional Rust-accelerated backend for python-gdb (pygdb._native)"
+license = "MIT"
+repository = "https://github.com/jcapriot/pygdb"
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+# abi3-py312: build against the stable/limited API starting at 3.12, so
+# one wheel works for every non-free-threaded CPython >=3.12 instead of
+# needing a separate build per minor version.
+#
+# abi3t-py315: the free-threaded counterpart (PEP 803, accepted March
+# 2026) -- PyO3 0.29+ and maturin 1.14+ both support it. Enabling both
+# features together follows PyO3's own recommended pattern: building
+# against a target interpreter >=3.15 produces one `abi3.abi3t`-tagged
+# wheel that covers *both* the GIL-enabled and free-threaded builds of
+# that interpreter and newer, so there's no need for a separate
+# non-free-threaded 3.15 wheel alongside it. There's no equivalent for
+# 3.14 -- abi3t only exists from 3.15 onward -- so 3.14's free-threaded
+# build (cp314t) still needs its own version-specific, non-abi3 wheel;
+# see pyproject.toml's [tool.cibuildwheel] for how the build matrix
+# reflects that split.
+#
+# Building an abi3t wheel specifically requires a free-threaded 3.15+
+# interpreter at build time (not just as an install target) -- that's
+# why the cp315t build identifier stays in the matrix even though its
+# *output* is no longer 3.15t-specific.
+pyo3 = { version = "0.29", features = ["abi3-py312", "abi3t-py315", "extension-module"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

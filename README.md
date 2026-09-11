@@ -31,7 +31,11 @@ pip install python-gdb
 
 The distribution is named `python-gdb` on PyPI (`pygdb` was already
 registered there for an unrelated project), but the importable package
-is `pygdb`.
+is `pygdb`. On a platform/Python version this project publishes a
+prebuilt wheel for, that automatically includes the optional Rust
+accelerator (see below) -- nothing extra to install or configure.
+Elsewhere, `pip` falls back to building from source, which needs a Rust
+toolchain (the package itself has no required dependencies either way).
 
 ## Quick start
 
@@ -50,6 +54,45 @@ db.read("L1000", "Easting")    # random access by (line name, channel name)
 
 See [the docs](docs/index.md) for the lower-level, slot-index-based
 functions `GDB` is built on.
+
+## Optional Rust-accelerated backend
+
+The pure-Python code in `pygdb/` is always the reference implementation
+and always fully correct and usable on its own — nothing here depends
+on Rust. This package is built with [`maturin`](https://www.maturin.rs/)
+so that an optional Rust extension (`pygdb._native`, source under
+[`rust/`](rust/)) rides along and is used automatically when present:
+it accelerates the two real CPU-bound hot paths profiling found in this
+reader — LZRW1 decompression and fixed-width string decoding — roughly
+3-6x on real files, measured against this project's own sample corpus.
+`pygdb/lzrw1.py`/`pygdb/gdb_reader.py` detect it at import time and fall
+back to plain Python transparently if it isn't there.
+
+Building it yourself (e.g. for local development, or a platform without
+a published wheel) needs a Rust toolchain:
+
+```sh
+pip install -e ".[dev]"   # compiles pygdb._native as part of the install
+```
+
+or, for a release-optimized build without an editable install:
+
+```sh
+pip install maturin
+maturin build --release --manifest-path rust/Cargo.toml
+```
+
+See [`rust/src/lib.rs`](rust/src/lib.rs) for what's implemented (and,
+just as importantly, what was tried and deliberately left out after
+being benchmarked as not worth it — a parallel batch decoder and a
+memory-mapped-file I/O path, both documented there with real numbers),
+and [`.github/workflows/wheels.yml`](.github/workflows/wheels.yml) for
+the released wheel matrix: an `abi3` wheel per platform covering every
+non-free-threaded CPython ≥3.12, an `abi3.abi3t` wheel per platform
+(PEP 803) covering both the GIL-enabled and free-threaded builds of
+CPython ≥3.15 with a single wheel, and one version-specific wheel per
+platform for 3.14's free-threaded build (`3.14t` has no stable-ABI
+option — `abi3t` only exists from 3.15 onward).
 
 ## Documentation
 

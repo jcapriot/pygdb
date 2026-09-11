@@ -8,7 +8,7 @@ import pytest
 
 from pygdb import GDB
 
-from helpers import ChannelSpec, LineSpec, build_gdb_bytes, pack_line_record
+from helpers import ChannelSpec, LineSpec, build_gdb_bytes, pack_line_record, pack_plain_blob
 
 CHANNELS = [
     ChannelSpec("Fiducial", dtype_code=3),
@@ -41,6 +41,24 @@ def test_gdb_rejects_bad_magic(tmp_path):
     path.write_bytes(b"NOPE" + b"\x00" * 60)
     with pytest.raises(ValueError):
         GDB(str(path))
+
+
+def test_gdb_context_manager_closes_file(tmp_path):
+    path = tmp_path / "ctx.gdb"
+    path.write_bytes(build_gdb_bytes(CHANNELS, LINES, comp_level=0))
+    with GDB(str(path)) as db:
+        assert db.read("L100", "Easting") == [100.0, 100.5, 101.0]
+    assert db._file.closed
+    with pytest.raises(ValueError):
+        db.read("L100", "Easting")  # reading after close should error, not crash
+
+
+def test_gdb_close_is_idempotent(tmp_path):
+    path = tmp_path / "close.gdb"
+    path.write_bytes(build_gdb_bytes(CHANNELS, LINES, comp_level=0))
+    db = GDB(str(path))
+    db.close()
+    db.close()  # must not raise
 
 
 def test_gdb_lines_and_channels(db):
@@ -81,7 +99,10 @@ def test_gdb_read_missing_pair_warns_and_returns_empty(db):
 
 
 def test_gdb_iter_line(db):
-    seen = dict(db.iter_line("L100"))
+    # iter_line yields (ChannelRecord, values), not (name, values) -- see
+    # its docstring for why (duplicate channel names must not silently
+    # collapse if converted to a dict).
+    seen = {c.name: values for c, values in db.iter_line("L100")}
     assert seen["Easting"] == [100.0, 100.5, 101.0]
     assert set(seen) == {"Fiducial", "Easting", "Depths"}
 
@@ -127,3 +148,175 @@ def test_gdb_calibrates_line_indices_around_a_phantom_first_slot(tmp_path):
     # And the corrected indices should be directly visible too.
     assert db.line("L100").index == 1
     assert db.line("L200").index == 2
+
+
+# -- duplicate-channel-name disambiguation regression tests -------------------
+
+def test_gdb_channel_raises_on_duplicate_name(tmp_path):
+    """
+    Regression test for a real bug found on a real sample (GSQ
+    melinda1/DB_Mag_1213.gdb, which has two channels each named UTC,
+    RADAR, and RAWMAG): GDB.channel() used to resolve a name via a plain
+    `{name: ChannelRecord}` dict, silently returning whichever duplicate
+    was inserted last. There's no file-wide way to pick the "right" one
+    without a line to disambiguate against, so this should raise instead
+    of guessing.
+    """
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("Dup", dtype_code=5),
+        ChannelSpec("Dup", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={"Fiducial": [1, 2]})]
+    path = tmp_path / "dup.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+    with pytest.raises(ValueError):
+        db.channel("Dup")
+
+
+def test_gdb_read_disambiguates_duplicate_channel_name_using_line_data(tmp_path):
+    """
+    The actual real-world shape of the bug above: two channels share a
+    name, but only *one* of them has data on a given line (true for
+    every real duplicate-name case found so far). `read()` must resolve
+    to whichever one actually has the data, not an arbitrary duplicate.
+
+    `LineSpec.data` is keyed by channel name, so it can't express "only
+    the second 'Dup' channel has data" directly (both same-named
+    channels would get a blob) -- built manually here instead: the base
+    file has no data at all under the shared name, then one blob is
+    appended by hand for channel index 2 (the second "Dup") only.
+    """
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("Dup", dtype_code=5),   # index 1 -- stays empty
+        ChannelSpec("Dup", dtype_code=5),   # index 2 -- gets the real data
+    ]
+    lines = [LineSpec("L100", data={"Fiducial": [1, 2]})]
+    page_size = 64
+    base = bytearray(build_gdb_bytes(channels, lines, page_size=page_size))
+
+    chans_max = len(channels)
+    blob_index = 0 * chans_max + 2  # line_index 0, channel_index 2
+    base += pack_plain_blob(blob_index, [42.0, 43.0], dtype_code=5, page_size=page_size)
+
+    path = tmp_path / "dup_resolved.gdb"
+    path.write_bytes(bytes(base))
+    db = GDB(str(path))
+
+    with pytest.raises(ValueError):
+        db.channel("Dup")  # still ambiguous without line context
+
+    assert db.read("L100", "Dup") == [42.0, 43.0]
+
+
+def test_gdb_read_raises_on_genuine_same_line_ambiguity(tmp_path):
+    """
+    If two same-named channels *both* have data on the same line,
+    there's no principled way to auto-pick one -- unlike the common
+    "only one duplicate is populated" case above, this should raise
+    rather than silently return either.
+    """
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("Dup", dtype_code=5),
+        ChannelSpec("Dup", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={"Fiducial": [1, 2], "Dup": [1.0, 2.0]})]
+    path = tmp_path / "dup_ambiguous.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+    with pytest.raises(ValueError):
+        db.read("L100", "Dup")
+
+
+def test_gdb_line_raises_on_duplicate_name(tmp_path):
+    """
+    Regression test mirroring channel()'s ambiguity handling: nothing in
+    the format forbids two lines sharing a name (docs/spec.md section
+    3.2 documents no uniqueness constraint, and the line table has the
+    same shape as the channel table, which is already confirmed to allow
+    duplicates on a real file) -- line() must raise rather than silently
+    picking whichever was inserted last into a plain-dict lookup.
+    """
+    lines = [
+        LineSpec("Dup", data={"Fiducial": [1, 2]}),
+        LineSpec("Dup", data={"Fiducial": [3, 4]}),
+    ]
+    path = tmp_path / "dup_line.gdb"
+    path.write_bytes(build_gdb_bytes(CHANNELS, lines))
+    db = GDB(str(path))
+    with pytest.raises(ValueError):
+        db.line("Dup")
+
+
+def test_gdb_occurrence_tuple_disambiguates_lines_and_channels(tmp_path):
+    """
+    The (name, occurrence) escape hatch: pick a specific line or channel
+    among duplicates by its 0-based position in .lines/.channels order,
+    instead of hitting the ValueError line()/channel() raise for an
+    ambiguous plain name -- and read() accepts the tuple form directly
+    for its `channel` argument too.
+    """
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("Dup", dtype_code=5),   # occurrence 0 -- stays empty
+        ChannelSpec("Dup", dtype_code=5),   # occurrence 1 -- gets data
+    ]
+    lines = [
+        LineSpec("DupLine", data={"Fiducial": [1, 2]}),   # occurrence 0
+        LineSpec("DupLine", data={"Fiducial": [3, 4]}),   # occurrence 1
+    ]
+    page_size = 64
+    base = bytearray(build_gdb_bytes(channels, lines, page_size=page_size))
+    chans_max = len(channels)
+    blob_index = 1 * chans_max + 2  # line occurrence 1, channel occurrence 1
+    base += pack_plain_blob(blob_index, [99.0, 98.0], dtype_code=5, page_size=page_size)
+    path = tmp_path / "occurrence.gdb"
+    path.write_bytes(bytes(base))
+    db = GDB(str(path))
+
+    assert db.channel(("Dup", 0)).index == 1
+    assert db.channel(("Dup", 1)).index == 2
+    assert db.line(("DupLine", 0)) is not db.line(("DupLine", 1))
+    assert db.line(("DupLine", 0)).name == db.line(("DupLine", 1)).name == "DupLine"
+
+    assert db.read(("DupLine", 1), ("Dup", 1)) == [99.0, 98.0]
+
+    with pytest.raises(IndexError):
+        db.channel(("Dup", 5))
+    with pytest.raises(IndexError):
+        db.line(("DupLine", 5))
+    with pytest.raises(KeyError):
+        db.channel(("NoSuchChannel", 0))
+
+
+def test_gdb_iter_line_yields_both_entries_for_duplicate_channel_names(tmp_path):
+    """
+    Regression test for a bug found while designing the fix above:
+    iter_line() used to yield (name, values) pairs, so
+    dict(db.iter_line(line)) would silently drop one channel's data if
+    two channels shared a name and both had data on the same line.
+    Yielding (ChannelRecord, values) instead means both entries survive
+    even when the caller builds a dict keyed by the record itself.
+    """
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("Dup", dtype_code=5),
+        ChannelSpec("Dup", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={"Fiducial": [1, 2], "Dup": [10.0, 20.0]})]
+    path = tmp_path / "iter_dup.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    results = list(db.iter_line("L100"))
+    dup_entries = [(c, v) for c, v in results if c.name == "Dup"]
+    assert len(dup_entries) == 2  # both channels came through, not collapsed
+    assert {c.index for c, _v in dup_entries} == {1, 2}
+    for _c, values in dup_entries:
+        assert values == [10.0, 20.0]
+
+    by_record = dict(results)
+    assert len(by_record) == 3  # Fiducial + both Dup channels, keyed by record

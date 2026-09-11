@@ -43,15 +43,21 @@ produce this code.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import struct
 import warnings
 import zlib
 from dataclasses import dataclass
 
-from typing import List, Optional, Tuple
+from typing import BinaryIO, List, Optional, Tuple
 
 from . import lzrw1 as _lzrw1
+
+try:
+    from . import _native as _native_ext
+except ImportError:
+    _native_ext = None
 
 
 class GDBParseWarning(RuntimeWarning):
@@ -159,8 +165,16 @@ DB_ARRAY_BASETYPE_NAMES = {
 }
 
 
-@dataclass
+@dataclass(eq=False)
 class ChannelRecord:
+    # eq=False -- keep the default identity-based __eq__/__hash__ instead
+    # of dataclass's usual field-by-field one, so instances stay hashable
+    # (GDB.iter_line() yields these and documents `dict(...)` keyed by
+    # the record itself as safe -- see its docstring -- which needs
+    # __hash__ to actually work). Value equality between two separately-
+    # constructed-but-identical records is never used anywhere in this
+    # codebase; every real lookup returns the same cached instance from
+    # GDB.channels, so identity is all that's ever needed in practice.
     index: int
     offset: int
     name: str
@@ -474,7 +488,7 @@ _LINE_TABLE_EMPTY_CATEGORY = 65536  # [CONFIRMED] sentinel seen on unused line-t
 _NAME_LIKE_RE = re.compile(rb"[\x20-\x7e]{1,63}\x00")
 
 
-@dataclass
+@dataclass(eq=False)
 class LineRecord:
     """
     One 128-byte line-table record. [LIKELY]/[UNKNOWN] -- much less firmly
@@ -483,6 +497,13 @@ class LineRecord:
     table itself (find_line_table below) is a heuristic scan rather than
     the structurally-proven SUPER-anchor technique used for the channel
     table. See docs/spec.md section 3.2 and docs/provenance/notes.md section 6.3.
+
+    `eq=False` keeps the default identity-based `__eq__`/`__hash__`
+    instead of dataclass's usual field-by-field one -- needed both to
+    stay hashable (see `ChannelRecord`'s docstring for why) and because
+    `GDB._calibrate_line_indices` mutates `.index` in place on these
+    after construction; a value-based `__eq__`/`__hash__` pair would be
+    actively wrong for an object whose fields change post-construction.
     """
     index: int         # 0-based physical slot number -- this IS line_slot_index
                         # in the blob_index formula (BlobHeader.line_channel)
@@ -947,6 +968,14 @@ def _decode_numeric_or_string(raw: bytes, channel: ChannelRecord, row_count: Opt
     values of `channel`'s known type. Shared by the uncompressed and
     compressed decode paths.
 
+    String-typed channels dispatch to the compiled `pygdb._native`
+    extension when it's available (same decode, ported to Rust -- see
+    `rust/src/lib.rs`'s `decode_fixed_width_strings`; profiling found
+    this the second real CPU-bound hot path in this reader besides
+    LZRW1, unlike numeric decode which stays near memory-bandwidth speed
+    via `struct.unpack` either way), falling back to the pure-Python list
+    comprehension below when it isn't.
+
     Fails gracefully rather than raising: an unrecognized element type
     returns `[]` with a `GDBParseWarning`; a `raw` buffer shorter than
     needed for the requested `row_count` (the file was truncated mid-
@@ -974,6 +1003,8 @@ def _decode_numeric_or_string(raw: bytes, channel: ChannelRecord, row_count: Opt
         )
         n = n_available
     if channel.is_string:
+        if _native_ext is not None:
+            return _native_ext.decode_fixed_width_strings(raw, width, n)
         return [
             raw[i * width : (i + 1) * width].split(b"\x00")[0].decode("ascii", errors="replace")
             for i in range(n)
@@ -982,8 +1013,28 @@ def _decode_numeric_or_string(raw: bytes, channel: ChannelRecord, row_count: Opt
     return list(struct.unpack(f"<{n}{fmt}", raw[: n * width]))
 
 
+@contextlib.contextmanager
+def _file_handle(path: str, file: Optional[BinaryIO]):
+    """
+    Yield `file` directly if given (an already-open handle a caller
+    wants reused across many calls), otherwise open `path` fresh and
+    close it on exit -- lets `read_blob_values` support both "just give
+    me a path" (the default, used everywhere else in this module) and
+    "reuse this open handle" (what `GDB` does, to avoid reopening the
+    file on every single read -- benchmarked at ~1.7-1.9x slower per
+    call otherwise, see the project's Rust-plan notes) with the same
+    `with _file_handle(path, file) as f:` call sites either way.
+    """
+    if file is not None:
+        yield file
+    else:
+        with open(path, "rb") as f:
+            yield f
+
+
 def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
-                      comp_level: int = 0, page_size: Optional[int] = None):
+                      comp_level: int = 0, page_size: Optional[int] = None,
+                      file: Optional[BinaryIO] = None):
     """
     Decode a found blob's real row data using the owning channel's
     already-known type (from the symbol table, docs/provenance/notes.md section 6.2).
@@ -1040,6 +1091,15 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
     warn and return `[]` rather than a partial decode -- documented
     here rather than silently implied to be as complete as the
     plain-data truncation handling.
+
+    `file`: an already-open binary file handle for `path`, reused
+    instead of opening `path` fresh -- pass this if you're calling this
+    function many times for the same file (e.g. `GDB` does, internally).
+    Reopening `path` on every call is real, measured overhead (~1.7-1.9x
+    slower per call, benchmarked against this project's real sample
+    corpus -- see the Rust-plan's M4 notes); `file=None` (the default)
+    keeps this function's plain "just give me a path" behavior for every
+    other caller.
     """
     if comp_level == 0:
         if blob.row_count < 0:
@@ -1057,7 +1117,7 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
                 f"type this reader doesn't know how to decode -- returning no values"
             )
             return []
-        with open(path, "rb") as f:
+        with _file_handle(path, file) as f:
             f.seek(blob.data_offset)
             raw = f.read(blob.row_count * width)
         return _decode_numeric_or_string(raw, channel, blob.row_count)
@@ -1065,7 +1125,7 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
     # comp_level != 0: could still be any of three real on-disk variants
     # (docs/provenance/notes.md section 6.6b) -- check which one this specific blob
     # actually is rather than assuming from the file-level comp_level.
-    with open(path, "rb") as f:
+    with _file_handle(path, file) as f:
         f.seek(blob.offset + COMPRESSED_BLOB_HEADER_SIZE)
         chunk_magic_probe = f.read(8)
     if len(chunk_magic_probe) < 8:
@@ -1095,7 +1155,7 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
                 f"type this reader doesn't know how to decode -- returning no values"
             )
             return []
-        with open(path, "rb") as f:
+        with _file_handle(path, file) as f:
             f.seek(blob.data_offset)
             raw = f.read(blob.row_count * width)
         return _decode_numeric_or_string(raw, channel, blob.row_count)
@@ -1114,7 +1174,7 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
     # chunk_length fields already span the full compressed length
     # regardless of how many pages it spilled into) is sufficient.
     if page_size is None:
-        with open(path, "rb") as f:
+        with _file_handle(path, file) as f:
             header = f.read(128)
         try:
             page_size = struct.unpack_from("<i", header, 100)[0]
@@ -1124,7 +1184,7 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
                 f"page_size -- cannot decode, returning no values"
             )
             return []
-    with open(path, "rb") as f:
+    with _file_handle(path, file) as f:
         f.seek(blob.offset + COMPRESSED_BLOB_HEADER_SIZE)
         expected_span = blob.n_pages * page_size - COMPRESSED_BLOB_HEADER_SIZE
         raw_span = f.read(expected_span)

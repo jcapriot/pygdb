@@ -1,0 +1,39 @@
+name: Test
+
+# Fast feedback on every push/PR: one native build per OS/Python
+# combination (GitHub-hosted runners ship a Rust toolchain, so this
+# `pip install -e .` compiles pygdb._native too -- quick, since it's one
+# small crate, not the full cross-platform/cross-arch matrix). That
+# means this exercises the accelerated backend, not the pure-Python
+# fallback path -- see wheels.yml for the actual release wheel matrix
+# (only runs on release tags / manual dispatch, since cross-arch builds
+# under QEMU are genuinely slow).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    name: pytest (${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install (pure Python -- no Rust toolchain here)
+        run: pip install -e ".[dev]"
+
+      - name: Run tests
+        run: pytest

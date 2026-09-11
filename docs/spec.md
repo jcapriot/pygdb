@@ -789,6 +789,13 @@ above lives in this repository:
   compression mode and coordinate system(s). Corrects the §3.2 line-
   indexing caveat against the real blob chain before exposing lines by
   name.
+- `rust/src/lib.rs` — an optional, opt-in Rust port (`pygdb._native`,
+  built with `maturin`) of this reader's two measured CPU-bound hot
+  paths: LZRW1 decompression and fixed-width string decoding. Purely an
+  accelerator, not a second implementation of the format -- the Python
+  reader above stays the source of truth, and `_native` is validated
+  against it bit-for-bit on this project's real sample corpus, not just
+  synthetic fixtures.
 
 Run `python -m pygdb.gdb_reader <path-to.gdb>` for a demo: header
 fields, the full channel list, and a decoded sample of real data from
