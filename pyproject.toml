@@ -106,19 +106,44 @@ audit-command = "python -c \"import subprocess, sys; p = sys.argv[1]; (print(f'c
 # install it fresh per build container. This is cibuildwheel's own
 # documented pattern for Rust extensions (see its FAQ's "cross-language"
 # section), not something invented here.
+#
+# Full set for reference/local use -- .github/workflows/wheels.yml
+# overrides this per-runner via CIBW_ARCHS: x86_64/i686 run natively on
+# ubuntu-latest (i686 is multilib on the same x86_64 host, not actually
+# a foreign arch); aarch64/armv7l run natively on ubuntu-24.04-arm (a
+# real aarch64 host, which can also execute 32-bit armv7 code directly
+# -- both GA, free hosted runners as of 2026); ppc64le/s390x have no
+# native GitHub-hosted runner at all and stay QEMU-emulated on
+# ubuntu-latest, since there's genuinely no alternative for them.
 before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal"
 environment = { PATH = "$HOME/.cargo/bin:$PATH" }
 archs = ["x86_64", "i686", "aarch64", "ppc64le", "s390x", "armv7l"]
 
 [tool.cibuildwheel.macos]
+# Full set for reference/local use -- .github/workflows/wheels.yml
+# overrides this per-runner via CIBW_ARCHS (arm64 on macos-latest,
+# x86_64 on macos-15-intel), so each build is native, not cross-
+# compiled: GitHub's macos-latest runners are arm64 (Apple Silicon)
+# natively, and rustup's default install only adds that native target,
+# not x86_64-apple-darwin -- building x86_64 there would need an extra
+# `rustup target add`, which running it on its own native Intel runner
+# avoids needing at all.
 archs = ["x86_64", "arm64"]
 before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal"
-environment = { PATH = "$HOME/.cargo/bin:$PATH", MACOSX_DEPLOYMENT_TARGET = "10.12" }
+environment = { PATH = "$HOME/.cargo/bin:$PATH", MACOSX_DEPLOYMENT_TARGET = "10.13" }
 
 [tool.cibuildwheel.windows]
 # GitHub-hosted Windows runners already ship a Rust toolchain (cibuildwheel's
 # own FAQ example for Windows only adds extra targets, not a fresh
-# install) -- ARM64/i686 need their own target added on top of the
-# runner's default host target.
+# install). Full set for reference/local use -- .github/workflows/wheels.yml
+# overrides this per-runner via CIBW_ARCHS: AMD64/x86 build natively on
+# windows-latest (x86 is a normal cross-linked target from an x64 MSVC
+# host, not a foreign arch); ARM64 builds natively on windows-11-arm (GA,
+# free hosted runner as of 2026) instead of being cross-compiled from
+# windows-latest. `rustup target add` for both non-default targets is
+# left unconditional here rather than split per-runner -- adding a target
+# that's already installed (e.g. aarch64 on windows-11-arm, if that's its
+# native default) is a harmless no-op, and it's not worth a more precise,
+# harder-to-verify conditional for what's at most a few wasted seconds.
 before-all = "rustup target add aarch64-pc-windows-msvc i686-pc-windows-msvc"
 archs = ["AMD64", "x86", "ARM64"]
