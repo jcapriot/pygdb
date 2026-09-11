@@ -107,17 +107,20 @@ audit-command = "python -c \"import subprocess, sys; p = sys.argv[1]; (print(f'c
 # documented pattern for Rust extensions (see its FAQ's "cross-language"
 # section), not something invented here.
 #
-# Full set for reference/local use -- .github/workflows/wheels.yml
-# overrides this per-runner via CIBW_ARCHS: x86_64/i686 run natively on
-# ubuntu-latest (i686 is multilib on the same x86_64 host, not actually
-# a foreign arch); aarch64/armv7l run natively on ubuntu-24.04-arm (a
-# real aarch64 host, which can also execute 32-bit armv7 code directly
-# -- both GA, free hosted runners as of 2026); ppc64le/s390x have no
-# native GitHub-hosted runner at all and stay QEMU-emulated on
-# ubuntu-latest, since there's genuinely no alternative for them.
+# ppc64le/s390x/armv7l are deliberately not built at all: rustup's own
+# bootstrap script fails outright on these under QEMU emulation (tried,
+# confirmed by real CI failures, not assumed) -- ppc64le/s390x have much
+# weaker Rust *host*-toolchain support than they do as compile targets,
+# and armv7l-under-QEMU is flaky enough that even numpy's own
+# cibuildwheel config skips ppc64le/s390x and doesn't attempt armv7l
+# either. x86_64/i686 run natively on ubuntu-latest (i686 is multilib on
+# the same x86_64 host, not actually a foreign arch); aarch64 runs
+# natively on ubuntu-24.04-arm (a real aarch64 host, GA and free for
+# public repos as of 2026) -- see .github/workflows/wheels.yml, which
+# overrides this per-runner via CIBW_ARCHS.
 before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal"
 environment = { PATH = "$HOME/.cargo/bin:$PATH" }
-archs = ["x86_64", "i686", "aarch64", "ppc64le", "s390x", "armv7l"]
+archs = ["x86_64", "i686", "aarch64"]
 
 [tool.cibuildwheel.macos]
 # Full set for reference/local use -- .github/workflows/wheels.yml

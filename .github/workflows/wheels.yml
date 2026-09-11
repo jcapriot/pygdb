@@ -11,26 +11,25 @@ name: Build wheels
 # module doc for what's shipped/why.
 #
 # The matrix below splits each OS across as many *native* runners as
-# GitHub actually hosts, rather than cross-compiling/emulating more than
-# necessary: arm64 macOS (macos-latest) and x86_64 macOS (macos-15-intel)
-# each build their own native arch instead of one cross-compiling for
-# the other; aarch64/armv7l Linux (ubuntu-24.04-arm, a real aarch64 host
-# that can also run 32-bit armv7 code directly) run natively instead of
-# under QEMU; ARM64 Windows (windows-11-arm) builds natively instead of
-# being cross-compiled from windows-latest. Only ppc64le/s390x Linux
-# have no native GitHub-hosted runner at all and stay QEMU-emulated on
-# ubuntu-latest -- there's genuinely no alternative for those two.
-# `pyproject.toml`'s per-platform `archs` lists the full set each OS is
-# capable of; `CIBW_ARCHS` below narrows that to what each specific
-# runner should actually build.
+# GitHub actually hosts, so nothing here is cross-compiled or QEMU-
+# emulated: arm64 macOS (macos-latest) and x86_64 macOS (macos-15-intel)
+# each build their own native arch; aarch64 Linux (ubuntu-24.04-arm, a
+# real aarch64 host) and x86_64/i686 Linux (ubuntu-latest) likewise;
+# ARM64 Windows (windows-11-arm) builds natively instead of being cross-
+# compiled from windows-latest. ppc64le/s390x/armv7l are deliberately
+# not built at all -- rustup's own bootstrap script failed outright under
+# QEMU emulation for them (a real, reproduced CI failure, not assumed),
+# and numpy's own cibuildwheel config skips the same two ppc64le/s390x
+# for similar reasons. See pyproject.toml's [tool.cibuildwheel.linux]
+# for the full rationale. `pyproject.toml`'s per-platform `archs` lists
+# what each OS is capable of; `CIBW_ARCHS` below narrows that to what
+# each specific runner should actually build.
 #
 # Builds run on the same triggers as test.yml (push to main, every PR,
-# manual dispatch) -- cross-arch/QEMU builds are genuinely slow, but
-# that's an accepted cost here, not something this workflow tries to
-# avoid. The *build* jobs are deliberately ungated; only `publish`, at
-# the bottom, is gated, and on a different trigger entirely (a GitHub
-# Release being published) so an ordinary push/PR never has a path to
-# actually uploading anything to PyPI.
+# manual dispatch). The *build* jobs are deliberately ungated; only
+# `publish`, at the bottom, is gated, and on a different trigger
+# entirely (a GitHub Release being published) so an ordinary push/PR
+# never has a path to actually uploading anything to PyPI.
 #
 # `publish` needs a PyPI "trusted publisher" configured for this
 # repository (pypi.org project settings -> Publishing, pointing at this
@@ -54,9 +53,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            archs: "x86_64 i686 ppc64le s390x"
+            archs: "x86_64 i686"
           - os: ubuntu-24.04-arm
-            archs: "aarch64 armv7l"
+            archs: "aarch64"
           - os: windows-latest
             archs: "AMD64 x86"
           - os: windows-11-arm
@@ -68,12 +67,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        if: runner.os == 'Linux'
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: all
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v4.2.1
