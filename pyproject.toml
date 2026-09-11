@@ -87,6 +87,19 @@ build = "cp312-* cp314t-* cp315t-*"
 # docs), not a gap in this config.
 skip = ["*-musllinux_i686"]
 test-command = "python -c \"import pygdb; from pygdb import _native; print('native backend:', _native.ping())\""
+# cibuildwheel's default (`abi3audit --strict --report {abi3_wheel}`)
+# runs on any wheel with an abi3 tag in its filename -- which per its
+# own docs means both plain `abi3` wheels AND our `abi3.abi3t` one, since
+# the substring "abi3" is present in the latter too. abi3audit itself
+# doesn't understand the abi3t tag at all yet (PEP 803 was only accepted
+# March 2026; abi3audit's own README has no mention of abi3t/free-
+# threading as of this writing), so it fails outright there -- not a
+# real violation. This keeps the real audit for the plain-abi3 (cp312)
+# wheel, where it's a genuinely useful check, and only skips it for the
+# abi3t one specifically (matched by filename, since that's the only
+# signal available here) -- drop the `abi3t` special case once abi3audit
+# adds support for it.
+audit-command = "python -c \"import subprocess, sys; p = sys.argv[1]; (print(f'cibuildwheel: skipping abi3audit for {p} -- abi3t tag not supported by abi3audit yet') if 'abi3t' in p else subprocess.run(['abi3audit', '--strict', '--report', p], check=True))\" {abi3_wheel}"
 
 [tool.cibuildwheel.linux]
 # manylinux/musllinux images come with a full C toolchain but not Rust;
