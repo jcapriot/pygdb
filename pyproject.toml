@@ -17,7 +17,14 @@ authors = [
     { name = "Joseph Capriotti", email = "josephrcapriotti@gmail.com" },
 ]
 requires-python = ">=3.12"
-dependencies = []
+# numpy is a real (required) dependency specifically so VA/array
+# channels (docs/spec.md section 5 -- a fixed-width vector of values
+# per row, e.g. a 512-wide airborne gamma-ray spectrum) can be returned
+# correctly shaped as (n_rows, array_width) instead of one flat,
+# unshapeable buffer. >=2.2 is past numpy's early/experimental
+# free-threaded-wheel work (relevant since this project ships its own
+# cp314t/cp315t wheels -- a GIL-only numpy would undermine that).
+dependencies = ["numpy>=2.2"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",

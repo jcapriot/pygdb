@@ -217,9 +217,12 @@ def read_grd(path: str):
     """
     Read a .grd file and return (header, values) where `values` is an
     `array.array` of the grid's raw (unscaled) element values in
-    on-disk order (row-major per the file's own `ordering`/KX flag;
-    reshaping is left to the caller since numpy is not a dependency of
-    this module).
+    on-disk order (row-major per the file's own `ordering`/KX flag).
+    numpy is a dependency of the `pygdb` package as a whole (see
+    `gdb_reader.py`'s VA/array-channel decoding), but this module's own
+    `.grd` reading doesn't need it -- a grid's shape is already fully
+    known from `shape_e`/`shape_v`, so reshaping is left to the caller
+    rather than done here.
 
     A file too short to even hold the 512-byte header raises `ValueError`
     (there's nothing to return at all in that case). Beyond that, this

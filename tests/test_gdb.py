@@ -4,6 +4,7 @@ Unit tests for the pygdb.GDB high-level facade.
 
 from __future__ import annotations
 
+import numpy.testing as npt
 import pytest
 
 from pygdb import GDB
@@ -47,7 +48,7 @@ def test_gdb_context_manager_closes_file(tmp_path):
     path = tmp_path / "ctx.gdb"
     path.write_bytes(build_gdb_bytes(CHANNELS, LINES, comp_level=0))
     with GDB(str(path)) as db:
-        assert db.read("L100", "Easting") == [100.0, 100.5, 101.0]
+        npt.assert_array_equal(db.read("L100", "Easting"), [100.0, 100.5, 101.0])
     assert db._file.closed
     with pytest.raises(ValueError):
         db.read("L100", "Easting")  # reading after close should error, not crash
@@ -87,15 +88,23 @@ def test_gdb_channels_on_line_reflects_sparse_grid(db):
 
 
 def test_gdb_read_by_name(db):
-    assert db.read("L100", "Easting") == [100.0, 100.5, 101.0]
-    assert db.read("L200", "Fiducial") == [10, 11]
+    npt.assert_array_equal(db.read("L100", "Easting"), [100.0, 100.5, 101.0])
+    npt.assert_array_equal(db.read("L200", "Fiducial"), [10, 11])
+
+
+def test_gdb_read_array_channel_returns_2d(db):
+    values = db.read("L100", "Depths")
+    assert values.shape == (3, 3)
+    npt.assert_array_equal(
+        values, [[0.0, 1.5, 3.0], [4.5, 6.0, 7.5], [9.0, 10.5, 12.0]],
+    )
 
 
 def test_gdb_read_missing_pair_warns_and_returns_empty(db):
     from pygdb import GDBParseWarning
     with pytest.warns(GDBParseWarning):
         values = db.read("L200", "Depths")
-    assert values == []
+    npt.assert_array_equal(values, [])
 
 
 def test_gdb_iter_line(db):
@@ -103,14 +112,14 @@ def test_gdb_iter_line(db):
     # its docstring for why (duplicate channel names must not silently
     # collapse if converted to a dict).
     seen = {c.name: values for c, values in db.iter_line("L100")}
-    assert seen["Easting"] == [100.0, 100.5, 101.0]
+    npt.assert_array_equal(seen["Easting"], [100.0, 100.5, 101.0])
     assert set(seen) == {"Fiducial", "Easting", "Depths"}
 
 
 def test_gdb_accepts_record_objects_not_just_names(db):
     line_rec = db.line("L100")
     chan_rec = db.channel("Easting")
-    assert db.read(line_rec, chan_rec) == [100.0, 100.5, 101.0]
+    npt.assert_array_equal(db.read(line_rec, chan_rec), [100.0, 100.5, 101.0])
     assert set(db.channels_on_line(line_rec)) == {"Fiducial", "Easting", "Depths"}
 
 
@@ -141,8 +150,8 @@ def test_gdb_calibrates_line_indices_around_a_phantom_first_slot(tmp_path):
     # Before calibration, read_lines() alone would report index 0/1 here;
     # GDB must correct that against the real blob chain so random access
     # by name still works.
-    assert db.read("L100", "Easting") == [100.0, 100.5, 101.0]
-    assert db.read("L200", "Fiducial") == [10, 11]
+    npt.assert_array_equal(db.read("L100", "Easting"), [100.0, 100.5, 101.0])
+    npt.assert_array_equal(db.read("L200", "Fiducial"), [10, 11])
     assert set(db.channels_on_line("L100")) == {"Fiducial", "Easting", "Depths"}
 
     # And the corrected indices should be directly visible too.
@@ -208,7 +217,7 @@ def test_gdb_read_disambiguates_duplicate_channel_name_using_line_data(tmp_path)
     with pytest.raises(ValueError):
         db.channel("Dup")  # still ambiguous without line context
 
-    assert db.read("L100", "Dup") == [42.0, 43.0]
+    npt.assert_array_equal(db.read("L100", "Dup"), [42.0, 43.0])
 
 
 def test_gdb_read_raises_on_genuine_same_line_ambiguity(tmp_path):
@@ -282,7 +291,7 @@ def test_gdb_occurrence_tuple_disambiguates_lines_and_channels(tmp_path):
     assert db.line(("DupLine", 0)) is not db.line(("DupLine", 1))
     assert db.line(("DupLine", 0)).name == db.line(("DupLine", 1)).name == "DupLine"
 
-    assert db.read(("DupLine", 1), ("Dup", 1)) == [99.0, 98.0]
+    npt.assert_array_equal(db.read(("DupLine", 1), ("Dup", 1)), [99.0, 98.0])
 
     with pytest.raises(IndexError):
         db.channel(("Dup", 5))
@@ -316,7 +325,7 @@ def test_gdb_iter_line_yields_both_entries_for_duplicate_channel_names(tmp_path)
     assert len(dup_entries) == 2  # both channels came through, not collapsed
     assert {c.index for c, _v in dup_entries} == {1, 2}
     for _c, values in dup_entries:
-        assert values == [10.0, 20.0]
+        npt.assert_array_equal(values, [10.0, 20.0])
 
     by_record = dict(results)
     assert len(by_record) == 3  # Fiducial + both Dup channels, keyed by record

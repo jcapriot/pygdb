@@ -35,7 +35,9 @@ is `pygdb`. On a platform/Python version this project publishes a
 prebuilt wheel for, that automatically includes the optional Rust
 accelerator (see below) -- nothing extra to install or configure.
 Elsewhere, `pip` falls back to building from source, which needs a Rust
-toolchain (the package itself has no required dependencies either way).
+toolchain. `numpy` is the one required dependency (used to return
+correctly-shaped arrays -- see Quick start below); everything else is
+optional.
 
 ## Quick start
 
@@ -50,6 +52,9 @@ db.coordinate_systems     # ['NAD83 / UTM zone 11N', 'WGS 84'] (best-effort, may
 db.line_names[:5]         # ['L1000', 'L1001', 'L1010', 'L1020', 'L1030']
 db.channels_on_line("L1000")   # channels that actually have data on this line
 db.read("L1000", "Easting")    # random access by (line name, channel name)
+                                # -> ndarray, shape (n_rows,) for a scalar
+                                #    channel, (n_rows, array_width) for a
+                                #    VA/array channel (docs/spec.md section 5)
 ```
 
 See [the docs](docs/index.md) for the lower-level, slot-index-based

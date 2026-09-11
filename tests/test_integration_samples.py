@@ -14,6 +14,8 @@ from __future__ import annotations
 import os
 import struct
 
+import numpy as np
+import numpy.testing as npt
 import pytest
 
 from pygdb import GDB
@@ -88,6 +90,27 @@ def test_magnetic_data_matches_published_ground_truth(samples_dir):
     assert "NAD83 / UTM zone 11N" in db.coordinate_systems
 
 
+def test_radiometric_data_array_channel_matches_documented_shape(samples_dir):
+    """
+    Permanent regression test for the confirmed real VA/array-channel
+    ground truth in docs/spec.md section 5: `ISPD`/`ISPU` in this real
+    USGS file are `array_width=512` (a full airborne gamma-ray energy
+    spectrum per station), and `row_count` (145,408) is exactly
+    `284 stations x 512 channels`. `read()` must hand back a `(284,
+    512)` array, not the flat 145,408-element buffer.
+    """
+    path = os.path.join(samples_dir, "usgs_mojave_2020", "Radiometric_Data.gdb")
+    if not os.path.exists(path):
+        pytest.skip("Radiometric_Data.gdb not present locally")
+    db = GDB(path)
+    for chan_name in ("ISPD", "ISPU"):
+        channel = db.channel(chan_name)
+        assert channel.array_width == 512
+        values = db.read(db.line_names[0], chan_name)
+        assert values.shape == (284, 512)
+        assert values.dtype == np.dtype("<u2")
+
+
 def test_ag106386_matches_published_ground_truth(samples_dir):
     """
     Cross-checked in the original research against real decompressed
@@ -104,7 +127,7 @@ def test_ag106386_matches_published_ground_truth(samples_dir):
     assert db.read(line0, "GA_project_number")[0] == 5027
     assert db.read(line0, "NRG_Job_Number")[0] == 2347
     fiducial = db.read(line0, "Fiducial")
-    assert fiducial == sorted(fiducial)  # a real ascending fiducial sequence
+    npt.assert_array_equal(fiducial, sorted(fiducial))  # a real ascending fiducial sequence
     assert any("WGS 84 / UTM zone 54S" in n for n in db.coordinate_systems)
 
 
@@ -133,7 +156,7 @@ def test_every_line_names_channel_matches_its_own_line_name(samples_dir):
         checked_any = True
         for line in db.lines:
             values = db.read(line, chan_name)
-            if not values:
+            if len(values) == 0:
                 continue
             assert transform(values[0]) == transform(line.name), (
                 f"{relpath}: line {line.name!r} decoded {chan_name}={values[0]!r}"

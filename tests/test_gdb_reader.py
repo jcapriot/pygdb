@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import struct
 
+import numpy as np
+import numpy.testing as npt
 import pytest
 
 from pygdb.gdb_reader import (
@@ -197,11 +199,86 @@ def test_read_blob_values_uncompressed_numeric_and_string(tmp_path):
 
     blob = find_blob(str(path), line_slot=0, channel_slot=1)
     values = read_blob_values(str(path), blob, channels["Easting"], comp_level=0)
-    assert values == [100.0, 100.5, 101.0]
+    npt.assert_array_equal(values, [100.0, 100.5, 101.0])
 
     blob = find_blob(str(path), line_slot=1, channel_slot=2)
     values = read_blob_values(str(path), blob, channels["LineName"], comp_level=0)
-    assert values == ["L200", "L200"]
+    npt.assert_array_equal(values, ["L200", "L200"])
+
+    # dtype sanity: GS_LONG -> int32, GS_DOUBLE -> float64, per
+    # GS_TYPE_NUMPY_DTYPE.
+    blob = find_blob(str(path), line_slot=0, channel_slot=0)
+    values = read_blob_values(str(path), blob, channels["Fiducial"], comp_level=0)
+    assert values.dtype == np.dtype("<i4")
+    blob = find_blob(str(path), line_slot=0, channel_slot=1)
+    values = read_blob_values(str(path), blob, channels["Easting"], comp_level=0)
+    assert values.dtype == np.dtype("<f8")
+
+
+def test_read_blob_values_array_channel_reshapes_to_2d(tmp_path):
+    """
+    Regression test for VA/array-channel decoding (docs/spec.md section
+    5): no test anywhere previously decoded an array channel's actual
+    blob values (only its symbol-table metadata, array_width/is_array,
+    was tested). `Depths` (array_width=3) on L100 is 3 fiducials x 3
+    elements each, flattened on disk -- `read_blob_values` must reshape
+    it back into a (3, 3) array with values in the right positions, not
+    hand back the flat 9-element buffer.
+    """
+    path = tmp_path / "test.gdb"
+    path.write_bytes(build_gdb_bytes(SIMPLE_CHANNELS, SIMPLE_LINES))
+    channels = {c.name: c for c in read_channels(str(path))}
+
+    blob = find_blob(str(path), line_slot=0, channel_slot=3)  # L100/Depths
+    values = read_blob_values(str(path), blob, channels["Depths"], comp_level=0)
+    assert values.shape == (3, 3)
+    npt.assert_array_equal(
+        values,
+        [[0.0, 1.5, 3.0], [4.5, 6.0, 7.5], [9.0, 10.5, 12.0]],
+    )
+
+
+def test_decode_array_channel_truncated_flat_count_drops_incomplete_row():
+    """
+    A flat element count that isn't a whole multiple of array_width
+    (truncated file / corrupt data) must warn and drop the trailing
+    incomplete row, not raise or return a ragged/unreshapeable result.
+    """
+    from pygdb.gdb_reader import ChannelRecord
+
+    channel = ChannelRecord(
+        index=0, offset=0, name="Depths", dtype_code=5, format_code=0, raw=b"",
+        array_width=3,
+    )
+    # 3 full rows worth of data (9 doubles) plus 1 extra, incomplete value.
+    raw = struct.pack("<10d", 0, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0, 10.5, 12.0, 99.0)
+    with pytest.warns(GDBParseWarning, match="incomplete"):
+        values = _decode_numeric_or_string(raw, channel, row_count=10)
+    assert values.shape == (3, 3)
+    npt.assert_array_equal(
+        values,
+        [[0.0, 1.5, 3.0], [4.5, 6.0, 7.5], [9.0, 10.5, 12.0]],
+    )
+
+
+def test_decode_string_array_channel_edge_case():
+    """
+    A string-typed array channel (is_string and is_array both true) has
+    never been observed in any real sample (docs/spec.md section 5's
+    documented open gap) -- confirm it still decodes gracefully (no
+    crash, correct shape) rather than assuming it can't happen.
+    """
+    from pygdb.gdb_reader import ChannelRecord
+
+    channel = ChannelRecord(
+        index=0, offset=0, name="Labels", dtype_code=-4, format_code=0, raw=b"",
+        array_width=2,
+    )
+    raw = b"AB\x00\x00" + b"CD\x00\x00" + b"EF\x00\x00" + b"GH\x00\x00"
+    values = _decode_numeric_or_string(raw, channel, row_count=4)
+    assert values.shape == (2, 2)
+    assert values.dtype == object
+    npt.assert_array_equal(values, [["AB", "CD"], ["EF", "GH"]])
 
 
 def test_decode_string_channel_edge_cases(tmp_path):
@@ -225,7 +302,7 @@ def test_decode_string_channel_edge_cases(tmp_path):
         + bytes([0xC3, 0xA9]) + b"\x00" * 6       # non-ASCII bytes -> U+FFFD each
     )
     values = _decode_numeric_or_string(raw, channel, row_count=3)
-    assert values == ["abc", "exactly8", "��"]
+    npt.assert_array_equal(values, ["abc", "exactly8", "��"])
 
 
 def test_iter_blobs_truncated_file_warns_and_returns_partial(tmp_path):
@@ -262,7 +339,7 @@ def test_read_blob_values_compressed_zlib(tmp_path):
     channel = ChannelRecord(index=0, offset=0, name="x", dtype_code=5, format_code=0, raw=b"")
 
     values = read_blob_values(path, blob, channel, comp_level=2, page_size=page_size)
-    assert values == [1.5, 2.5, 3.5]
+    npt.assert_array_equal(values, [1.5, 2.5, 3.5])
 
 
 def test_read_blob_values_compressed_lzrw1(tmp_path):
@@ -281,7 +358,7 @@ def test_read_blob_values_compressed_lzrw1(tmp_path):
     channel = ChannelRecord(index=0, offset=0, name="x", dtype_code=3, format_code=0, raw=b"")
 
     values = read_blob_values(path, blob, channel, comp_level=1, page_size=page_size)
-    assert values == [42, 43]
+    npt.assert_array_equal(values, [42, 43])
 
 
 def test_read_blob_values_compressed_lzrw1_stored_raw(tmp_path):
@@ -300,7 +377,7 @@ def test_read_blob_values_compressed_lzrw1_stored_raw(tmp_path):
     channel = ChannelRecord(index=0, offset=0, name="x", dtype_code=3, format_code=0, raw=b"")
 
     values = read_blob_values(path, blob, channel, comp_level=1, page_size=page_size)
-    assert values == [7, 8]
+    npt.assert_array_equal(values, [7, 8])
 
 
 def test_read_blob_values_bare_blob_inside_compressed_file(tmp_path):
@@ -325,7 +402,7 @@ def test_read_blob_values_bare_blob_inside_compressed_file(tmp_path):
     # comp_level=2 (declared compressed at the file level), but this
     # specific blob has no chunk magic at the expected offset.
     values = read_blob_values(path, blob, channel, comp_level=2, page_size=64)
-    assert values == [1.0, 2.0]
+    npt.assert_array_equal(values, [1.0, 2.0])
 
 
 def test_read_blob_values_administrative_blob_negative_row_count_warns(tmp_path):
@@ -340,4 +417,4 @@ def test_read_blob_values_administrative_blob_negative_row_count_warns(tmp_path)
 
     with pytest.warns(GDBParseWarning):
         values = read_blob_values(path, blob, channel, comp_level=0)
-    assert values == []
+    npt.assert_array_equal(values, [])

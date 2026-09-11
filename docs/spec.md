@@ -312,6 +312,15 @@ from the `GS_DOUBLE`/`GS_FLOAT` case was needed to decode it correctly
 storage. **Open gap:** a string array channel has still not been
 found in any real sample.
 
+**Reader behavior:** `GDB.read()`/`iter_line()` reshape an array
+channel's flat `row_count`-element buffer into a proper `(n_rows,
+array_width)` numpy array before returning it -- the reader, not the
+caller, is responsible for knowing `array_width` and reshaping
+correctly (see `gdb_reader._decode_numeric_or_string`). A flat element
+count that isn't a whole multiple of `array_width` (truncated/corrupt
+data) warns and drops the incomplete trailing row rather than
+returning a raggedly-shaped result.
+
 ---
 
 ## 6. The blob index: locating (line, channel) → data

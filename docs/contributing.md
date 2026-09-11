@@ -60,8 +60,10 @@ In keeping with that:
 ## Development
 
 - The reader lives in `pygdb/` at the repository root
-  (`gdb_reader.py`, `grd_reader.py`, `lzrw1.py`, `registry.py`, `gdb.py`)
-  and has no third-party dependencies.
+  (`gdb_reader.py`, `grd_reader.py`, `lzrw1.py`, `registry.py`, `gdb.py`).
+  `numpy` is its one required third-party dependency, used specifically
+  so VA/array channels (docs/spec.md section 5) come back as correctly-
+  shaped `(n_rows, array_width)` arrays instead of one flat buffer.
 - `rust/` holds an optional Rust extension (`pygdb._native`) that
   accelerates the reader's real CPU-bound hot paths (LZRW1
   decompression, fixed-width string decoding). This is one package,

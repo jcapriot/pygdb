@@ -33,6 +33,11 @@ pip install python-gdb
     already registered there for an unrelated project). The importable
     package is still `pygdb`.
 
+`numpy` is the one required dependency -- it's what lets `read()`
+return correctly-shaped arrays rather than a flat, unshapeable buffer
+(see Quick start below). Everything else (the Rust accelerator,
+`zensical` for docs, `pytest` for tests) is optional.
+
 ## Quick start
 
 The `GDB` class is the recommended entry point: a name-based view over
@@ -50,6 +55,9 @@ db.line_names[:5]        # ['L1000', 'L1001', 'L1010', 'L1020', 'L1030']
 db.channels_on_line("L1000")  # channels that actually have data on this line
 
 db.read("L1000", "Easting")   # random access by (line name, channel name)
+                               # -> ndarray, shape (n_rows,) for a scalar
+                               #    channel, (n_rows, array_width) for a
+                               #    VA/array channel (docs/spec.md section 5)
 
 for channel, values in db.iter_line("L1000"):
     print(channel.name, values[:3])

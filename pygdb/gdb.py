@@ -17,6 +17,8 @@ import warnings
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Tuple, Union
 
+import numpy as np
+
 from .gdb_reader import (
     BlobHeader,
     ChannelRecord,
@@ -437,11 +439,14 @@ class GDB:
         line_rec = self._resolve_line(line)
         return [c.name for c, _blob in self._channels_with_data_on_line(line_rec)]
 
-    def read(self, line: LineRef, channel: ChannelRef) -> list:
+    def read(self, line: LineRef, channel: ChannelRef) -> np.ndarray:
         """
         Random access by name: decode and return every value recorded
-        for `channel` on `line` (a list of numbers, or strings for a
-        string-typed channel). `line`/`channel` may be names,
+        for `channel` on `line`, as a numpy `ndarray` -- 1-D for an
+        ordinary scalar channel, 2-D `(n_rows, channel.array_width)`
+        for a VA/array channel (docs/spec.md section 5), dtype matching
+        the channel's `GS_*` type, or `object` (holding `str`) for a
+        string-typed channel. `line`/`channel` may be names,
         `(name, occurrence)` pairs (see `line()`/`channel()`), or
         `LineRecord`/`ChannelRecord` instances.
 
@@ -452,13 +457,13 @@ class GDB:
         picking an arbitrary one -- raising `ValueError` only if that's
         *still* ambiguous (more than one same-named channel has data on
         this exact line); pass `(name, occurrence)` or a specific
-        `ChannelRecord` to sidestep either lookup. Returns `[]` (with a
-        `GDBParseWarning`, per `read_blob_values`) if the name is valid
-        but this specific (line, channel) pair has no data blob, or its
-        data can't be decoded -- consistent with the rest of this
-        package's degrade-gracefully philosophy for decode-time
-        problems, as opposed to a plain lookup-by-name mistake (which
-        does raise).
+        `ChannelRecord` to sidestep either lookup. Returns an empty
+        array (with a `GDBParseWarning`, per `read_blob_values`) if the
+        name is valid but this specific (line, channel) pair has no
+        data blob, or its data can't be decoded -- consistent with the
+        rest of this package's degrade-gracefully philosophy for
+        decode-time problems, as opposed to a plain lookup-by-name
+        mistake (which does raise).
         """
         line_rec = self._resolve_line(line)
         if isinstance(channel, ChannelRecord):
@@ -477,14 +482,14 @@ class GDB:
                 f"docs/spec.md section 1)",
                 GDBParseWarning, stacklevel=2,
             )
-            return []
+            return np.array([])
         return read_blob_values(
             self.path, blob, chan_rec,
             comp_level=self.comp_level or 0, page_size=self.page_size,
             file=self._file,
         )
 
-    def iter_line(self, line: LineRef) -> Iterator[Tuple[ChannelRecord, list]]:
+    def iter_line(self, line: LineRef) -> Iterator[Tuple[ChannelRecord, np.ndarray]]:
         """
         Yield `(channel, values)` for every channel that actually has
         data on `line`, via `_channels_with_data_on_line` directly

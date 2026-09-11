@@ -52,6 +52,8 @@ from dataclasses import dataclass
 
 from typing import BinaryIO, List, Optional, Tuple
 
+import numpy as np
+
 from . import lzrw1 as _lzrw1
 
 try:
@@ -119,9 +121,9 @@ GS_TYPE_NAMES = {
     13: "GS_DOUBLE2D",
 }
 
-# numpy-less struct format codes for each GS_* type, for whoever wants to
-# extend this to actually decode data once the indexing question (docs/provenance/notes.md
-# section 6.4/8) is solved.
+# struct format codes for each GS_* type -- used for `_element_width`'s
+# byte-width math (struct.calcsize), independent of whichever decode
+# strategy actually reads the bytes.
 GS_TYPE_STRUCT = {
     0: "b",   # GS_BYTE (signed, per GS_S1* constants)
     1: "H",   # GS_USHORT
@@ -133,6 +135,25 @@ GS_TYPE_STRUCT = {
     7: "I",   # GS_ULONG
     8: "q",   # GS_LONG64
     9: "Q",   # GS_ULONG64
+}
+
+# Little-endian numpy dtype strings for each GS_* type (explicit `<`
+# byte-order prefix, matching this format's confirmed little-endian
+# layout everywhere else -- a platform-native dtype would silently
+# misdecode on a big-endian host). Used by `_decode_numeric_or_string`
+# for `np.frombuffer`; `GS_TYPE_STRUCT` above is kept separately since
+# `_element_width` only needs a byte count, not a full dtype.
+GS_TYPE_NUMPY_DTYPE = {
+    0: "<i1",   # GS_BYTE (signed)
+    1: "<u2",   # GS_USHORT
+    2: "<i2",   # GS_SHORT
+    3: "<i4",   # GS_LONG
+    4: "<f4",   # GS_FLOAT
+    5: "<f8",   # GS_DOUBLE
+    6: "<u1",   # GS_UBYTE
+    7: "<u4",   # GS_ULONG
+    8: "<i8",   # GS_LONG64
+    9: "<u8",   # GS_ULONG64
 }
 
 DB_CHAN_FORMAT_NAMES = {
@@ -968,20 +989,35 @@ def _decode_numeric_or_string(raw: bytes, channel: ChannelRecord, row_count: Opt
     values of `channel`'s known type. Shared by the uncompressed and
     compressed decode paths.
 
+    Always returns a numpy `ndarray`: 1-D `(n_rows,)` for an ordinary
+    scalar channel, or 2-D `(n_rows, channel.array_width)` for a VA/
+    array channel (docs/spec.md section 5 -- e.g. a 512-wide airborne
+    gamma-ray spectrum recorded per station; `array_width` is fixed per
+    channel, never seen to vary row-to-row, so this reshape is always a
+    clean rectangle). Numeric channels get the dtype matching their
+    `GS_*` type (`GS_TYPE_NUMPY_DTYPE`); string channels (including the
+    unconfirmed-but-handled case of a *string* array channel) get
+    `dtype=object` holding plain Python `str`, since numpy has no
+    variable-content fixed-dtype string type that round-trips this
+    format's null-padded, variable-actual-length names cleanly.
+
     String-typed channels dispatch to the compiled `pygdb._native`
     extension when it's available (same decode, ported to Rust -- see
     `rust/src/lib.rs`'s `decode_fixed_width_strings`; profiling found
     this the second real CPU-bound hot path in this reader besides
     LZRW1, unlike numeric decode which stays near memory-bandwidth speed
-    via `struct.unpack` either way), falling back to the pure-Python list
+    via `np.frombuffer` either way), falling back to the pure-Python list
     comprehension below when it isn't.
 
     Fails gracefully rather than raising: an unrecognized element type
-    returns `[]` with a `GDBParseWarning`; a `raw` buffer shorter than
-    needed for the requested `row_count` (the file was truncated mid-
-    blob, a real scenario for a cut-off download) decodes as many
-    *complete* elements as actually fit and warns about the shortfall,
-    rather than raising a `struct.error` and discarding everything.
+    returns an empty array with a `GDBParseWarning`; a `raw` buffer
+    shorter than needed for the requested `row_count` (the file was
+    truncated mid-blob, a real scenario for a cut-off download) decodes
+    as many *complete* elements as actually fit and warns about the
+    shortfall, rather than raising a `struct.error` and discarding
+    everything; for an array channel, a flat element count that isn't a
+    whole multiple of `array_width` similarly warns and drops the
+    trailing incomplete row rather than raising.
     """
     width = _element_width(channel)
     if width is None:
@@ -991,7 +1027,7 @@ def _decode_numeric_or_string(raw: bytes, channel: ChannelRecord, row_count: Opt
             f"GS_FLOAT3D/GS_DOUBLE3D/etc type, never seen in a real sample) -- "
             f"returning no values for it"
         )
-        return []
+        return np.array([])
     n_available = len(raw) // width
     n = row_count if row_count is not None else n_available
     if n > n_available:
@@ -1002,15 +1038,35 @@ def _decode_numeric_or_string(raw: bytes, channel: ChannelRecord, row_count: Opt
             f"returning the {n_available} row(s) that could be decoded"
         )
         n = n_available
+    if channel.is_array:
+        # `n` here is the FLAT element count (row_count == n_rows *
+        # array_width for an array channel, confirmed docs/spec.md
+        # section 5); truncate to the largest whole number of complete
+        # rows before reshaping if it doesn't divide evenly.
+        usable_rows, remainder = divmod(n, channel.array_width)
+        if remainder:
+            _warn(
+                f"channel {channel.name!r}: {n} flat element(s) isn't a whole "
+                f"multiple of array_width={channel.array_width} -- dropping the "
+                f"trailing {remainder} incomplete element(s) rather than "
+                f"returning a raggedly-shaped result"
+            )
+            n = usable_rows * channel.array_width
     if channel.is_string:
         if _native_ext is not None:
-            return _native_ext.decode_fixed_width_strings(raw, width, n)
-        return [
-            raw[i * width : (i + 1) * width].split(b"\x00")[0].decode("ascii", errors="replace")
-            for i in range(n)
-        ]
-    fmt = GS_TYPE_STRUCT[channel.dtype_code]
-    return list(struct.unpack(f"<{n}{fmt}", raw[: n * width]))
+            values = _native_ext.decode_fixed_width_strings(raw, width, n)
+        else:
+            values = [
+                raw[i * width : (i + 1) * width].split(b"\x00")[0].decode("ascii", errors="replace")
+                for i in range(n)
+            ]
+        arr = np.array(values, dtype=object)
+    else:
+        dtype = GS_TYPE_NUMPY_DTYPE[channel.dtype_code]
+        arr = np.frombuffer(raw[: n * width], dtype=dtype).copy()
+    if channel.is_array:
+        arr = arr.reshape(-1, channel.array_width)
+    return arr
 
 
 @contextlib.contextmanager
@@ -1081,16 +1137,22 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
     decode, a truncated read (file cut off mid-blob), an unrecognized
     chunk subtype, or a chunk that fails to decompress (corrupt/
     truncated compressed data, or `lzrw1.LZRW1DecodeError`) all return
-    `[]` with a `GDBParseWarning` describing what went wrong, instead
-    of raising and losing the caller's place in a larger loop (e.g. a
-    whole-file scan that's decoded hundreds of blobs already). The one
-    exception where full graceful salvage wasn't attempted is a
-    truncated/corrupt *compressed* stream: unlike the plain-data case,
-    there's no simple way to hand back "the first K decoded values"
-    from a partially-decompressed zlib/LZRW1 stream, so those cases
-    warn and return `[]` rather than a partial decode -- documented
-    here rather than silently implied to be as complete as the
-    plain-data truncation handling.
+    an empty `ndarray` (`np.array([])`) with a `GDBParseWarning`
+    describing what went wrong, instead of raising and losing the
+    caller's place in a larger loop (e.g. a whole-file scan that's
+    decoded hundreds of blobs already). The one exception where full
+    graceful salvage wasn't attempted is a truncated/corrupt
+    *compressed* stream: unlike the plain-data case, there's no simple
+    way to hand back "the first K decoded values" from a partially-
+    decompressed zlib/LZRW1 stream, so those cases warn and return an
+    empty array rather than a partial decode -- documented here rather
+    than silently implied to be as complete as the plain-data
+    truncation handling.
+
+    Return shape/dtype: see `_decode_numeric_or_string`'s docstring --
+    1-D `ndarray` for a scalar channel, 2-D `(n_rows, array_width)` for
+    a VA/array channel, dtype matching the channel's `GS_*` type or
+    `object` (holding `str`) for a string channel.
 
     `file`: an already-open binary file handle for `path`, reused
     instead of opening `path` fresh -- pass this if you're calling this
@@ -1109,14 +1171,14 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
                 f"administrative blobs flagged [UNKNOWN] in docs/provenance/notes.md "
                 f"section 6.4/6.9, not a real data blob; returning no values"
             )
-            return []
+            return np.array([])
         width = _element_width(channel)
         if width is None:
             _warn(
                 f"channel {channel.name!r} has dtype_code={channel.dtype_code}, a "
                 f"type this reader doesn't know how to decode -- returning no values"
             )
-            return []
+            return np.array([])
         with _file_handle(path, file) as f:
             f.seek(blob.data_offset)
             raw = f.read(blob.row_count * width)
@@ -1134,7 +1196,7 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
             f"header/chunk-magic region (offset {blob.offset + COMPRESSED_BLOB_HEADER_SIZE}) "
             f"could be fully read -- truncated mid-blob; returning no values"
         )
-        return []
+        return np.array([])
     if chunk_magic_probe != _lzrw1.CHUNK_MAGIC:
         # Variant 3: no chunk wrapper at all -- a "bare" blob, byte-for-byte
         # identical in layout to a DB_COMP_NONE one, just living inside an
@@ -1147,14 +1209,14 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
                 f"administrative blobs flagged [UNKNOWN] in docs/provenance/notes.md "
                 f"section 6.4/6.9, not a real data blob; returning no values"
             )
-            return []
+            return np.array([])
         width = _element_width(channel)
         if width is None:
             _warn(
                 f"channel {channel.name!r} has dtype_code={channel.dtype_code}, a "
                 f"type this reader doesn't know how to decode -- returning no values"
             )
-            return []
+            return np.array([])
         with _file_handle(path, file) as f:
             f.seek(blob.data_offset)
             raw = f.read(blob.row_count * width)
@@ -1183,7 +1245,7 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
                 f"blob_index={blob.blob_index}: header too short to read "
                 f"page_size -- cannot decode, returning no values"
             )
-            return []
+            return np.array([])
     with _file_handle(path, file) as f:
         f.seek(blob.offset + COMPRESSED_BLOB_HEADER_SIZE)
         expected_span = blob.n_pages * page_size - COMPRESSED_BLOB_HEADER_SIZE
@@ -1201,7 +1263,7 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
             f"chunk sub-header ({len(raw_span)} available, need 16) -- cannot "
             f"decode, returning no values"
         )
-        return []
+        return np.array([])
     subtype = struct.unpack_from("<i", raw_span, 8)[0]
     if subtype == _lzrw1.DB_COMP_SIZE:
         try:
@@ -1212,7 +1274,7 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
                 f"blob_index={blob.blob_index}: zlib decompression failed ({e}) "
                 f"-- likely truncated or corrupt compressed data; returning no values"
             )
-            return []
+            return np.array([])
     elif subtype == _lzrw1.DB_COMP_SPEED:
         try:
             chunk = _lzrw1.parse_chunk_header(raw_span, 0)
@@ -1223,14 +1285,14 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
                 f"-- likely truncated or corrupt compressed data, or an "
                 f"unrecognized chunk variant; returning no values"
             )
-            return []
+            return np.array([])
     else:
         _warn(
             f"blob_index={blob.blob_index}: unrecognized chunk subtype={subtype} "
             f"(expected {_lzrw1.DB_COMP_SIZE}=Size or {_lzrw1.DB_COMP_SPEED}=Speed) "
             f"-- returning no values"
         )
-        return []
+        return np.array([])
     return _decode_numeric_or_string(decompressed, channel)
 
 
@@ -1283,11 +1345,12 @@ if __name__ == "__main__":
         if chan is None:
             continue
         # read_blob_values() never raises for a blob/channel it can't decode --
-        # it warns (GDBParseWarning) and returns [] instead, so a plain empty-
-        # result check is all that's needed here; no try/except required.
+        # it warns (GDBParseWarning) and returns an empty array instead, so a
+        # plain empty-result check is all that's needed here; no try/except
+        # required.
         values = read_blob_values(path, blob, chan, comp_level=comp_level,
                                    page_size=fields["page_size"])
-        if not values:
+        if len(values) == 0:
             continue
         print(
             f"  line_slot={line_slot} channel_slot={chan_slot} ({chan.name}), "
