@@ -8,21 +8,27 @@ name: Build wheels
 # wheel per platform for 3.14's free-threaded build (cp314t, which has
 # no stable-ABI option since abi3t starts at 3.15). See pyproject.toml's
 # [tool.cibuildwheel] for the exact build selector and rust/src/lib.rs's
-# module doc for what's shipped/why. Cross-arch Linux builds run under
-# QEMU emulation, which is slow -- this only runs on release tags and
-# manual dispatch, not on every push/PR (see test.yml for the fast
-# per-push feedback loop).
+# module doc for what's shipped/why.
 #
-# This builds and uploads wheels as workflow artifacts. It does NOT
-# publish to PyPI -- that needs a PyPI "trusted publisher" configured
-# for this repository (pypi.org project settings -> Publishing), which
-# only the project owner can set up. Once that's done, add a
-# `pypa/gh-action-pypi-publish` step gated on the release-tag trigger.
+# Builds run on the same triggers as test.yml (push to main, every PR,
+# manual dispatch) -- cross-arch Linux builds under QEMU are genuinely
+# slow, but that's an accepted cost here, not something this workflow
+# tries to avoid. The *build* jobs are deliberately ungated; only
+# `publish`, at the bottom, is gated, and on a different trigger
+# entirely (a GitHub Release being published) so an ordinary push/PR
+# never has a path to actually uploading anything to PyPI.
+#
+# `publish` needs a PyPI "trusted publisher" configured for this
+# repository (pypi.org project settings -> Publishing, pointing at this
+# workflow file) before it can succeed -- until that's set up, it'll
+# just fail cleanly on release rather than do nothing silently.
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
   workflow_dispatch: {}
 
 jobs:
@@ -68,3 +74,28 @@ jobs:
         with:
           name: sdist
           path: dist/*.tar.gz
+
+  publish:
+    name: Publish to PyPI
+    needs: [build_wheels, build_sdist]
+    # Only a published GitHub Release actually uploads anything -- push
+    # to main, every PR, and manual dispatch all build and upload
+    # artifacts above (for inspection/testing) but stop there.
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    environment: pypi  # matches the trusted publisher's environment name on PyPI -- see README/setup notes
+    permissions:
+      id-token: write  # required for PyPI trusted publishing (OIDC) -- no API token needed
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
