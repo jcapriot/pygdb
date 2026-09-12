@@ -13,6 +13,7 @@ import numpy as np
 import numpy.testing as npt
 import pytest
 
+import pygdb.gdb_reader as gdb_reader_module
 from pygdb.gdb_reader import (
     BlobHeader,
     COMPRESSED_BLOB_HEADER_SIZE,
@@ -31,6 +32,25 @@ from pygdb.gdb_reader import (
 
 import helpers
 from helpers import ChannelSpec, LineSpec, build_gdb_bytes
+
+
+@pytest.fixture(params=["python", "native"])
+def backend(request, monkeypatch):
+    """
+    Forces `_decode_numeric_or_string`'s string-decode branch through a
+    specific backend for the duration of a test -- mirrors
+    tests/test_lzrw1.py's `backend` fixture, for the same reason: without
+    it, whichever tests use it only ever exercise ONE of
+    `pygdb._native.decode_fixed_width_strings` / the pure-Python fallback
+    per test run, so a regression in the one NOT currently active
+    (typically the pure-Python fallback, since `pygdb._native` is built
+    in this dev environment and in CI) would go unnoticed.
+    """
+    if request.param == "native" and gdb_reader_module._native_ext is None:
+        pytest.skip("pygdb._native is not built in this environment")
+    if request.param == "python":
+        monkeypatch.setattr(gdb_reader_module, "_native_ext", None)
+    return request.param
 
 
 # -- magic / header -----------------------------------------------------------
@@ -261,7 +281,7 @@ def test_decode_array_channel_truncated_flat_count_drops_incomplete_row():
     )
 
 
-def test_decode_string_array_channel_edge_case():
+def test_decode_string_array_channel_edge_case(backend):
     """
     A string-typed array channel (is_string and is_array both true) has
     never been observed in any real sample (docs/spec.md section 5's
@@ -281,15 +301,16 @@ def test_decode_string_array_channel_edge_case():
     npt.assert_array_equal(values, [["AB", "CD"], ["EF", "GH"]])
 
 
-def test_decode_string_channel_edge_cases(tmp_path):
+def test_decode_string_channel_edge_cases(tmp_path, backend):
     """
     Direct unit test for the string-decode branch's edge cases -- null
     mid-record, exactly-width-with-no-null, and a non-ASCII byte (which
     must become U+FFFD, matching Python's `bytes.decode("ascii",
-    errors="replace")` exactly). Exercises the dispatch to
-    `pygdb._native.decode_fixed_width_strings` when the extension is
-    built (see rust/src/lib.rs), or the pure-Python fallback otherwise --
-    both must agree with this exact expected output.
+    errors="replace")` exactly). Runs against both backends (see the
+    `backend` fixture) -- both must agree with this exact expected
+    output, including through the all-ASCII fast path
+    `decode_fixed_width_strings` (rust/src/lib.rs) takes for the first
+    two records here.
     """
     path = tmp_path / "test.gdb"
     path.write_bytes(build_gdb_bytes(SIMPLE_CHANNELS, SIMPLE_LINES))

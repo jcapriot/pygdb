@@ -87,15 +87,25 @@ fn lzrw1_decompress_impl(data: &[u8], start: usize, decompressed_length: usize) 
                 }
                 let start_idx = out.len() - offset;
                 let n = length.min(decompressed_length - out.len());
-                // Copies can self-overlap (offset < length is the classic LZ
-                // run-length trick), so this has to stay a byte-at-a-time
-                // loop rather than a bulk slice copy. A chunked "wildcopy"
-                // (as used by lz4/zstd) isn't worth it here specifically
-                // because LZRW1's 4-bit length field caps `n` at 16: the
-                // loop is already too short to amortize any wildcopy setup
-                // cost, and this tight a loop is fine as plain Rust.
-                for i in 0..n {
-                    out.push(out[start_idx + i]);
+                if offset >= n {
+                    // No self-overlap -- the source range is already fully
+                    // written and won't change as we copy, so this is a
+                    // plain, safe bulk copy. `Vec::extend_from_within` is
+                    // stdlib, panics only on an out-of-bounds range (can't
+                    // happen: `start_idx + n <= out.len()` always holds
+                    // here), and compiles down to a single `memcpy`-class
+                    // copy instead of `n` individual bounds-checked pushes.
+                    out.extend_from_within(start_idx..start_idx + n);
+                } else {
+                    // Self-overlapping (offset < length is the classic LZ
+                    // run-length trick: each newly-copied byte becomes
+                    // available for the next) -- `extend_from_within` would
+                    // read the wrong (stale) bytes here, so this has to stay
+                    // a byte-at-a-time loop. LZRW1's 4-bit length field caps
+                    // `n` at 16 either way, so this loop is always short.
+                    for i in 0..n {
+                        out.push(out[start_idx + i]);
+                    }
                 }
             } else {
                 out.push(read_u8(data, p)?);
@@ -134,14 +144,29 @@ fn decode_fixed_width_strings(data: &[u8], width: usize, count: usize) -> PyResu
     for i in 0..count {
         let record = &data[i * width..(i + 1) * width];
         let end = record.iter().position(|&b| b == 0).unwrap_or(record.len());
-        let mut s = String::with_capacity(end);
-        for &b in &record[..end] {
-            if b < 0x80 {
-                s.push(b as char);
-            } else {
-                s.push('\u{FFFD}');
+        let name = &record[..end];
+        // Real channel/line names are ASCII in every sample seen so far
+        // (bytes >= 0x80 only turn up rarely, in unused record padding
+        // past the null terminator, i.e. never actually inside `name`).
+        // `[u8]::is_ascii` is a single vectorized scan (the standard
+        // library checks a word at a time, not byte-by-byte), so this
+        // fast path replaces the common case's per-byte branch-and-push
+        // with one scan plus one bulk copy. `from_utf8` cannot fail here
+        // -- ASCII is always valid UTF-8 -- so `unwrap` is safe, not a
+        // gamble.
+        let s = if name.is_ascii() {
+            String::from_utf8(name.to_vec()).unwrap()
+        } else {
+            let mut s = String::with_capacity(end);
+            for &b in name {
+                if b < 0x80 {
+                    s.push(b as char);
+                } else {
+                    s.push('\u{FFFD}');
+                }
             }
-        }
+            s
+        };
         out.push(s);
     }
     Ok(out)
