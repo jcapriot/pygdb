@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
@@ -342,13 +343,29 @@ class GDB:
         Runs once, right after the blob index is first built -- cheap
         relative to that index build itself (already O(number of real
         lines) additional work, not another file scan).
+
+        Offsets are checked in *distance-from-zero* order (`0, 1, -1, 2,
+        -2, ...`), not the naive `-4, -3, ..., 4` left-to-right scan an
+        earlier version of this method used, and only a *strictly*
+        better score ever displaces the current best -- so a tie always
+        keeps the smaller-magnitude offset, and a tie against 0
+        specifically always keeps 0. This matters for a real, if
+        previously untested, case: a line with genuinely zero populated
+        channels contributes no evidence for or against any offset, and
+        the naive scan could let a spurious negative offset *tie* with
+        the correct 0 and win purely by being checked first -- silently
+        shifting every line's index (not just the empty one's), so an
+        unrelated line would start reading a different line's data.
+        Found by testing `to_geoh5` against a synthetic file with one
+        empty and one populated line; see the regression test for the
+        exact before/after.
         """
         lines = self.lines
         if not lines or not self._blob_index:
             return
         slots_with_data = {line_slot for line_slot, _channel_slot in self._blob_index}
         best_offset, best_score = 0, -1
-        for offset in range(-4, 5):
+        for offset in sorted(range(-4, 5), key=lambda o: (abs(o), o < 0)):
             score = sum(1 for l in lines if (l.index + offset) in slots_with_data)
             if score > best_score:
                 best_score, best_offset = score, offset
@@ -523,6 +540,54 @@ class GDB:
             )
             yield c, values
 
+    def _disambiguate_names(self, line_rec: LineRecord, decoded: List[Tuple[ChannelRecord, np.ndarray]]):
+        """
+        Yield `(var_name, channel, values)` for every `(channel, values)`
+        pair in `decoded`, disambiguating any channel name shared by more
+        than one populated channel on this line -- shared by `to_xarray`
+        and `to_geoh5`, which both need the exact same numbering so a
+        name collision resolves identically (and matches `channel()`'s
+        own `(name, occurrence)` numbering) regardless of export format.
+
+        For a name shared by more than one populated channel (confirmed
+        structurally possible, though never yet observed with data on
+        both -- see `channel()`'s docstring), every occurrence after the
+        first is disambiguated as `f"{name}[{occurrence}]"`, `occurrence`
+        being the same 0-based index into every channel sharing that
+        name (in `.channels` order) that `channel()`'s `(name,
+        occurrence)` form uses. Raises a `GDBParseWarning` when this
+        actually triggers, since a caller not expecting a
+        bracket-suffixed name should be told why one showed up.
+
+        `stacklevel=3` here (rather than the usual `2`) accounts for
+        this being a generator a caller iterates via a `for` loop --
+        `2` would point at that `for` loop itself rather than the
+        caller's own caller, unlike a plain function call.
+        """
+        if self._channels_by_name is None:
+            self.channels  # populate the cache (for occurrence numbering)
+
+        name_counts: Dict[str, int] = {}
+        for c, _values in decoded:
+            name_counts[c.name] = name_counts.get(c.name, 0) + 1
+
+        seen_so_far: Dict[str, int] = {}
+        for c, values in decoded:
+            seen_so_far[c.name] = seen_so_far.get(c.name, 0) + 1
+            if name_counts[c.name] > 1:
+                occurrence = self._channels_by_name[c.name].index(c)
+                var_name = c.name if seen_so_far[c.name] == 1 else f"{c.name}[{occurrence}]"
+                warnings.warn(
+                    f"{self.path}: line {line_rec.name!r} has {name_counts[c.name]} "
+                    f"channels named {c.name!r} with data -- using {var_name!r} "
+                    f"for occurrence {occurrence} (pass (name, occurrence) to "
+                    f"channel() for the same numbering)",
+                    GDBParseWarning, stacklevel=3,
+                )
+            else:
+                var_name = c.name
+            yield var_name, c, values
+
     def to_xarray(self, line: LineRef) -> "xr.Dataset":
         """
         Build an `xarray.Dataset` for every channel that has data on
@@ -586,31 +651,10 @@ class GDB:
             ))
             for c, blob in self._channels_with_data_on_line(line_rec)
         ]
-        if self._channels_by_name is None:
-            self.channels  # populate the cache (for occurrence numbering)
-
         station_length = max((len(values) for _c, values in decoded), default=0)
-        name_counts: Dict[str, int] = {}
-        for c, _values in decoded:
-            name_counts[c.name] = name_counts.get(c.name, 0) + 1
 
         data_vars = {}
-        seen_so_far: Dict[str, int] = {}
-        for c, values in decoded:
-            seen_so_far[c.name] = seen_so_far.get(c.name, 0) + 1
-            if name_counts[c.name] > 1:
-                occurrence = self._channels_by_name[c.name].index(c)
-                var_name = c.name if seen_so_far[c.name] == 1 else f"{c.name}[{occurrence}]"
-                warnings.warn(
-                    f"{self.path}: line {line_rec.name!r} has {name_counts[c.name]} "
-                    f"channels named {c.name!r} with data -- using {var_name!r} "
-                    f"for occurrence {occurrence} (pass (name, occurrence) to "
-                    f"channel() for the same numbering)",
-                    GDBParseWarning, stacklevel=2,
-                )
-            else:
-                var_name = c.name
-
+        for var_name, c, values in self._disambiguate_names(line_rec, decoded):
             if len(values) == station_length:
                 station_dim = "station"
             else:
@@ -639,3 +683,201 @@ class GDB:
                 "path": self.path,
             },
         )
+
+    def to_geoh5(
+        self,
+        path: str,
+        *,
+        x_channel: str = "Easting",
+        y_channel: str = "Northing",
+        z_channel: Optional[str] = None,
+    ) -> None:
+        """
+        Export every line's data to a new `.geoh5` file at `path` --
+        one `Points` object per line (holding real per-line data,
+        i.e. it has at least one channel with data), grouped under one
+        `ContainerGroup` named after this `.gdb` file, inside a
+        `geoh5py.Workspace`. Needs the optional `geoh5py` dependency
+        (`pip install python-gdb[geoh5]`), imported lazily here so
+        importing `pygdb` itself never requires it.
+
+        Unlike `to_xarray` (one line, in memory, no geometry needed),
+        this is whole-file and writes directly to disk, since a
+        `geoh5py.Workspace` is inherently file-backed and `.geoh5`'s own
+        natural unit is one file holding a whole survey's worth of named
+        objects, not one line at a time.
+
+        **Vertex geometry**: `x_channel`/`y_channel` (default
+        `"Easting"`/`"Northing"`, matching this project's own validated
+        real sample corpus, but fully overridable for a file that uses
+        different names) provide each line's `Points.vertices`; a line
+        missing either is **skipped entirely** (no `Points` object
+        created for it), with a `GDBParseWarning`, rather than guessed
+        at or defaulted to `(0, 0)` -- this reader never guesses what a
+        channel means (see `to_xarray`'s docstring), only defaults for
+        the common case. `z_channel` is optional: `None` (the default)
+        or simply absent on a given line means every vertex gets `Z =
+        0.0` -- unlike a missing X/Y, a missing elevation channel is
+        normal and shouldn't block export.
+
+        **Array/VA channels** (docs/spec.md section 5): `.geoh5` (per
+        `geoh5py`, checked directly against its real `data/` module
+        source) has no `Data` type holding more than one value per
+        vertex -- the plain numeric types silently `ravel()` anything
+        with `ndim > 1`. So each array channel is exported as **one
+        `Data` entry per column**, named `f"{name}[{j}]"` for `j` in
+        `range(array_width)`, tied back together with a `PropertyGroup`
+        named after the channel (`ObjectBase.add_data(...,
+        property_group=name)`) -- the same "one `Data` per gate/column,
+        grouped" pattern `geoh5py`'s own built-in survey types
+        (`AirborneTEMSurvey` et al.) use internally for multi-gate EM
+        decay-curve data, not a workaround invented here.
+
+        **Duplicate channel names**: disambiguated exactly like
+        `to_xarray` (see `_disambiguate_names`) -- `f"{name}[{occurrence}]"`
+        for every occurrence after the first, same numbering as
+        `channel(("name", occurrence))`, with a `GDBParseWarning`.
+
+        **Row-count mismatches**: `.geoh5` `Data` with `VERTEX`
+        association must match the parent object's vertex count
+        exactly -- there's no analogue to `to_xarray`'s per-channel
+        dimension escape hatch. A channel that decodes to a different
+        row count than this line's vertex count (from `x_channel`) is
+        **skipped** (that channel only, not the whole line), with a
+        `GDBParseWarning`.
+
+        **Not attempted**: coordinate-system/CRS export --
+        `self.coordinate_systems` only returns best-effort names (no
+        EPSG codes or full projection definitions), which isn't enough
+        to populate `.geoh5`'s real CRS metadata correctly.
+        """
+        try:
+            import geoh5py  # noqa: F401 -- import-only check, see below
+        except ImportError as e:
+            raise ImportError(
+                "to_geoh5() needs the optional 'geoh5py' dependency -- "
+                "install with `pip install python-gdb[geoh5]`"
+            ) from e
+        # A bare `import geoh5py` (rather than importing these submodules
+        # directly inside the `try`) is what makes the dependency check
+        # actually fire in every case, including when `geoh5py`'s own
+        # submodules are already cached in `sys.modules` from an earlier
+        # import elsewhere in the process: a `from geoh5py.groups import
+        # ContainerGroup` reuses an already-imported `geoh5py.groups`
+        # without re-checking `geoh5py` itself, so testing for a missing
+        # dependency by monkeypatching `sys.modules["geoh5py"] = None`
+        # would otherwise silently not trigger this except block.
+        from geoh5py.groups import ContainerGroup
+        from geoh5py.objects import Points
+        from geoh5py.workspace import Workspace
+
+        with Workspace(path, mode="a") as ws:
+            file_group = ws.create_entity(ContainerGroup, entity={"name": Path(self.path).stem})
+
+            for line_rec in self.lines:
+                pairs = self._channels_with_data_on_line(line_rec)
+                if not pairs:
+                    continue
+
+                decoded = [
+                    (c, read_blob_values(
+                        self.path, blob, c,
+                        comp_level=self.comp_level or 0, page_size=self.page_size,
+                        file=self._file,
+                    ))
+                    for c, blob in pairs
+                ]
+
+                def _find(name):
+                    for c, values in decoded:
+                        if c.name == name:
+                            return c, values
+                    return None, None
+
+                x_chan, x_values = _find(x_channel)
+                y_chan, y_values = _find(y_channel)
+                if x_chan is None or y_chan is None:
+                    missing = [n for n, c in ((x_channel, x_chan), (y_channel, y_chan)) if c is None]
+                    warnings.warn(
+                        f"{self.path}: line {line_rec.name!r} has no data for "
+                        f"{missing!r} -- can't place its points; skipping this "
+                        f"line entirely (pass x_channel=/y_channel= if this file "
+                        f"uses different coordinate channel names)",
+                        GDBParseWarning, stacklevel=2,
+                    )
+                    continue
+
+                n_vertices = len(x_values)
+                if len(y_values) != n_vertices:
+                    warnings.warn(
+                        f"{self.path}: line {line_rec.name!r}: {x_channel!r} decoded "
+                        f"{n_vertices} row(s) but {y_channel!r} decoded "
+                        f"{len(y_values)} -- can't build consistent vertices; "
+                        f"skipping this line entirely",
+                        GDBParseWarning, stacklevel=2,
+                    )
+                    continue
+
+                geometry_channels = {x_chan, y_chan}
+                z_values = np.zeros(n_vertices)
+                if z_channel is not None:
+                    z_chan, found_z_values = _find(z_channel)
+                    if z_chan is not None and len(found_z_values) == n_vertices:
+                        z_values = found_z_values
+                        geometry_channels.add(z_chan)
+                    elif z_chan is not None:
+                        warnings.warn(
+                            f"{self.path}: line {line_rec.name!r}: z_channel "
+                            f"{z_channel!r} decoded {len(found_z_values)} row(s), "
+                            f"expected {n_vertices} -- using all-zero Z for this "
+                            f"line instead",
+                            GDBParseWarning, stacklevel=2,
+                        )
+
+                vertices = np.column_stack(
+                    [x_values, y_values, z_values]
+                ).astype(float)
+                points_obj = ws.create_entity(
+                    Points,
+                    entity={"name": line_rec.name, "parent": file_group, "vertices": vertices},
+                )
+                points_obj.add_data({
+                    "line_category": {"values": line_rec.category_name, "association": "OBJECT"},
+                })
+
+                for var_name, c, values in self._disambiguate_names(line_rec, decoded):
+                    if c in geometry_channels:
+                        continue
+                    if len(values) != n_vertices:
+                        warnings.warn(
+                            f"{self.path}: line {line_rec.name!r} channel {c.name!r} "
+                            f"decoded {len(values)} row(s), expected {n_vertices} "
+                            f"(this line's vertex count) -- geoh5 data must match "
+                            f"the object's vertex count exactly; skipping this "
+                            f"channel",
+                            GDBParseWarning, stacklevel=2,
+                        )
+                        continue
+
+                    description = f"{c.type_name} / {c.format_name}"
+                    if c.is_array:
+                        description += f" / {c.array_basetype_name}"
+                        points_obj.add_data(
+                            {
+                                f"{var_name}[{j}]": {
+                                    "values": values[:, j],
+                                    "association": "VERTEX",
+                                    "description": description,
+                                }
+                                for j in range(c.array_width)
+                            },
+                            property_group=var_name,
+                        )
+                    else:
+                        points_obj.add_data({
+                            var_name: {
+                                "values": values,
+                                "association": "VERTEX",
+                                "description": description,
+                            },
+                        })
