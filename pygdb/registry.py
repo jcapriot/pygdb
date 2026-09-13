@@ -58,22 +58,35 @@ def find_coordinate_systems(path: str, max_real_line_slot: Optional[int] = None)
     """
     Scan `path` for coordinate-system (map projection) names.
 
-    Returns a de-duplicated, order-of-discovery list of name strings (e.g.
-    `"WGS 84 / UTM zone 54S"`), or an empty list if none were found --
-    which is expected and normal for a real file with no REG/IPJ content
-    at all (docs/spec.md section 9), not necessarily a sign of a problem.
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file to scan.
+    max_real_line_slot : int, optional
+        The highest physical line-table slot index that corresponds to
+        a real survey line -- blobs whose `line_slot` (decoded via
+        `BlobHeader.line_channel`) beyond this are treated as
+        "administrative" and probed for IPJ content. If not given, it
+        is derived by calling `read_lines(path)` (an extra table scan)
+        and using the highest slot index found there; pass it
+        explicitly if you already have that file's `read_lines()`
+        result to avoid repeating the scan.
 
-    `max_real_line_slot` is the highest physical line-table slot index
-    that corresponds to a real survey line -- blobs whose `line_slot`
-    (decoded via `BlobHeader.line_channel`) is beyond this are treated as
-    "administrative" and probed for IPJ content. If not given, it's
-    derived by calling `read_lines(path)` (an extra table scan) and using
-    the highest slot index found there; pass it explicitly if you already
-    have that file's `read_lines()` result to avoid repeating the scan.
+    Returns
+    -------
+    list of str
+        A de-duplicated, order-of-discovery list of name strings (e.g.
+        `"WGS 84 / UTM zone 54S"`), or an empty list if none were
+        found -- which is expected and normal for a real file with no
+        REG/IPJ content at all (docs/spec.md section 9), not
+        necessarily a sign of a problem.
 
-    Fails gracefully like the rest of this package: a bad magic or
-    truncated header returns `[]` with a `GDBParseWarning` rather than
-    raising.
+    Warns
+    -----
+    GDBParseWarning
+        If `path` doesn't start with the expected magic, or its header
+        is too short to read `chans_max` -- fails gracefully like the
+        rest of this package, returning `[]` rather than raising.
     """
     with open(path, "rb") as f:
         header = f.read(128)
@@ -133,45 +146,63 @@ def find_channel_roles(
     channel_names: Optional[Iterable[str]] = None,
 ) -> Dict[str, Optional[str]]:
     """
-    Scan `path` for which real channel plays the X/Y/Z coordinate role,
-    per the file's own internal registry (docs/provenance/notes.md
+    Scan `path` for which real channel plays the X/Y/Z coordinate role.
+
+    Reads the file's own internal registry (docs/provenance/notes.md
     section 6.8b) -- a directly-decodable alternative to guessing from
     channel-naming conventions (`"Easting"`/`"Northing"` and similar
     aren't consistent enough across real files to guess safely; see
-    `gdb.GDB.to_xarray`'s docstring for why this reader avoids that kind
-    of guess elsewhere too).
+    `gdb.GDB.to_xarray`'s docstring for why this reader avoids that
+    kind of guess elsewhere too).
 
-    Returns `{"X": ..., "Y": ..., "Z": ...}`, always all three keys; a
-    role with no confirmed real-channel assignment (the registry key is
-    absent, its value doesn't match any real channel in `channel_names`,
-    or -- a real, confirmed case -- its value is a single blank space,
-    Oasis montaj's own "no channel assigned to this role" placeholder)
-    maps to `None` rather than being omitted, so a caller doesn't need
-    to distinguish "not found" from "found but unusable."
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file to scan.
+    max_real_line_slot : int, optional
+        See `find_coordinate_systems` -- same meaning and same
+        "pass it if you already have it" reasoning.
+    channel_names : iterable of str, optional
+        The file's own real channel names, used to validate each
+        candidate registry value (see Notes). If not given, this calls
+        `read_channels(path)` itself (an extra table scan) -- pass
+        `[c.name for c in db.channels]` if the caller already has it.
 
-    A real complication, found by testing (section 6.8b): this format's
-    append-only blob storage can leave *multiple, differing* stale
-    copies of the same registry key in one file when a role gets
+    Returns
+    -------
+    dict of {str : str or None}
+        `{"X": ..., "Y": ..., "Z": ...}`, always all three keys; a role
+        with no confirmed real-channel assignment (the registry key is
+        absent, its value doesn't match any real channel in
+        `channel_names`, or -- a real, confirmed case -- its value is a
+        single blank space, Oasis montaj's own "no channel assigned to
+        this role" placeholder) maps to `None` rather than being
+        omitted, so a caller doesn't need to distinguish "not found"
+        from "found but unusable."
+
+    Warns
+    -----
+    GDBParseWarning
+        If `path` doesn't start with the expected magic, or its header
+        is too short to read `chans_max`/`page_size` -- fails
+        gracefully like `find_coordinate_systems`, returning all-`None`
+        rather than raising. Also raised if more than one *different*
+        candidate value both validate as real channels for the same
+        role (see Notes) -- genuine ambiguity, not yet observed on any
+        real file.
+
+    Notes
+    -----
+    A real complication, found by testing (section 6.8b): this
+    format's append-only blob storage can leave *multiple, differing*
+    stale copies of the same registry key in one file when a role gets
     re-registered (confirmed on 2 of 22 real files) -- and neither
     "prefer the first occurrence" nor "prefer the last" resolves both
     real cases correctly (one needs each). The robust rule used here
     instead: collect every candidate value found for a role, and keep
     whichever one(s) actually name a real, current channel (checked
     against `channel_names`) -- a direct cross-check against data this
-    reader already parses, not a positional guess. If more than one
-    *different* candidate both validate as real channels (genuine
-    ambiguity -- not yet observed on any real file), this warns and
-    returns `None` for that role rather than silently picking one.
-
-    `channel_names`: the file's own real channel names, used for the
-    validation above. If not given, this calls `read_channels(path)`
-    itself (an extra table scan) -- pass `[c.name for c in
-    db.channels]` if the caller already has it, mirroring
-    `max_real_line_slot`'s own "pass it if you already have it" pattern.
-
-    Fails gracefully like `find_coordinate_systems`: a bad magic or
-    truncated header returns all-`None` with a `GDBParseWarning` rather
-    than raising.
+    reader already parses, not a positional guess.
     """
     with open(path, "rb") as f:
         header = f.read(128)

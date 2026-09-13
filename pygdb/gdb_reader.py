@@ -64,21 +64,25 @@ except ImportError:
 
 class GDBParseWarning(RuntimeWarning):
     """
-    Warned (via `warnings.warn`) whenever this reader hits a blob,
-    chunk, or record it can't parse -- an unexpected byte sequence, a
-    file that ends prematurely (truncated download, or a blob chain
-    that runs past EOF), an administrative-blob variant it doesn't
-    recognize, or anything else that doesn't fit the confirmed
-    structure. This reader is designed to degrade gracefully rather
-    than hard-crash on this whole class of problem: functions return
-    whatever they successfully decoded up to the point of trouble
-    (a shorter-than-expected list, an empty list, or in the worst case
-    an empty result) instead of raising, and a `GDBParseWarning`
-    describing what couldn't be decoded and why is always issued
-    alongside, so a caller can tell a clean, complete result from a
-    partial one and go investigate. See docs/provenance/notes.md's "reader robustness"
-    notes for the design rationale (an explicit engineering request,
-    not new format research).
+    Warned whenever this reader hits a blob, chunk, or record it can't parse.
+
+    Covers an unexpected byte sequence, a file that ends prematurely
+    (truncated download, or a blob chain that runs past EOF), an
+    administrative-blob variant it doesn't recognize, or anything else
+    that doesn't fit the confirmed structure. This reader is designed
+    to degrade gracefully rather than hard-crash on this whole class
+    of problem: functions return whatever they successfully decoded up
+    to the point of trouble (a shorter-than-expected list, an empty
+    list, or in the worst case an empty result) instead of raising,
+    and a `GDBParseWarning` describing what couldn't be decoded and
+    why is always issued alongside, so a caller can tell a clean,
+    complete result from a partial one and go investigate.
+
+    Notes
+    -----
+    See docs/provenance/notes.md's "reader robustness" notes for the
+    design rationale (an explicit engineering request, not new format
+    research).
 
     This does not apply to a handful of genuine precondition failures
     that aren't "this file has an interesting anomaly" (e.g. calling
@@ -218,63 +222,96 @@ DB_ARRAY_BASETYPE_NAMES = {
 
 @dataclass(eq=False)
 class ChannelRecord:
-    # eq=False -- keep the default identity-based __eq__/__hash__ instead
-    # of dataclass's usual field-by-field one, so instances stay hashable
-    # (GDB.iter_line() yields these and documents `dict(...)` keyed by
-    # the record itself as safe -- see its docstring -- which needs
-    # __hash__ to actually work). Value equality between two separately-
-    # constructed-but-identical records is never used anywhere in this
-    # codebase; every real lookup returns the same cached instance from
-    # GDB.channels, so identity is all that's ever needed in practice.
+    """
+    One record from a `.gdb` file's channel symbol table.
+
+    Attributes
+    ----------
+    index : int
+        Slot index into the channel table.
+    offset : int
+        Byte offset of this record within the file.
+    name : str
+        Channel name.
+    dtype_code : int
+        Raw int16 value: positive = `GS_*` type (see
+        `GS_TYPE_NUMPY_DTYPE`), negative = `-string_width`.
+    format_code : int
+        Raw int16 display-format code (see `DB_CHAN_FORMAT_NAMES`).
+    raw : bytes
+        The record's raw, undecoded bytes.
+    array_width : int, default 1
+        **[CONFIRMED]** relative offset +118, int16. 1 = plain scalar
+        channel (the overwhelming majority of real channels seen). >1
+        = a true VA/array channel storing that many elements per
+        fiducial "cell" -- e.g. 24 (time-decay gates) or 30 (depth
+        layers) in the real AG106386 Georgetown conductivity file.
+        Independently cross-checked against that same file's
+        plain-text ASCII sibling (.dfn) format, which spells out
+        "30F10.4" (Fortran-style: 30 repetitions of a float field) for
+        the exact same channel name -- see docs/provenance/notes.md.
+    array_basetype_code : int, default 0
+        **[LIKELY]** relative offset +86, int16.
+    name_is_clean : bool, default True
+        False if the name field was NUL-unterminated or had
+        non-printable bytes -- see docs/provenance/notes.md re: older
+        (pre-2020, e.g. 1990s GEOTEM) files sometimes leaving unused
+        capacity slots un-zeroed rather than clean, unlike the 2020
+        USGS samples.
+
+    Notes
+    -----
+    `eq=False` keeps the default identity-based `__eq__`/`__hash__`
+    instead of dataclass's usual field-by-field one, so instances stay
+    hashable (`GDB.iter_line()` yields these and documents `dict(...)`
+    keyed by the record itself as safe -- see its docstring -- which
+    needs `__hash__` to actually work). Value equality between two
+    separately-constructed-but-identical records is never used
+    anywhere in this codebase; every real lookup returns the same
+    cached instance from `GDB.channels`, so identity is all that's
+    ever needed in practice.
+    """
+
     index: int
     offset: int
     name: str
-    dtype_code: int  # raw int16 value: positive=GS_* type, negative=-string_width
+    dtype_code: int
     format_code: int
     raw: bytes
-    array_width: int = 1     # [CONFIRMED] relative offset +118, int16. 1 = plain
-                              # scalar channel (the overwhelming majority of real
-                              # channels seen). >1 = a true VA/array channel
-                              # storing that many elements per fiducial "cell" --
-                              # e.g. 24 (time-decay gates) or 30 (depth layers) in
-                              # the real AG106386 Georgetown conductivity file.
-                              # Independently cross-checked against that same
-                              # file's plain-text ASCII sibling (.dfn) format,
-                              # which spells out "30F10.4" (Fortran-style: 30
-                              # repetitions of a float field) for the exact same
-                              # channel name -- see docs/provenance/notes.md.
-    array_basetype_code: int = 0  # [LIKELY] relative offset +86, int16.
-    name_is_clean: bool = True  # False = name field was NUL-unterminated / had
-                                 # non-printable bytes -- see docs/provenance/notes.md re: older
-                                 # (pre-2020, e.g. 1990s GEOTEM) files sometimes
-                                 # leaving unused capacity slots un-zeroed rather
-                                 # than clean, unlike the 2020 USGS samples.
+    array_width: int = 1
+    array_basetype_code: int = 0
+    name_is_clean: bool = True
 
     @property
     def is_string(self) -> bool:
+        """bool: True if `dtype_code` encodes a string width (negative)."""
         return self.dtype_code < 0
 
     @property
     def string_width(self) -> Optional[int]:
+        """int or None: Fixed on-disk width in bytes, for a string channel."""
         return -self.dtype_code if self.is_string else None
 
     @property
     def type_name(self) -> str:
+        """str: Human-readable type name (a `GS_*` name, or `"string[N]"`)."""
         if self.is_string:
             return f"string[{self.string_width}]"
         return GS_TYPE_NAMES.get(self.dtype_code, f"unknown({self.dtype_code})")
 
     @property
     def format_name(self) -> str:
+        """str: Human-readable display-format name (a `DB_CHAN_FORMAT_*` name)."""
         return DB_CHAN_FORMAT_NAMES.get(self.format_code, f"unknown({self.format_code})")
 
     @property
     def is_array(self) -> bool:
-        """True for a real VA/array channel (array_width > 1). [CONFIRMED]."""
+        """bool: True for a real VA/array channel (`array_width > 1`). **[CONFIRMED]**."""
         return self.array_width > 1
 
     @property
     def array_basetype_name(self) -> str:
+        """str: Human-readable array base-type name (a `DB_ARRAY_BASETYPE_*` name)."""
         return DB_ARRAY_BASETYPE_NAMES.get(
             self.array_basetype_code, f"unknown({self.array_basetype_code})"
         )
@@ -282,12 +319,19 @@ class ChannelRecord:
     @property
     def looks_sane(self) -> bool:
         """
-        Heuristic sanity check distinguishing a real channel record from
-        leftover-garbage bytes that happen to decode a clean printable
-        name (observed for real in DB_Mag_833.gdb -- see docs/provenance/notes.md). Real
-        records seen so far always have dtype either a known GS_* code
-        (0-13) or a small negative string width, and a format code in the
-        known DB_CHAN_FORMAT_* range (0-6).
+        Heuristic sanity check distinguishing a real channel record
+        from leftover-garbage bytes.
+
+        Returns
+        -------
+        bool
+            True if this record looks like real channel data rather
+            than leftover-garbage bytes that happen to decode a clean
+            printable name (observed for real in DB_Mag_833.gdb -- see
+            docs/provenance/notes.md). Real records seen so far always
+            have dtype either a known GS_* code (0-13) or a small
+            negative string width, and a format code in the known
+            DB_CHAN_FORMAT_* range (0-6).
         """
         dtype_ok = self.dtype_code in GS_TYPE_NAMES or -256 <= self.dtype_code < 0
         format_ok = self.format_code in DB_CHAN_FORMAT_NAMES
@@ -298,16 +342,31 @@ def _read_name(raw: bytes, offset: int, max_len: int = 64):
     """
     Read a NUL-padded name field.
 
-    Returns (name, is_clean). is_clean is False when the field has no NUL
-    terminator within max_len, or contains non-printable bytes before the
-    terminator -- observed [CONFIRMED against a real 1992 file,
-    DB_Mag_293.gdb from GSQ's Holroy River survey] to happen for *unused*
-    channel-table capacity slots in at least one older (pre-2020) real
-    .gdb file: unlike the 2020 USGS samples (where unused capacity slots
-    are cleanly zeroed), this older file leaves unused slots holding
-    leftover/uninitialized bytes that happen to look like binary float
-    data, not padding. Treat is_clean=False slots as "unused capacity,
-    contents undefined" rather than as real channels.
+    Parameters
+    ----------
+    raw : bytes
+        Buffer containing the name field.
+    offset : int
+        Offset into `raw` where the field starts.
+    max_len : int, default 64
+        Field width in bytes.
+
+    Returns
+    -------
+    name : str
+        The decoded name.
+    is_clean : bool
+        False when the field has no NUL terminator within `max_len`,
+        or contains non-printable bytes before the terminator --
+        observed **[CONFIRMED against a real 1992 file, DB_Mag_293.gdb
+        from GSQ's Holroy River survey]** to happen for *unused*
+        channel-table capacity slots in at least one older (pre-2020)
+        real `.gdb` file: unlike the 2020 USGS samples (where unused
+        capacity slots are cleanly zeroed), this older file leaves
+        unused slots holding leftover/uninitialized bytes that happen
+        to look like binary float data, not padding. Treat
+        `is_clean=False` slots as "unused capacity, contents
+        undefined" rather than as real channels.
     """
     field = raw[offset : offset + max_len]
     nul = field.find(b"\x00")
@@ -320,41 +379,91 @@ def _read_name(raw: bytes, offset: int, max_len: int = 64):
 
 def check_magic(data: bytes) -> bool:
     """
-    [CONFIRMED] the 4-byte "!CBD" prefix against 9/9 real files across two
-    independent sources (2020 USGS Mojave survey, 1990s-2020s GSQ
-    Queensland surveys from three different TEM systems/vendors).
+    Check whether `data` starts with the format's magic bytes.
 
-    The FULL 16-byte HEADER_SIGNATURE is only [LIKELY] -- it matched
-    exactly in 8/9 real files, but one real file
+    Parameters
+    ----------
+    data : bytes
+        The file's leading bytes (at least 4).
+
+    Returns
+    -------
+    bool
+        True if `data` starts with the 4-byte `"!CBD"` magic.
+
+    Notes
+    -----
+    **[CONFIRMED]** against 9/9 real files across two independent
+    sources (2020 USGS Mojave survey, 1990s-2020s GSQ Queensland
+    surveys from three different TEM systems/vendors).
+
+    The full 16-byte `HEADER_SIGNATURE` is only **[LIKELY]** -- it
+    matched exactly in 8/9 real files, but one real file
     (DB_Mag_Elaine_1003.gdb, from GSQ's Mount Gordon delivery) has
-    `f0 f0 f0 f0` at bytes 8-11 instead of the usual `00 00 00 00`. That
-    file is otherwise structurally normal (chans_max/users_max/page_size
-    all decode sanely), so this looks like a real, if rare, variation in
-    that sub-block rather than a different format entirely -- flagged
-    [UNKNOWN] in docs/provenance/notes.md. Only the 4-byte magic is treated as a hard
-    requirement here; the rest of the signature is reported separately.
+    `f0 f0 f0 f0` at bytes 8-11 instead of the usual `00 00 00 00`.
+    That file is otherwise structurally normal
+    (chans_max/users_max/page_size all decode sanely), so this looks
+    like a real, if rare, variation in that sub-block rather than a
+    different format entirely -- flagged **[UNKNOWN]** in
+    docs/provenance/notes.md. Only the 4-byte magic is treated as a
+    hard requirement here; the rest of the signature is reported
+    separately (`magic_signature_matches_common_case`).
     """
     return data[:4] == MAGIC
 
 
 def magic_signature_matches_common_case(data: bytes) -> bool:
-    """True if bytes 0-15 exactly match the signature seen in most real files."""
+    """
+    Check whether `data`'s first 16 bytes match the common-case signature.
+
+    Parameters
+    ----------
+    data : bytes
+        The file's leading bytes (at least 16).
+
+    Returns
+    -------
+    bool
+        True if bytes 0-15 exactly match `HEADER_SIGNATURE`, the
+        signature seen in most real files (see `check_magic`'s notes
+        for the one real exception found).
+    """
     return data[:16] == HEADER_SIGNATURE
 
 
 def header_fields(data: bytes) -> dict:
     """
-    Extract the header int32 fields whose approximate meaning we have
-    some confidence in. See docs/provenance/notes.md section 6.1 for the full table
-    including the still-unknown offsets, and for why each confidence
-    label was assigned.
+    Extract the header int32 fields whose approximate meaning is known.
 
-    Fails gracefully on a truncated/too-short header: any field that
-    can't be read (not enough bytes at its offset) is set to `None`
-    in the returned dict rather than raising, and a `GDBParseWarning`
-    is issued naming which field(s) were affected. Callers that need a
-    field should check for `None` before using it (every function in
-    this module that consumes `header_fields()` output does).
+    Parameters
+    ----------
+    data : bytes
+        The file's header bytes.
+
+    Returns
+    -------
+    dict
+        Maps each of `"chans_max"`, `"users_max"`, `"page_size"`, and
+        `"comp_level"` to its decoded int32 value. See
+        docs/provenance/notes.md section 6.1 for the full table
+        including the still-unknown offsets, and for why each
+        confidence label was assigned.
+
+    Warns
+    -----
+    GDBParseWarning
+        If `data` is truncated: any field that can't be read (not
+        enough bytes at its offset) is set to `None` in the returned
+        dict rather than raising. Callers that need a field should
+        check for `None` before using it (every function in this
+        module that consumes `header_fields()` output does).
+
+    Notes
+    -----
+    `comp_level==1` (`DB_COMP_SPEED`) does NOT mean the payload is
+    zlib -- confirmed it is NOT (docs/provenance/notes.md section
+    6.5b), it's canonical LZRW1 (section 6.5c). `comp_level==2`
+    (`DB_COMP_SIZE`) IS confirmed real zlib.
     """
     result = {}
     for name, offset in (("chans_max", 24), ("users_max", 40),
@@ -392,36 +501,61 @@ def find_channel_table(data: bytes, search_window=(0, None)) -> int:
     """
     Locate the start of the channel symbol table.
 
-    Strategy [CONFIRMED against 2 real 2020 USGS files, RE-CONFIRMED --
-    with one revision -- against 5 more real 1990s-2020s GSQ files, see
-    docs/provenance/notes.md/docs/provenance/log.md "pressure test" round]: search for the default
-    super-user name (from GXDB.create()'s documented default
-    `super="SUPER"`). The channel table is found to occupy exactly
-    `chans_max` consecutive 128-byte records immediately before the user
-    table, i.e.
+    Parameters
+    ----------
+    data : bytes
+        Buffer to search (typically the start of the file).
+    search_window : tuple of (int, int or None), default (0, None)
+        `(lo, hi)` byte range within `data` to search; `hi=None`
+        means the end of `data`.
+
+    Returns
+    -------
+    int
+        Byte offset of the channel table's first record.
+
+    Raises
+    ------
+    ValueError
+        If no `"SUPER"`/`"super"` occurrence in the search window
+        implies a valid channel table.
+
+    Notes
+    -----
+    Strategy **[CONFIRMED against 2 real 2020 USGS files, RE-CONFIRMED
+    -- with one revision -- against 5 more real 1990s-2020s GSQ files,
+    see docs/provenance/notes.md/docs/provenance/log.md "pressure
+    test" round]**: search for the default super-user name (from
+    `GXDB.create()`'s documented default `super="SUPER"`). The channel
+    table is found to occupy exactly `chans_max` consecutive 128-byte
+    records immediately before the user table, i.e.
+
+    ::
+
         channel_table_start == offset_of(super_name) - 8 - chans_max*128
 
     This isn't a generic file-format constant we can hardcode a single
-    offset for -- it depends on `chans_max`, which itself varies between
-    files -- so we compute it.
+    offset for -- it depends on `chans_max`, which itself varies
+    between files -- so we compute it.
 
-    REVISION from the original derivation: the two 2020 USGS files both
-    had the default super-user name stored as literal uppercase ASCII
-    "SUPER". Five real 1990s-2020s GSQ files instead have it stored as
-    lowercase "super" -- confirmed to be the *same* structural pattern
-    (same 128-byte-per-record math, same position relative to the
-    channel table) once the case is corrected, not a different layout.
-    Search for both cases. (One of the GSQ files, DB_Mag_833.gdb, also
-    demonstrated that the literal string can coincidentally appear
-    elsewhere in a file, e.g. inside embedded metadata blobs, and that
-    the *word* "super"/"SUPER" appearing is not on its own sufficient --
-    a naive first-match there pointed at a bogus offset. Confirmed
-    correct instead via an independent generic 128-byte-periodicity scan
-    that landed on the identical answer once cross-checked.)
+    REVISION from the original derivation: the two 2020 USGS files
+    both had the default super-user name stored as literal uppercase
+    ASCII "SUPER". Five real 1990s-2020s GSQ files instead have it
+    stored as lowercase "super" -- confirmed to be the *same*
+    structural pattern (same 128-byte-per-record math, same position
+    relative to the channel table) once the case is corrected, not a
+    different layout. Search for both cases. (One of the GSQ files,
+    DB_Mag_833.gdb, also demonstrated that the literal string can
+    coincidentally appear elsewhere in a file, e.g. inside embedded
+    metadata blobs, and that the *word* "super"/"SUPER" appearing is
+    not on its own sufficient -- a naive first-match there pointed at
+    a bogus offset. Confirmed correct instead via an independent
+    generic 128-byte-periodicity scan that landed on the identical
+    answer once cross-checked.)
 
-    Every occurrence of "SUPER"/"super" is tried and the first one whose
-    implied table start decodes a *clean* (NUL-terminated, printable)
-    channel name is used.
+    Every occurrence of "SUPER"/"super" is tried and the first one
+    whose implied table start decodes a *clean* (NUL-terminated,
+    printable) channel name is used.
     """
     lo, hi = search_window
     if hi is None:
@@ -452,14 +586,29 @@ def find_channel_table(data: bytes, search_window=(0, None)) -> int:
 
 def read_channels(path: str) -> List[ChannelRecord]:
     """
-    Decode the channel symbol table. Fails gracefully: a file that
-    isn't a real `.gdb` (bad magic), has a truncated header, has no
-    locatable channel table, or has a channel table that's cut off
-    partway through all result in a `GDBParseWarning` plus whatever
-    channels *were* successfully decoded before the problem (an empty
-    list in the first three cases, since nothing was decodable yet; a
-    real, non-empty, shorter-than-`chans_max` list in the last case).
-    Never raises for these -- see `GDBParseWarning`'s docstring.
+    Decode the channel symbol table.
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file.
+
+    Returns
+    -------
+    list of ChannelRecord
+        Every channel successfully decoded, in table order.
+
+    Warns
+    -----
+    GDBParseWarning
+        A file that isn't a real `.gdb` (bad magic), has a truncated
+        header, has no locatable channel table, or has a channel
+        table that's cut off partway through all result in this
+        warning plus whatever channels *were* successfully decoded
+        before the problem (an empty list in the first three cases,
+        since nothing was decodable yet; a real, non-empty,
+        shorter-than-`chans_max` list in the last case). Never raises
+        for these -- see `GDBParseWarning`'s docstring.
     """
     with open(path, "rb") as f:
         # Reading the whole file is wasteful for a 700MB+ real survey
@@ -542,22 +691,44 @@ _NAME_LIKE_RE = re.compile(rb"[\x20-\x7e]{1,63}\x00")
 @dataclass(eq=False)
 class LineRecord:
     """
-    One 128-byte line-table record. [LIKELY]/[UNKNOWN] -- much less firmly
-    established than ChannelRecord: only the name (relative +32) and
-    category code (relative +108) fields are decoded, and locating the
-    table itself (find_line_table below) is a heuristic scan rather than
-    the structurally-proven SUPER-anchor technique used for the channel
-    table. See docs/spec.md section 3.2 and docs/provenance/notes.md section 6.3.
+    One 128-byte line-table record.
+
+    Attributes
+    ----------
+    index : int
+        0-based physical slot number -- this IS `line_slot_index` in
+        the blob_index formula (`BlobHeader.line_channel`).
+    offset : int
+        Byte offset of this record within the file.
+    name : str
+        Line name.
+    category_code : int or None
+        Raw int32 category code (see `DB_CATEGORY_LINE_NAMES`).
+    raw : bytes
+        The record's raw, undecoded bytes.
+    name_is_clean : bool, default True
+        See `ChannelRecord.name_is_clean`.
+
+    Notes
+    -----
+    **[LIKELY]/[UNKNOWN]** -- much less firmly established than
+    `ChannelRecord`: only the name (relative +32) and category code
+    (relative +108) fields are decoded, and locating the table itself
+    (`find_line_table` below) is a heuristic scan rather than the
+    structurally-proven SUPER-anchor technique used for the channel
+    table. See docs/spec.md section 3.2 and docs/provenance/notes.md
+    section 6.3.
 
     `eq=False` keeps the default identity-based `__eq__`/`__hash__`
     instead of dataclass's usual field-by-field one -- needed both to
-    stay hashable (see `ChannelRecord`'s docstring for why) and because
-    `GDB._calibrate_line_indices` mutates `.index` in place on these
-    after construction; a value-based `__eq__`/`__hash__` pair would be
-    actively wrong for an object whose fields change post-construction.
+    stay hashable (see `ChannelRecord`'s docstring for why) and
+    because `GDB._calibrate_line_indices` mutates `.index` in place on
+    these after construction; a value-based `__eq__`/`__hash__` pair
+    would be actively wrong for an object whose fields change
+    post-construction.
     """
-    index: int         # 0-based physical slot number -- this IS line_slot_index
-                        # in the blob_index formula (BlobHeader.line_channel)
+
+    index: int
     offset: int
     name: str
     category_code: Optional[int]
@@ -566,6 +737,7 @@ class LineRecord:
 
     @property
     def category_name(self) -> str:
+        """str: Human-readable category name (a `DB_CATEGORY_LINE_*` name)."""
         if self.category_code is None:
             return "unknown"
         return DB_CATEGORY_LINE_NAMES.get(self.category_code, f"unknown({self.category_code})")
@@ -588,44 +760,65 @@ def find_line_table(data: bytes, search_window: Tuple[int, Optional[int]] = (128
     """
     Locate the start of the line symbol table.
 
-    Unlike find_channel_table, there's no known default-name anchor (the
-    line table has nothing analogous to the channel table's "SUPER" user
-    record immediately after it) and no confirmed header field gives its
-    start offset directly -- reconciling one with the header's capacity
-    fields was tried and didn't cleanly round-trip (docs/provenance/log.md
-    Session 1 section 1.16, docs/provenance/notes.md section 6.3). This is
-    therefore a heuristic **[LIKELY]** scan, not the structurally-proven
-    technique used for the channel table: it looks for a run of 128-byte
-    records whose relative +32 field looks like a clean, NUL-terminated,
-    printable line name and whose relative +108 category field matches one
-    of the two confirmed real values (100=NORMAL/FLIGHT, 200=GROUP), then
-    returns the earliest such record in the run with the most hits at a
-    consistent 128-byte phase.
+    Parameters
+    ----------
+    data : bytes
+        Buffer to search.
+    search_window : tuple of (int, int or None), default (128, None)
+        `(lo, hi)` byte range within `data` to search; `hi=None`
+        means the end of `data`. Callers should generally narrow `hi`
+        to `blob_region_start(data)` when known, since every real
+        file examined has its symbol tables (line, channel, user)
+        entirely before the blob region, and narrowing avoids
+        false-positive matches inside actual channel data.
 
-    **Known limitation, found by real-file testing, not yet fixed here:**
-    if a table's true first slot(s) don't carry a category code in
-    {100, 200}, this returns a start that's one or more slots too late --
-    every subsequent LineRecord.index is then off by that same fixed
-    amount, which breaks blob_index lookups by line name. Observed for
-    real on a GSQ file (`rm001141`): physical slot 0 is a genuine, named
-    record (`"L0"`) with category `65636` (**[GUESS]**: `65536 + 100`,
-    plausibly "a NORMAL line that was since cleared," not confirmed),
-    which this function doesn't recognize, so it starts the table one
-    slot late. A generic backward-scan fix was tried and rejected: "keep
-    walking backward while the name field still looks clean" massively
-    over-extends on at least one real file (walked 30+ slots into what
-    turned out to be unrelated, legitimately-empty space before the real
-    table). `GDB` (in `gdb.py`) instead cross-validates and corrects this
-    against the actual blob chain, which is a strictly stronger signal
-    than anything available from the symbol-table bytes alone -- prefer
-    it over calling this function directly when correct line-indexed
-    data access matters, not just names.
+    Returns
+    -------
+    int
+        Byte offset of the line table's first record.
 
-    `search_window` defaults to (128, end of `data`) -- callers should
-    generally narrow `hi` to `blob_region_start(data)` when known, since
-    every real file examined has its symbol tables (line, channel, user)
-    entirely before the blob region, and narrowing avoids false-positive
-    matches inside actual channel data.
+    Raises
+    ------
+    ValueError
+        If no line-record-shaped data (clean name + a known category
+        code) is found in the search window.
+
+    Notes
+    -----
+    Unlike `find_channel_table`, there's no known default-name anchor
+    (the line table has nothing analogous to the channel table's
+    "SUPER" user record immediately after it) and no confirmed header
+    field gives its start offset directly -- reconciling one with the
+    header's capacity fields was tried and didn't cleanly round-trip
+    (docs/provenance/log.md Session 1 section 1.16,
+    docs/provenance/notes.md section 6.3). This is therefore a
+    heuristic **[LIKELY]** scan, not the structurally-proven technique
+    used for the channel table: it looks for a run of 128-byte records
+    whose relative +32 field looks like a clean, NUL-terminated,
+    printable line name and whose relative +108 category field
+    matches one of the two confirmed real values (100=NORMAL/FLIGHT,
+    200=GROUP), then returns the earliest such record in the run with
+    the most hits at a consistent 128-byte phase.
+
+    **Known limitation, found by real-file testing, not yet fixed
+    here:** if a table's true first slot(s) don't carry a category
+    code in {100, 200}, this returns a start that's one or more slots
+    too late -- every subsequent `LineRecord.index` is then off by
+    that same fixed amount, which breaks blob_index lookups by line
+    name. Observed for real on a GSQ file (`rm001141`): physical slot
+    0 is a genuine, named record (`"L0"`) with category `65636`
+    (**[GUESS]**: `65536 + 100`, plausibly "a NORMAL line that was
+    since cleared," not confirmed), which this function doesn't
+    recognize, so it starts the table one slot late. A generic
+    backward-scan fix was tried and rejected: "keep walking backward
+    while the name field still looks clean" massively over-extends on
+    at least one real file (walked 30+ slots into what turned out to
+    be unrelated, legitimately-empty space before the real table).
+    `GDB` (in `gdb.py`) instead cross-validates and corrects this
+    against the actual blob chain, which is a strictly stronger
+    signal than anything available from the symbol-table bytes alone
+    -- prefer it over calling this function directly when correct
+    line-indexed data access matters, not just names.
     """
     lo, hi = search_window
     if hi is None:
@@ -656,26 +849,43 @@ def find_line_table(data: bytes, search_window: Tuple[int, Optional[int]] = (128
 
 def read_lines(path: str) -> List[LineRecord]:
     """
-    Decode the line symbol table. Heuristic (see find_line_table) --
-    less firmly established than read_channels. Fails gracefully in the
-    same style: a bad magic, truncated header, or unlocatable line table
-    all return `[]` with a `GDBParseWarning` rather than raising.
+    Decode the line symbol table.
 
-    Since no confirmed header field gives the line table's slot capacity
-    (the way chans_max does for the channel table), this reads forward
-    from the located start until 8 consecutive records fail to look like
-    either a populated line record or clean unused capacity -- a
-    tolerance against one-off corruption/false-positive records, not a
-    precisely-known table boundary.
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file.
 
-    **`LineRecord.index` can be off by a small, fixed amount** on a file
-    where `find_line_table`'s heuristic starts one or more slots late --
-    see that function's docstring. This makes `.name` still correct but
-    `.index` (and therefore any blob_index lookup keyed on it) wrong.
-    `GDB` (in `gdb.py`) corrects this against the actual blob chain
-    before exposing lines by name; call it instead of this function
-    directly when you need working (line, channel) data access, not
-    just a list of names.
+    Returns
+    -------
+    list of LineRecord
+        Every line successfully decoded, in table order.
+
+    Warns
+    -----
+    GDBParseWarning
+        A bad magic, truncated header, or unlocatable line table all
+        return `[]` with this warning rather than raising.
+
+    Notes
+    -----
+    Heuristic (see `find_line_table`) -- less firmly established than
+    `read_channels`. Since no confirmed header field gives the line
+    table's slot capacity (the way `chans_max` does for the channel
+    table), this reads forward from the located start until 8
+    consecutive records fail to look like either a populated line
+    record or clean unused capacity -- a tolerance against one-off
+    corruption/false-positive records, not a precisely-known table
+    boundary.
+
+    **`LineRecord.index` can be off by a small, fixed amount** on a
+    file where `find_line_table`'s heuristic starts one or more slots
+    late -- see that function's docstring. This makes `.name` still
+    correct but `.index` (and therefore any blob_index lookup keyed on
+    it) wrong. `GDB` (in `gdb.py`) corrects this against the actual
+    blob chain before exposing lines by name; call it instead of this
+    function directly when you need working (line, channel) data
+    access, not just a list of names.
     """
     with open(path, "rb") as f:
         header = f.read(4096)
@@ -741,41 +951,82 @@ COMPRESSED_BLOB_HEADER_SIZE = 56
 @dataclass
 class BlobHeader:
     """
-    The per-channel-per-line data block header. [CONFIRMED] for fields
-    up to and including `blob_index` (verified byte-exact on 5 real
-    DB_COMP_NONE files via a whole-file, zero-error chain walk that
-    lands exactly on each file's true size -- see docs/provenance/notes.md section 6.6).
-    Fields from `timestamp` onward are only [LIKELY]/[UNKNOWN] and are
-    known NOT to decode sensibly at these byte offsets in at least one
-    real older (1991 GSQ) file -- kept here for the modern (2020 USGS)
-    case where they were verified, not assumed general.
+    The per-channel-per-line data block header.
+
+    Attributes
+    ----------
+    offset : int
+        Absolute file offset of this header's first byte.
+    n_pages : int
+        **[CONFIRMED]** -- this blob's total on-disk size, in pages
+        (`page_size` from `header_fields()`).
+    n_pages_dup : int
+        **[LIKELY]** -- always seen equal to `n_pages`.
+    blob_index : int
+        **[CONFIRMED]** -- see `line_channel`.
+    timestamp : int
+        **[LIKELY]**, modern files only -- see Notes.
+    reserved_200 : int
+        **[UNKNOWN]**.
+    scale : float
+        **[LIKELY]**, modern files only.
+    row_count : int
+        **[CONFIRMED]**, modern files only (verified against real
+        ground-truth-matching decoded values).
+    gs_type_code : int
+        **[CONFIRMED]**, modern files only (matches owning channel's
+        own symbol-table dtype exactly).
+
+    Notes
+    -----
+    **[CONFIRMED]** for fields up to and including `blob_index`
+    (verified byte-exact on 5 real DB_COMP_NONE files via a
+    whole-file, zero-error chain walk that lands exactly on each
+    file's true size -- see docs/provenance/notes.md section 6.6).
+    Fields from `timestamp` onward are only **[LIKELY]**/**[UNKNOWN]**
+    and are known NOT to decode sensibly at these byte offsets in at
+    least one real older (1991 GSQ) file -- kept here for the modern
+    (2020 USGS) case where they were verified, not assumed general.
     """
-    offset: int          # absolute file offset of this header's first byte
-    n_pages: int         # [CONFIRMED] -- this blob's total on-disk size, in
-                          # pages (page_size from header_fields())
-    n_pages_dup: int      # [LIKELY] -- always seen equal to n_pages
-    blob_index: int       # [CONFIRMED] -- see line_slot/channel_slot below
-    timestamp: int        # [LIKELY] modern files only, see docstring above
-    reserved_200: int     # [UNKNOWN]
-    scale: float          # [LIKELY] modern files only
-    row_count: int        # [CONFIRMED] modern files only (verified against
-                          # real ground-truth-matching decoded values)
-    gs_type_code: int     # [CONFIRMED] modern files only (matches owning
-                          # channel's own symbol-table dtype exactly)
+
+    offset: int
+    n_pages: int
+    n_pages_dup: int
+    blob_index: int
+    timestamp: int
+    reserved_200: int
+    scale: float
+    row_count: int
+    gs_type_code: int
 
     def line_channel(self, chans_max: int):
         """
-        Decompose blob_index into (line_slot_index, channel_slot_index)
-        via the formula [CONFIRMED] in docs/provenance/notes.md section 6.6:
-            blob_index == line_slot_index * chans_max + channel_slot_index
-        Both are 0-based physical slot numbers in their respective
-        symbol tables (same indexing as ChannelRecord.index and the
-        line table walked ad hoc in docs/provenance/notes.md section 6.3).
+        Decompose `blob_index` into `(line_slot_index, channel_slot_index)`.
+
+        Parameters
+        ----------
+        chans_max : int
+            The file's channel-table capacity (from `header_fields()`).
+
+        Returns
+        -------
+        tuple of (int, int)
+            `(line_slot_index, channel_slot_index)`, both 0-based
+            physical slot numbers in their respective symbol tables
+            (same indexing as `ChannelRecord.index` and the line table
+            walked ad hoc in docs/provenance/notes.md section 6.3),
+            via the formula **[CONFIRMED]** in
+            docs/provenance/notes.md section 6.6:
+
+            ::
+
+                blob_index == line_slot_index * chans_max + channel_slot_index
         """
         return divmod(self.blob_index, chans_max)
 
     @property
     def data_offset(self) -> int:
+        """int: Absolute file offset where this blob's value data begins."""
         return self.offset + BLOB_HEADER_SIZE
 
 
@@ -800,20 +1051,31 @@ def _parse_blob_header(raw: bytes, offset: int) -> Optional[BlobHeader]:
 
 def blob_region_start(data: bytes) -> Optional[int]:
     """
-    Absolute byte offset of the first real blob header.
+    Find the absolute byte offset of the first real blob header.
 
-    [CONFIRMED] on 20+ real files (every compression mode, chans_max
-    20-500, ~1991-2020, all 3 agencies) -- see docs/provenance/notes.md section 6.6/
-    6.6b. Header offset 108 (int32) is a PAGE NUMBER; multiplying by
-    page_size (header offset 100) lands exactly on the CC CC 00 FF
-    magic every time. (Header offset 104, an earlier "live lead" for
-    this same purpose in this project's own notes, is a close-but-wrong
-    red herring -- it sits near, but not exactly on, the end of the
-    symbol tables, and isn't even page-aligned.)
+    Parameters
+    ----------
+    data : bytes
+        The file's header bytes (at least 112 bytes).
 
-    Returns `None` (with a `GDBParseWarning`) if `data` is too short to
-    even read the two fields this needs (offset 108 + 4 bytes) -- a
-    severely truncated header.
+    Returns
+    -------
+    int or None
+        The offset, or `None` (with a `GDBParseWarning`) if `data` is
+        too short to even read the two fields this needs (offset 108
+        + 4 bytes) -- a severely truncated header.
+
+    Notes
+    -----
+    **[CONFIRMED]** on 20+ real files (every compression mode,
+    chans_max 20-500, ~1991-2020, all 3 agencies) -- see
+    docs/provenance/notes.md section 6.6/6.6b. Header offset 108
+    (int32) is a PAGE NUMBER; multiplying by `page_size` (header
+    offset 100) lands exactly on the `CC CC 00 FF` magic every time.
+    (Header offset 104, an earlier "live lead" for this same purpose
+    in this project's own notes, is a close-but-wrong red herring --
+    it sits near, but not exactly on, the end of the symbol tables,
+    and isn't even page-aligned.)
     """
     try:
         page_size = struct.unpack_from("<i", data, 100)[0]
@@ -829,32 +1091,52 @@ def blob_region_start(data: bytes) -> Optional[int]:
 
 def iter_blobs(path: str, max_blobs: Optional[int] = None):
     """
-    Walk the self-describing blob chain from the start of the blob
-    region to end of file (or `max_blobs`, or the first framing
-    anomaly), yielding BlobHeader records in on-disk order.
+    Walk the self-describing blob chain.
 
-    [CONFIRMED] end-to-end (zero framing errors, landing exactly on the
-    true file size) on 20 real files spanning all 3 agencies this
-    project has files from and all three `DB_COMP_*` compression modes,
-    2MB to 1.93GB -- see docs/provenance/notes.md section 6.6b/6.6d/6.9.
+    Walks from the start of the blob region to end of file (or
+    `max_blobs`, or the first framing anomaly).
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file.
+    max_blobs : int, optional
+        Stop after yielding this many blobs, if given.
+
+    Yields
+    ------
+    BlobHeader
+        Each blob header, in on-disk order.
+
+    Warns
+    -----
+    GDBParseWarning
+        Reaching the file's true end cleanly is silent (the expected,
+        common case), but a magic mismatch, a non-positive `n_pages`,
+        a file that ends mid-header, or landing short of true EOF by
+        less than one full header (i.e. real leftover bytes, not
+        enough to be read at all) are all real anomalies and each gets
+        its own specific warning identifying the offset and how many
+        blobs were walked first -- so a caller can tell "the chain
+        looked completely normal and just ended" from "something
+        didn't fit the confirmed structure" without having to guess
+        from the return value alone. Never raises for a bad/truncated
+        file; only for a real precondition problem (can't even open
+        `path`, propagated normally from `open`).
+
+    Notes
+    -----
+    **[CONFIRMED]** end-to-end (zero framing errors, landing exactly
+    on the true file size) on 20 real files spanning all 3 agencies
+    this project has files from and all three `DB_COMP_*` compression
+    modes, 2MB to 1.93GB -- see docs/provenance/notes.md section
+    6.6b/6.6d/6.9.
 
     As a generator, this already "returns partial results" in the most
     natural way possible: whatever's been yielded before a problem is
     hit stays with the caller (a `for blob in iter_blobs(path): ...`
     loop simply ends, keeping everything already processed) -- nothing
-    is lost by stopping early. What this function adds on top of that
-    is a clear `GDBParseWarning` distinguishing *why* it stopped:
-    reaching the file's true end cleanly is silent (the expected,
-    common case), but a magic mismatch, a non-positive `n_pages`, a
-    file that ends mid-header, or landing short of true EOF by less
-    than one full header (i.e. real leftover bytes, not enough to be
-    read at all) are all real anomalies and each gets its own specific
-    warning identifying the offset and how many blobs were walked
-    first -- so a caller can tell "the chain looked completely normal
-    and just ended" from "something didn't fit the confirmed
-    structure" without having to guess from the return value alone.
-    Never raises for a bad/truncated file; only for a real precondition
-    problem (can't even open `path`, propagated normally from `open`).
+    is lost by stopping early.
     """
     with open(path, "rb") as f:
         header = f.read(128)
@@ -965,19 +1247,40 @@ def iter_blobs(path: str, max_blobs: Optional[int] = None):
 
 def find_blob(path: str, line_slot: int, channel_slot: int, chans_max: Optional[int] = None) -> Optional[BlobHeader]:
     """
-    Locate the blob for a specific (line, channel) pair by walking the
-    chain (see iter_blobs) and computing the target blob_index via the
-    formula [CONFIRMED] in docs/provenance/notes.md section 6.6. Returns `None` if the
-    chain ends (or breaks -- see `iter_blobs`'s `GDBParseWarning`s for
-    why) before the target is found, or if `chans_max` can't be
-    determined at all (bad magic / truncated header) -- never raises
-    for these, consistent with the rest of this module.
+    Locate the blob for a specific (line, channel) pair.
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file.
+    line_slot : int
+        0-based physical line-table slot index.
+    channel_slot : int
+        0-based physical channel-table slot index.
+    chans_max : int, optional
+        The file's channel-table capacity. If not given, it's read
+        from the file's own header.
+
+    Returns
+    -------
+    BlobHeader or None
+        The matching blob header, or `None` if the chain ends (or
+        breaks -- see `iter_blobs`'s warnings for why) before the
+        target is found, or if `chans_max` can't be determined at all
+        (bad magic / truncated header) -- never raises for these,
+        consistent with the rest of this module.
+
+    Notes
+    -----
+    Walks the chain (see `iter_blobs`) and computes the target
+    `blob_index` via the formula **[CONFIRMED]** in
+    docs/provenance/notes.md section 6.6.
 
     This does a linear walk from the start of the blob region every
     call -- fine for occasional lookups or for building a full
     line/channel -> offset index once (walk the whole chain yourself
-    with iter_blobs() and record every blob.offset keyed by
-    blob.line_channel(chans_max) if you need many lookups).
+    with `iter_blobs()` and record every `blob.offset` keyed by
+    `blob.line_channel(chans_max)` if you need many lookups).
     """
     if chans_max is None:
         with open(path, "rb") as f:
@@ -1000,12 +1303,23 @@ def find_blob(path: str, line_slot: int, channel_slot: int, chans_max: Optional[
 
 def _element_width(channel: ChannelRecord) -> Optional[int]:
     """
-    Byte width of one element of `channel`'s data, or `None` if it's a
-    type this reader doesn't know how to decode -- e.g. one of the
-    multi-dimensional `GS_FLOAT3D`/`GS_DOUBLE3D`/`GS_FLOAT2D`/
-    `GS_DOUBLE2D` types, none of which have been seen in any real
-    sample yet (docs/provenance/notes.md section 4). Callers should check for `None`
-    and warn/return gracefully rather than assume a format exists.
+    Byte width of one element of `channel`'s data.
+
+    Parameters
+    ----------
+    channel : ChannelRecord
+        The channel to check.
+
+    Returns
+    -------
+    int or None
+        The element width, or `None` if `channel` is a type this
+        reader doesn't know how to decode -- e.g. one of the
+        multi-dimensional `GS_FLOAT3D`/`GS_DOUBLE3D`/`GS_FLOAT2D`/
+        `GS_DOUBLE2D` types, none of which have been seen in any real
+        sample yet (docs/provenance/notes.md section 4). Callers
+        should check for `None` and warn/return gracefully rather
+        than assume a format exists.
     """
     if channel.is_string:
         return channel.string_width
@@ -1015,22 +1329,52 @@ def _element_width(channel: ChannelRecord) -> Optional[int]:
 
 def _decode_numeric_or_string(raw: bytes, channel: ChannelRecord, row_count: Optional[int] = None):
     """
-    Interpret a raw byte buffer as `row_count` (or however many fit)
-    values of `channel`'s known type. Shared by the uncompressed and
-    compressed decode paths.
+    Interpret a raw byte buffer as `channel`'s known type.
 
-    Always returns a numpy `ndarray`: 1-D `(n_rows,)` for an ordinary
-    scalar channel, or 2-D `(n_rows, channel.array_width)` for a VA/
-    array channel (docs/spec.md section 5 -- e.g. a 512-wide airborne
-    gamma-ray spectrum recorded per station; `array_width` is fixed per
-    channel, never seen to vary row-to-row, so this reshape is always a
-    clean rectangle). Numeric channels get the dtype matching their
-    `GS_*` type (`GS_TYPE_NUMPY_DTYPE`); string channels (including the
-    unconfirmed-but-handled case of a *string* array channel) get a
-    fixed-width Unicode dtype, `<U{max_len}>` (`max_len` = the longest
-    *decoded* record actually present, not `width`, the on-disk field
-    size -- see below).
+    Shared by the uncompressed and compressed decode paths.
 
+    Parameters
+    ----------
+    raw : bytes or bytearray
+        The decoded/decompressed source buffer.
+    channel : ChannelRecord
+        The owning channel, for its dtype/width/array-ness.
+    row_count : int, optional
+        Number of rows to decode. If not given, as many complete
+        elements as fit in `raw` are decoded.
+
+    Returns
+    -------
+    numpy.ndarray
+        1-D `(n_rows,)` for an ordinary scalar channel, or 2-D
+        `(n_rows, channel.array_width)` for a VA/array channel
+        (docs/spec.md section 5 -- e.g. a 512-wide airborne gamma-ray
+        spectrum recorded per station; `array_width` is fixed per
+        channel, never seen to vary row-to-row, so this reshape is
+        always a clean rectangle). Numeric channels get the dtype
+        matching their `GS_*` type (`GS_TYPE_NUMPY_DTYPE`); string
+        channels (including the unconfirmed-but-handled case of a
+        *string* array channel) get a fixed-width Unicode dtype,
+        `<U{max_len}>` (`max_len` = the longest *decoded* record
+        actually present, not `width`, the on-disk field size -- see
+        Notes). Both string and numeric results are writable (see
+        Notes for how).
+
+    Warns
+    -----
+    GDBParseWarning
+        An unrecognized element type returns an empty array; a `raw`
+        buffer shorter than needed for the requested `row_count` (the
+        file was truncated mid-blob, a real scenario for a cut-off
+        download) decodes as many *complete* elements as actually fit
+        and warns about the shortfall, rather than raising a
+        `struct.error` and discarding everything; for an array
+        channel, a flat element count that isn't a whole multiple of
+        `array_width` similarly warns and drops the trailing
+        incomplete row rather than raising. Never raises for these.
+
+    Notes
+    -----
     Both string and numeric results are writable -- this project is
     fundamentally a file *reader* with no inherent need to mutate
     decoded values itself, but a caller who wants to is never blocked
@@ -1117,16 +1461,6 @@ def _decode_numeric_or_string(raw: bytes, channel: ChannelRecord, row_count: Opt
     via `np.frombuffer` either way), falling back to the pure-Python list
     comprehension below when it isn't -- both backends produce the same
     `<U{max_len}>`-dtype, writable result either way.
-
-    Fails gracefully rather than raising: an unrecognized element type
-    returns an empty array with a `GDBParseWarning`; a `raw` buffer
-    shorter than needed for the requested `row_count` (the file was
-    truncated mid-blob, a real scenario for a cut-off download) decodes
-    as many *complete* elements as actually fit and warns about the
-    shortfall, rather than raising a `struct.error` and discarding
-    everything; for an array channel, a flat element count that isn't a
-    whole multiple of `array_width` similarly warns and drops the
-    trailing incomplete row rather than raising.
     """
     width = _element_width(channel)
     if width is None:
@@ -1198,14 +1532,31 @@ def _decode_numeric_or_string(raw: bytes, channel: ChannelRecord, row_count: Opt
 @contextlib.contextmanager
 def _file_handle(path: str, file: Optional[BinaryIO]):
     """
-    Yield `file` directly if given (an already-open handle a caller
-    wants reused across many calls), otherwise open `path` fresh and
-    close it on exit -- lets `read_blob_values` support both "just give
-    me a path" (the default, used everywhere else in this module) and
-    "reuse this open handle" (what `GDB` does, to avoid reopening the
-    file on every single read -- benchmarked at ~1.7-1.9x slower per
-    call otherwise, see the project's Rust-plan notes) with the same
-    `with _file_handle(path, file) as f:` call sites either way.
+    Context manager yielding an open file handle for `path`.
+
+    Parameters
+    ----------
+    path : str
+        Path to open if `file` isn't given.
+    file : BinaryIO or None
+        An already-open handle to reuse, or `None` to open `path`
+        fresh.
+
+    Yields
+    ------
+    BinaryIO
+        `file` directly if given (an already-open handle a caller
+        wants reused across many calls), otherwise a freshly-opened
+        handle on `path`, closed on exit.
+
+    Notes
+    -----
+    Lets `read_blob_values` support both "just give me a path" (the
+    default, used everywhere else in this module) and "reuse this
+    open handle" (what `GDB` does, to avoid reopening the file on
+    every single read -- benchmarked at ~1.7-1.9x slower per call
+    otherwise, see the project's Rust-plan notes) with the same `with
+    _file_handle(path, file) as f:` call sites either way.
     """
     if file is not None:
         yield file
@@ -1216,16 +1567,29 @@ def _file_handle(path: str, file: Optional[BinaryIO]):
 
 def _read_writable(f: BinaryIO, n: int) -> bytearray:
     """
-    Read up to `n` bytes from `f` into a freshly-allocated, writable
-    `bytearray` -- unlike `f.read(n)`, which always hands back immutable
-    `bytes` no matter what it's read from, this is what lets the numpy
-    array `_decode_numeric_or_string` builds on top end up genuinely
-    writable with no extra copy (see that function's docstring). If the
-    file ends before `n` bytes are available (a truncated download, the
-    same real scenario the old `f.read(n)` call already tolerated), the
-    returned buffer is trimmed to the amount actually read rather than
-    left zero-padded out to `n` -- callers rely on `len()` reflecting
-    real data, not requested size.
+    Read up to `n` bytes from `f` into a writable buffer.
+
+    Parameters
+    ----------
+    f : BinaryIO
+        Open, readable file handle.
+    n : int
+        Maximum number of bytes to read.
+
+    Returns
+    -------
+    bytearray
+        A freshly-allocated, writable `bytearray` -- unlike `f.read(n)`,
+        which always hands back immutable `bytes` no matter what it's
+        read from, this is what lets the numpy array
+        `_decode_numeric_or_string` builds on top end up genuinely
+        writable with no extra copy (see that function's docstring).
+        If the file ends before `n` bytes are available (a truncated
+        download, the same real scenario the old `f.read(n)` call
+        already tolerated), the returned buffer is trimmed to the
+        amount actually read rather than left zero-padded out to `n`
+        -- callers rely on `len()` reflecting real data, not requested
+        size.
     """
     buf = bytearray(n)
     n_read = f.readinto(buf)
@@ -1237,76 +1601,106 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
                       comp_level: int = 0, page_size: Optional[int] = None,
                       file: Optional[BinaryIO] = None):
     """
-    Decode a found blob's real row data using the owning channel's
-    already-known type (from the symbol table, docs/provenance/notes.md section 6.2).
+    Decode a found blob's real row data.
 
-    [CONFIRMED] against real ground truth for GS_DOUBLE data and for
-    fixed-width strings, for DB_COMP_NONE (docs/provenance/notes.md section 6.6: a real
-    `fid` blob decoded this way reproduces the exact CSV ground-truth
-    value, and a real `line`-channel blob decodes to the correct real
-    line name repeated once per row).
+    Uses the owning channel's already-known type (from the symbol
+    table, docs/provenance/notes.md section 6.2).
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file.
+    blob : BlobHeader
+        The blob to decode, as returned by `find_blob`/`iter_blobs`.
+    channel : ChannelRecord
+        The owning channel.
+    comp_level : int, default 0
+        The file's declared compression level: 0 (`DB_COMP_NONE`), 1
+        (`DB_COMP_SPEED`), or 2 (`DB_COMP_SIZE`).
+    page_size : int, optional
+        The file's page size, needed to locate a compressed blob's
+        full span for `comp_level != 0`. If not given, it's read from
+        the file's own header.
+    file : BinaryIO, optional
+        An already-open binary file handle for `path`, reused instead
+        of opening `path` fresh -- pass this if you're calling this
+        function many times for the same file (e.g. `GDB` does,
+        internally). Reopening `path` on every call is real, measured
+        overhead (~1.7-1.9x slower per call, benchmarked against this
+        project's real sample corpus -- see the Rust-plan's M4 notes);
+        `file=None` (the default) keeps this function's plain "just
+        give me a path" behavior for every other caller.
+
+    Returns
+    -------
+    numpy.ndarray
+        See `_decode_numeric_or_string`'s docstring for the exact
+        shape/dtype rules -- 1-D `ndarray` for a scalar channel, 2-D
+        `(n_rows, array_width)` for a VA/array channel, dtype matching
+        the channel's `GS_*` type or a fixed-width Unicode dtype for a
+        string channel.
+
+    Warns
+    -----
+    GDBParseWarning
+        Per an explicit engineering request, this fails gracefully
+        rather than raising: a negative `row_count` (a
+        reserved/administrative blob, docs/provenance/notes.md section
+        6.4/6.9, not real data), a channel type this reader can't
+        decode, a truncated read (file cut off mid-blob), an
+        unrecognized chunk subtype, or a chunk that fails to
+        decompress (corrupt/truncated compressed data, or
+        `lzrw1.LZRW1DecodeError`) all return an empty `ndarray`
+        (`np.array([])`) with this warning describing what went wrong,
+        instead of raising and losing the caller's place in a larger
+        loop (e.g. a whole-file scan that's decoded hundreds of blobs
+        already). The one exception where full graceful salvage
+        wasn't attempted is a truncated/corrupt *compressed* stream:
+        unlike the plain-data case, there's no simple way to hand back
+        "the first K decoded values" from a partially-decompressed
+        zlib/LZRW1 stream, so those cases warn and return an empty
+        array rather than a partial decode -- documented here rather
+        than silently implied to be as complete as the plain-data
+        truncation handling.
+
+    Notes
+    -----
+    **[CONFIRMED]** against real ground truth for GS_DOUBLE data and
+    for fixed-width strings, for DB_COMP_NONE (docs/provenance/notes.md
+    section 6.6: a real `fid` blob decoded this way reproduces the
+    exact CSV ground-truth value, and a real `line`-channel blob
+    decodes to the correct real line name repeated once per row).
 
     Also handles compressed blobs (`comp_level` 1=DB_COMP_SPEED or
-    2=DB_COMP_SIZE), **including multi-page ones** -- [CONFIRMED]
+    2=DB_COMP_SIZE), **including multi-page ones** -- **[CONFIRMED]**
     against real ground truth for both single- and multi-page
     DB_COMP_SIZE (a real single-page blob_index=0 decodes to the known
     constant 5027; a real 36-page array-channel blob decodes to
     `LEI_Depth`'s exact known real depth profile, `0.0, 3.0, 6.3, 9.9,
-    ...`, repeated once per station -- both matching docs/provenance/notes.md section
-    6.5/6.2b's independently-established ground truth exactly) and for
-    both single- and multi-page DB_COMP_SPEED (a real 2-page
-    `Northing_AMGz55` blob decodes to sane real coordinates with real
-    `rDUMMY` sentinels). See docs/provenance/notes.md section 6.6d: a multi-page blob is
+    ...`, repeated once per station -- both matching
+    docs/provenance/notes.md section 6.5/6.2b's independently-
+    established ground truth exactly) and for both single- and
+    multi-page DB_COMP_SPEED (a real 2-page `Northing_AMGz55` blob
+    decodes to sane real coordinates with real `rDUMMY` sentinels).
+    See docs/provenance/notes.md section 6.6d: a multi-page blob is
     simply one continuous compressed stream spanning the whole
     `n_pages*page_size` span, not one independently-framed chunk per
     page -- no special multi-page logic was actually needed once this
     was verified, just reading the full span instead of one page.
 
     **A real third on-disk variant, auto-detected here rather than
-    assumed away (docs/provenance/notes.md section 6.6b):** even inside a file that
-    genuinely declares (and elsewhere uses) DB_COMP_SPEED, some
-    individual blobs turn out to carry no chunk wrapper at all -- just
-    the plain 48-byte DB_COMP_NONE-style header with real, directly
-    readable data straight after it (confirmed on a real
-    `Easting_AMGz55` blob in `DB_EM_293.gdb`: decoding it as if
+    assumed away (docs/provenance/notes.md section 6.6b):** even
+    inside a file that genuinely declares (and elsewhere uses)
+    DB_COMP_SPEED, some individual blobs turn out to carry no chunk
+    wrapper at all -- just the plain 48-byte DB_COMP_NONE-style header
+    with real, directly readable data straight after it (confirmed on
+    a real `Easting_AMGz55` blob in `DB_EM_293.gdb`: decoding it as if
     `comp_level==0` reproduces sane, real coordinate values with real
     `rDUMMY=-1.0E32` sentinels in the expected places). When
-    `comp_level != 0`, this function checks for the 16-byte chunk magic
-    at the 56-byte-header position first and only falls back to the
-    genuinely-compressed path if it's actually there -- otherwise it
-    decodes the blob exactly like a DB_COMP_NONE one.
-
-    **Fails gracefully, per an explicit engineering request:** a
-    negative `row_count` (a reserved/administrative blob, docs/provenance/notes.md
-    section 6.4/6.9, not real data), a channel type this reader can't
-    decode, a truncated read (file cut off mid-blob), an unrecognized
-    chunk subtype, or a chunk that fails to decompress (corrupt/
-    truncated compressed data, or `lzrw1.LZRW1DecodeError`) all return
-    an empty `ndarray` (`np.array([])`) with a `GDBParseWarning`
-    describing what went wrong, instead of raising and losing the
-    caller's place in a larger loop (e.g. a whole-file scan that's
-    decoded hundreds of blobs already). The one exception where full
-    graceful salvage wasn't attempted is a truncated/corrupt
-    *compressed* stream: unlike the plain-data case, there's no simple
-    way to hand back "the first K decoded values" from a partially-
-    decompressed zlib/LZRW1 stream, so those cases warn and return an
-    empty array rather than a partial decode -- documented here rather
-    than silently implied to be as complete as the plain-data
-    truncation handling.
-
-    Return shape/dtype: see `_decode_numeric_or_string`'s docstring --
-    1-D `ndarray` for a scalar channel, 2-D `(n_rows, array_width)` for
-    a VA/array channel, dtype matching the channel's `GS_*` type or
-    `object` (holding `str`) for a string channel.
-
-    `file`: an already-open binary file handle for `path`, reused
-    instead of opening `path` fresh -- pass this if you're calling this
-    function many times for the same file (e.g. `GDB` does, internally).
-    Reopening `path` on every call is real, measured overhead (~1.7-1.9x
-    slower per call, benchmarked against this project's real sample
-    corpus -- see the Rust-plan's M4 notes); `file=None` (the default)
-    keeps this function's plain "just give me a path" behavior for every
-    other caller.
+    `comp_level != 0`, this function checks for the 16-byte chunk
+    magic at the 56-byte-header position first and only falls back to
+    the genuinely-compressed path if it's actually there -- otherwise
+    it decodes the blob exactly like a DB_COMP_NONE one.
     """
     if comp_level == 0:
         if blob.row_count < 0:

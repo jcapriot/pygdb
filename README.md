@@ -128,9 +128,12 @@ option — `abi3t` only exists from 3.15 onward).
 ## Documentation
 
 Full documentation — the format specification, usage, contributing
-guide, and research provenance — lives under [`docs/`](docs/index.md)
-and is built with [Zensical](https://zensical.org/). To view it
-locally:
+guide, and research provenance — is published at
+**[jcapriot.github.io/pygdb](https://jcapriot.github.io/pygdb/)**,
+built from [`docs/`](docs/index.md) with [Zensical](https://zensical.org/)
+(published on every GitHub Release — see
+[`.github/workflows/docs.yml`](.github/workflows/docs.yml)). To view a
+work-in-progress version locally instead:
 
 ```sh
 pip install -e ".[docs]"
@@ -141,6 +144,9 @@ zensical serve
   for the `.gdb`/`.grd` on-disk format, with a confidence rating
   (confirmed / likely / guess / unknown) on every field. Updated as
   more real example files are tested against it.
+- [`docs/reference.md`](docs/reference.md) — API reference for
+  `pygdb`'s public surface, generated from its own numpydoc-style
+  docstrings via [`mkdocstrings`](https://mkdocstrings.github.io/).
 - [`docs/contributing.md`](docs/contributing.md) — how to report bugs
   (reproducible example files welcome) and this project's hard
   boundary on reverse engineering.

@@ -1,0 +1,64 @@
+name: Docs
+
+# Builds the Zensical-based documentation site (including the
+# mkdocstrings-generated API reference, docs/reference.md) and
+# publishes it to GitHub Pages. Gated the same way wheels.yml gates
+# its PyPI publish step -- only a published GitHub Release actually
+# deploys anything, so the live docs always match a real released
+# version rather than whatever's on the tip of main. `workflow_dispatch`
+# is kept as an escape hatch for re-publishing without cutting a new
+# release (e.g. after fixing a docs-only mistake).
+#
+# One-time manual step before this can deploy anywhere: in this
+# repo's Settings -> Pages, set "Source" to "GitHub Actions" --
+# actions/deploy-pages can't turn Pages on for a repo where it's never
+# been enabled at all.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one Pages deployment at a time; let an in-flight one finish
+# rather than cancel it outright, so a second push can't race it into
+# publishing a half-updated site.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # mkdocstrings statically parses pygdb's source (via griffe); no
+      # need to exercise the Rust accelerator to build docs.
+      - name: Install
+        run: pip install -e ".[docs]"
+
+      - name: Build docs
+        run: zensical build --strict
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

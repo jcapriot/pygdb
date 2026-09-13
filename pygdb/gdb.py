@@ -63,15 +63,30 @@ ChannelRef = Union[str, Tuple[str, int], "ChannelRecord"]
 @dataclass
 class CompressionInfo:
     """
-    This file's *declared* compression mode (header offset 120,
-    docs/spec.md section 7). Note this describes what the file was
-    configured with, not a guarantee every blob actually used it --
-    some real files declare `DB_COMP_SPEED`/`DB_COMP_SIZE` but contain
-    zero compressed blobs (docs/spec.md section 7.6), and individual
-    "bare" blobs inside a genuinely-compressed file can skip compression
-    entirely (docs/spec.md section 7.4) -- `read_blob_values()` already
-    detects and handles both cases automatically per-blob.
+    This file's *declared* compression mode.
+
+    Header offset 120, docs/spec.md section 7.
+
+    Attributes
+    ----------
+    code : int or None
+        Raw compression-level int32 (0, 1, or 2).
+    name : str
+        The matching `DB_COMP_*` name.
+    codec : str
+        The matching real codec name (`"none"`, `"lzrw1"`, or `"zlib"`).
+
+    Notes
+    -----
+    This describes what the file was configured with, not a guarantee
+    every blob actually used it -- some real files declare
+    `DB_COMP_SPEED`/`DB_COMP_SIZE` but contain zero compressed blobs
+    (docs/spec.md section 7.6), and individual "bare" blobs inside a
+    genuinely-compressed file can skip compression entirely
+    (docs/spec.md section 7.4) -- `read_blob_values()` already detects
+    and handles both cases automatically per-blob.
     """
+
     code: Optional[int]
     name: str
     codec: str
@@ -81,6 +96,22 @@ class GDB:
     """
     High-level, name-based view of a single `.gdb` file.
 
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file.
+
+    Raises
+    ------
+    ValueError
+        At construction time, if `path` doesn't start with the
+        expected `.gdb` magic -- unlike the module-level functions in
+        `gdb_reader`/`registry` (which warn and return empty results),
+        since a `GDB` object that isn't backed by a real `.gdb` file
+        can't usefully do anything at all.
+
+    Examples
+    --------
     >>> db = GDB("survey.gdb")
     >>> db.line_names[:3]
     ['L1000', 'L1001', 'L1010']
@@ -93,6 +124,8 @@ class GDB:
     >>> db.coordinate_systems
     ['NAD83 / UTM zone 11N', 'WGS 84']
 
+    Notes
+    -----
     Channel and line tables are read once, lazily, on first access, and
     cached; the (line, channel) -> blob index used by `read()` and
     `channels_on_line()` is likewise built once (a full blob-chain walk)
@@ -104,12 +137,6 @@ class GDB:
     the Rust-plan's M4 notes). Close it (`db.close()`, or use `GDB` as a
     context manager) when done with it, or just let it get
     garbage-collected -- `__del__` closes it too, as a safety net.
-
-    Raises `ValueError` at construction time if `path` doesn't start
-    with the expected `.gdb` magic -- unlike the module-level functions
-    in `gdb_reader`/`registry` (which warn and return empty results),
-    since a `GDB` object that isn't backed by a real `.gdb` file can't
-    usefully do anything at all.
     """
 
     def __init__(self, path: str):
@@ -153,18 +180,22 @@ class GDB:
 
     @property
     def chans_max(self) -> Optional[int]:
+        """int or None: The file's channel-table capacity (header offset 24)."""
         return self._fields["chans_max"]
 
     @property
     def page_size(self) -> Optional[int]:
+        """int or None: The file's page size in bytes (header offset 100)."""
         return self._fields["page_size"]
 
     @property
     def comp_level(self) -> Optional[int]:
+        """int or None: The file's declared compression level (header offset 120)."""
         return self._fields["comp_level"]
 
     @property
     def compression(self) -> CompressionInfo:
+        """CompressionInfo: The file's declared compression mode."""
         code = self.comp_level
         return CompressionInfo(
             code=code,
@@ -175,11 +206,12 @@ class GDB:
     @property
     def coordinate_systems(self) -> List[str]:
         """
-        Best-effort list of coordinate-system/map-projection names found
-        in this file's REG/IPJ administrative-blob content (docs/spec.md
-        section 8-9). An empty list just means none were found -- not
-        every real file has this content, and even when it does, this is
-        a name-only extraction, not a full projection definition.
+        list of str: Best-effort coordinate-system/map-projection names
+        found in this file's REG/IPJ administrative-blob content
+        (docs/spec.md section 8-9). An empty list just means none were
+        found -- not every real file has this content, and even when
+        it does, this is a name-only extraction, not a full projection
+        definition.
         """
         if self._coordinate_systems is None:
             max_real_line_slot = max((line.index for line in self.lines), default=-1)
@@ -191,19 +223,20 @@ class GDB:
     @property
     def coordinate_channels(self) -> Dict[str, Optional[str]]:
         """
-        Which real channel plays the X/Y/Z coordinate role, per this
-        file's own internal registry (docs/provenance/notes.md section
-        6.8b) -- a directly-decodable alternative to guessing from
-        channel-naming conventions. Always `{"X": ..., "Y": ..., "Z":
-        ...}`; a role this file's registry doesn't confirm a real
-        channel for (absent entirely, or a real but ambiguous/blank
-        entry -- see `find_channel_roles`) is `None`, not omitted.
+        dict of {str : str or None}: Which real channel plays the
+        X/Y/Z coordinate role, per this file's own internal registry
+        (docs/provenance/notes.md section 6.8b) -- a directly-decodable
+        alternative to guessing from channel-naming conventions.
+        Always `{"X": ..., "Y": ..., "Z": ...}`; a role this file's
+        registry doesn't confirm a real channel for (absent entirely,
+        or a real but ambiguous/blank entry -- see
+        `pygdb.registry.find_channel_roles`) is `None`, not omitted.
 
-        Confirmed present and correctly resolvable on every one of this
-        project's 22 real sample files for X/Y (100%), 2 of 22 for Z --
-        `to_geoh5` uses this as its coordinate-channel default, falling
-        back to `"Easting"`/`"Northing"` only when a role isn't
-        confirmed here.
+        Confirmed present and correctly resolvable on every one of
+        this project's 22 real sample files for X/Y (100%), 2 of 22
+        for Z -- `to_geoh5` uses this as its coordinate-channel
+        default, falling back to `"Easting"`/`"Northing"` only when a
+        role isn't confirmed here.
         """
         if self._coordinate_channels is None:
             max_real_line_slot = max((line.index for line in self.lines), default=-1)
@@ -217,6 +250,7 @@ class GDB:
 
     @property
     def channels(self) -> List[ChannelRecord]:
+        """list of ChannelRecord: This file's channel table, read once and cached."""
         if self._channels is None:
             self._channels = read_channels(self.path)
             self._channels_by_name = {}
@@ -226,10 +260,12 @@ class GDB:
 
     @property
     def channel_names(self) -> List[str]:
+        """list of str: `[c.name for c in self.channels]`."""
         return [c.name for c in self.channels]
 
     @property
     def lines(self) -> List[LineRecord]:
+        """list of LineRecord: This file's line table, read once and cached."""
         if self._lines is None:
             self._lines = read_lines(self.path)
             self._lines_by_name = {}
@@ -239,15 +275,40 @@ class GDB:
 
     @property
     def line_names(self) -> List[str]:
+        """list of str: `[l.name for l in self.lines]`."""
         return [l.name for l in self.lines]
 
     def _nth_by_name(self, by_name: Dict[str, list], name: str, occurrence: int, kind: str):
         """
-        Shared lookup for the `(name, occurrence)` form `channel()`/
-        `line()` both accept: `occurrence` is a 0-based index into every
-        record sharing `name`, in `.channels`/`.lines` order -- an
-        explicit way to pick a specific one when a plain name is
-        ambiguous, rather than raising or guessing.
+        Shared lookup for the `(name, occurrence)` form.
+
+        Both `channel()` and `line()` accept this form.
+
+        Parameters
+        ----------
+        by_name : dict
+            `self._channels_by_name` or `self._lines_by_name`.
+        name : str
+            The name to look up.
+        occurrence : int
+            0-based index into every record sharing `name`, in
+            `.channels`/`.lines` order -- an explicit way to pick a
+            specific one when a plain name is ambiguous, rather than
+            raising or guessing.
+        kind : str
+            `"channel"` or `"line"`, for the error message.
+
+        Returns
+        -------
+        ChannelRecord or LineRecord
+            The matching record.
+
+        Raises
+        ------
+        KeyError
+            If no record is named `name`.
+        IndexError
+            If fewer than `occurrence + 1` records share `name`.
         """
         matches = by_name.get(name)
         if not matches:
@@ -262,21 +323,35 @@ class GDB:
 
     def channel(self, name: ChannelRef) -> ChannelRecord:
         """
-        Look up a channel by name. Raises `KeyError` if no channel has
-        this name.
+        Look up a channel by name.
 
-        Raises `ValueError` if more than one channel shares this name --
-        a real, if unusual, on-disk possibility (confirmed for real on a
-        sample file with two channels each named `UTC`, `RADAR`, and
-        `RAWMAG`), for which there's no file-wide way to pick the
-        "right" one without a line to disambiguate against. `read()`
-        already disambiguates this automatically using line context
-        (see `_resolve_channel_on_line`).
+        Parameters
+        ----------
+        name : str or tuple of (str, int)
+            A plain channel name, or `(name, occurrence)`
+            (`occurrence` a 0-based index into every channel sharing
+            that name, in `.channels` order) to pick a specific one
+            explicitly rather than relying on `name` alone being
+            unambiguous.
 
-        Pass `(name, occurrence)` instead of a plain name (`occurrence`
-        a 0-based index into every channel sharing that name, in
-        `.channels` order) to pick a specific one explicitly rather than
-        relying on that, or hitting the `ValueError` above.
+        Returns
+        -------
+        ChannelRecord
+            The matching channel.
+
+        Raises
+        ------
+        KeyError
+            If no channel has this name.
+        ValueError
+            If more than one channel shares this name and no
+            `occurrence` was given -- a real, if unusual, on-disk
+            possibility (confirmed for real on a sample file with two
+            channels each named `UTC`, `RADAR`, and `RAWMAG`), for
+            which there's no file-wide way to pick the "right" one
+            without a line to disambiguate against. `read()` already
+            disambiguates this automatically using line context (see
+            `_resolve_channel_on_line`).
         """
         if self._channels_by_name is None:
             self.channels  # populate the cache
@@ -299,20 +374,32 @@ class GDB:
 
     def line(self, name: LineRef) -> LineRecord:
         """
-        Look up a line by name. Raises `KeyError` if no line has this
-        name.
+        Look up a line by name.
 
-        Raises `ValueError` if more than one line shares this name --
-        the line table has the same on-disk shape as the channel table
-        (see `channel()`'s docstring), with nothing in the format
-        forbidding a duplicate name there either; not yet observed on a
-        real file, but handled the same way on principle rather than
-        left as a silent last-one-wins lookup.
+        Parameters
+        ----------
+        name : str or tuple of (str, int)
+            A plain line name, or `(name, occurrence)` (`occurrence` a
+            0-based index into every line sharing that name, in
+            `.lines` order) to pick a specific one explicitly.
 
-        Pass `(name, occurrence)` instead of a plain name (`occurrence`
-        a 0-based index into every line sharing that name, in `.lines`
-        order) to pick a specific one explicitly rather than hitting
-        that `ValueError`.
+        Returns
+        -------
+        LineRecord
+            The matching line.
+
+        Raises
+        ------
+        KeyError
+            If no line has this name.
+        ValueError
+            If more than one line shares this name and no `occurrence`
+            was given -- the line table has the same on-disk shape as
+            the channel table (see `channel()`), with nothing in the
+            format forbidding a duplicate name there either; not yet
+            observed on a real file, but handled the same way on
+            principle rather than left as a silent last-one-wins
+            lookup.
         """
         if self._lines_by_name is None:
             self.lines  # populate the cache
@@ -337,11 +424,17 @@ class GDB:
 
     def _ensure_blob_index(self) -> Dict[Tuple[int, int], BlobHeader]:
         """
-        Build the full (line_slot, channel_slot) -> BlobHeader map with one
-        blob-chain walk, cached from then on. `iter_blobs`/`find_blob`
-        themselves recommend this for anything beyond an occasional
-        one-off lookup -- this class always wants line/channel listings
-        and random-access reads, so it always builds the index.
+        Build and cache the full blob index.
+
+        Returns
+        -------
+        dict of {(int, int) : BlobHeader}
+            Maps `(line_slot, channel_slot)` to `BlobHeader`, built
+            with one blob-chain walk and cached from then on.
+            `iter_blobs`/`find_blob` themselves recommend this for
+            anything beyond an occasional one-off lookup -- this class
+            always wants line/channel listings and random-access
+            reads, so it always builds the index.
         """
         if self._blob_index is None:
             chans_max = self.chans_max
@@ -354,39 +447,44 @@ class GDB:
 
     def _calibrate_line_indices(self) -> None:
         """
-        Correct a possible small, fixed off-by-N in every LineRecord.index
-        (see find_line_table's and read_lines's docstrings in
-        gdb_reader.py) by checking, for a handful of small integer
-        shifts, which one makes the most already-found lines actually
-        have at least one real data blob on disk for *some* channel --
-        then applying the winning shift to every LineRecord.index in
-        place. This is a strictly stronger signal than anything available
+        Correct a possible small, fixed off-by-N in every line's index.
+
+        See `find_line_table`'s and `read_lines`'s docstrings in
+        `gdb_reader.py`. Checks, for a handful of small integer shifts,
+        which one makes the most already-found lines actually have at
+        least one real data blob on disk for *some* channel -- then
+        applies the winning shift to every `LineRecord.index` in
+        place.
+
+        Notes
+        -----
+        This is a strictly stronger signal than anything available
         from the symbol-table bytes alone (it's checking against the
-        real, self-describing blob chain, not another heuristic guess),
-        confirmed to fix a real off-by-one found on a GSQ file
-        (`rm001141`) without disturbing any of the other real files this
-        package has been tested against (where the winning shift is 0,
-        i.e. a no-op).
+        real, self-describing blob chain, not another heuristic
+        guess), confirmed to fix a real off-by-one found on a GSQ file
+        (`rm001141`) without disturbing any of the other real files
+        this package has been tested against (where the winning shift
+        is 0, i.e. a no-op).
 
         Runs once, right after the blob index is first built -- cheap
         relative to that index build itself (already O(number of real
         lines) additional work, not another file scan).
 
-        Offsets are checked in *distance-from-zero* order (`0, 1, -1, 2,
-        -2, ...`), not the naive `-4, -3, ..., 4` left-to-right scan an
-        earlier version of this method used, and only a *strictly*
-        better score ever displaces the current best -- so a tie always
-        keeps the smaller-magnitude offset, and a tie against 0
+        Offsets are checked in *distance-from-zero* order (`0, 1, -1,
+        2, -2, ...`), not the naive `-4, -3, ..., 4` left-to-right scan
+        an earlier version of this method used, and only a *strictly*
+        better score ever displaces the current best -- so a tie
+        always keeps the smaller-magnitude offset, and a tie against 0
         specifically always keeps 0. This matters for a real, if
-        previously untested, case: a line with genuinely zero populated
-        channels contributes no evidence for or against any offset, and
-        the naive scan could let a spurious negative offset *tie* with
-        the correct 0 and win purely by being checked first -- silently
-        shifting every line's index (not just the empty one's), so an
-        unrelated line would start reading a different line's data.
-        Found by testing `to_geoh5` against a synthetic file with one
-        empty and one populated line; see the regression test for the
-        exact before/after.
+        previously untested, case: a line with genuinely zero
+        populated channels contributes no evidence for or against any
+        offset, and the naive scan could let a spurious negative
+        offset *tie* with the correct 0 and win purely by being
+        checked first -- silently shifting every line's index (not
+        just the empty one's), so an unrelated line would start
+        reading a different line's data. Found by testing `to_geoh5`
+        against a synthetic file with one empty and one populated
+        line; see the regression test for the exact before/after.
         """
         lines = self.lines
         if not lines or not self._blob_index:
@@ -403,14 +501,29 @@ class GDB:
 
     def _channels_with_data_on_line(self, line_rec: LineRecord) -> List[Tuple[ChannelRecord, BlobHeader]]:
         """
-        `(channel, blob)` for every channel that actually has a real data
-        blob recorded for `line_rec`, in `self.channels` order. Shared by
-        `channels_on_line` and `iter_line` so both agree on exactly which
-        channel matched -- looking a channel back up by name afterward
-        would be ambiguous for a file with duplicate channel names (real
-        channel records aren't guaranteed unique by name), so callers
-        that need the actual data should go through this, not re-resolve
-        `channels_on_line`'s returned names.
+        Find every channel with real data on `line_rec`.
+
+        Parameters
+        ----------
+        line_rec : LineRecord
+            The line to check.
+
+        Returns
+        -------
+        list of (ChannelRecord, BlobHeader)
+            `(channel, blob)` for every channel that actually has a
+            real data blob recorded for `line_rec`, in `self.channels`
+            order.
+
+        Notes
+        -----
+        Shared by `channels_on_line` and `iter_line` so both agree on
+        exactly which channel matched -- looking a channel back up by
+        name afterward would be ambiguous for a file with duplicate
+        channel names (real channel records aren't guaranteed unique
+        by name), so callers that need the actual data should go
+        through this, not re-resolve `channels_on_line`'s returned
+        names.
         """
         index = self._ensure_blob_index()
         return [
@@ -423,19 +536,38 @@ class GDB:
         self, line_rec: LineRecord, name: str
     ) -> Tuple[ChannelRecord, Optional[BlobHeader]]:
         """
-        Resolve a channel name to `(ChannelRecord, BlobHeader-or-None)`
-        for a specific line, using the line's own data to disambiguate a
-        name shared by more than one channel (see `channel()`'s
-        docstring) -- picking whichever same-named channel actually has
-        data on this line, rather than an arbitrary one. Raises
-        `KeyError` if no channel has this name at all.
+        Resolve a channel name to `(ChannelRecord, BlobHeader-or-None)` for one line.
 
-        If more than one same-named channel has data on this same line,
-        that's genuinely ambiguous (not just "the file happens to reuse
-        this name") and raises `ValueError` -- every real duplicate-name
-        case found so far has only one of the duplicates actually
-        populated per line, so this hasn't been observed, but there's no
-        principled way to guess if it ever is.
+        Uses the line's own data to disambiguate a name shared by more
+        than one channel (see `channel()`), picking whichever
+        same-named channel actually has data on this line, rather than
+        an arbitrary one.
+
+        Parameters
+        ----------
+        line_rec : LineRecord
+            The line to disambiguate against.
+        name : str
+            The channel name to resolve.
+
+        Returns
+        -------
+        channel : ChannelRecord
+            The resolved channel.
+        blob : BlobHeader or None
+            Its data blob on `line_rec`, or `None` if it has none.
+
+        Raises
+        ------
+        KeyError
+            If no channel has this name at all.
+        ValueError
+            If more than one same-named channel has data on this same
+            line -- genuinely ambiguous (not just "the file happens to
+            reuse this name"). Every real duplicate-name case found so
+            far has only one of the duplicates actually populated per
+            line, so this hasn't been observed, but there's no
+            principled way to guess if it ever is.
         """
         if self._channels_by_name is None:
             self.channels  # populate the cache
@@ -470,45 +602,72 @@ class GDB:
 
     def channels_on_line(self, line: LineRef) -> List[str]:
         """
-        Names of channels that actually have a real data blob recorded
-        for `line` -- the format stores a sparse (line, channel) grid
-        (docs/spec.md section 1), so most lines only populate a subset
-        of this file's full channel list. `line` may be a line name, a
-        `(name, occurrence)` pair (see `line()`), or a `LineRecord`.
+        Names of channels that actually have data on `line`.
 
-        If two channels share a name and both have data on this line,
-        that name appears twice here (a list, so nothing is silently
-        dropped) -- use `iter_line()` instead if you need the actual
-        `ChannelRecord` for each entry, not just its name.
+        Parameters
+        ----------
+        line : str or tuple or LineRecord
+            A line name, a `(name, occurrence)` pair (see `line()`),
+            or a `LineRecord`.
+
+        Returns
+        -------
+        list of str
+            Channel names with a real data blob recorded for `line` --
+            the format stores a sparse (line, channel) grid
+            (docs/spec.md section 1), so most lines only populate a
+            subset of this file's full channel list. If two channels
+            share a name and both have data on this line, that name
+            appears twice here (a list, so nothing is silently
+            dropped) -- use `iter_line()` instead if you need the
+            actual `ChannelRecord` for each entry, not just its name.
         """
         line_rec = self._resolve_line(line)
         return [c.name for c, _blob in self._channels_with_data_on_line(line_rec)]
 
     def read(self, line: LineRef, channel: ChannelRef) -> np.ndarray:
         """
-        Random access by name: decode and return every value recorded
-        for `channel` on `line`, as a numpy `ndarray` -- 1-D for an
-        ordinary scalar channel, 2-D `(n_rows, channel.array_width)`
-        for a VA/array channel (docs/spec.md section 5), dtype matching
-        the channel's `GS_*` type, or `object` (holding `str`) for a
-        string-typed channel. `line`/`channel` may be names,
-        `(name, occurrence)` pairs (see `line()`/`channel()`), or
-        `LineRecord`/`ChannelRecord` instances.
+        Random access by name: decode every value recorded for `channel` on `line`.
 
-        Raises `KeyError` if `line` or `channel` isn't a name this file
-        has. If `channel` is a plain name shared by more than one
-        channel (see `channel()`'s docstring), this resolves it using
-        `line`'s own data (`_resolve_channel_on_line`) rather than
-        picking an arbitrary one -- raising `ValueError` only if that's
-        *still* ambiguous (more than one same-named channel has data on
-        this exact line); pass `(name, occurrence)` or a specific
-        `ChannelRecord` to sidestep either lookup. Returns an empty
-        array (with a `GDBParseWarning`, per `read_blob_values`) if the
-        name is valid but this specific (line, channel) pair has no
-        data blob, or its data can't be decoded -- consistent with the
-        rest of this package's degrade-gracefully philosophy for
-        decode-time problems, as opposed to a plain lookup-by-name
-        mistake (which does raise).
+        Parameters
+        ----------
+        line : str or tuple or LineRecord
+            A line name, a `(name, occurrence)` pair, or a `LineRecord`.
+        channel : str or tuple or ChannelRecord
+            A channel name, a `(name, occurrence)` pair, or a
+            `ChannelRecord`.
+
+        Returns
+        -------
+        numpy.ndarray
+            1-D for an ordinary scalar channel, 2-D `(n_rows,
+            channel.array_width)` for a VA/array channel (docs/spec.md
+            section 5), dtype matching the channel's `GS_*` type, or a
+            fixed-width Unicode dtype for a string-typed channel.
+
+        Raises
+        ------
+        KeyError
+            If `line` or `channel` isn't a name this file has.
+        ValueError
+            If `channel` is a plain name shared by more than one
+            channel (see `channel()`) and it's *still* ambiguous after
+            resolving it using `line`'s own data
+            (`_resolve_channel_on_line`) -- i.e. more than one
+            same-named channel has data on this exact line. Pass
+            `(name, occurrence)` or a specific `ChannelRecord` to
+            sidestep either lookup.
+
+        Warns
+        -----
+        GDBParseWarning
+            Per `read_blob_values`, if `line`/`channel` are valid
+            names but this specific (line, channel) pair has no data
+            blob, or its data can't be decoded -- an empty array is
+            returned rather than raising, consistent with the rest of
+            this package's degrade-gracefully philosophy for
+            decode-time problems, as opposed to a plain lookup-by-name
+            mistake (which does raise).
         """
         line_rec = self._resolve_line(line)
         if isinstance(channel, ChannelRecord):
@@ -536,28 +695,41 @@ class GDB:
 
     def iter_line(self, line: LineRef) -> Iterator[Tuple[ChannelRecord, np.ndarray]]:
         """
-        Yield `(channel, values)` for every channel that actually has
-        data on `line`, via `_channels_with_data_on_line` directly
-        rather than one `read()` call per channel (saving the repeated
-        name lookups).
+        Iterate every channel's data on one line.
 
-        Yields the `ChannelRecord` itself, not just its name (`values`
-        is the same as `read(line, channel)` would give for that exact
-        channel) -- deliberately, so that if two channels share a name
-        and both have data on this line, both still come through as
-        distinct, fully-identified entries. `dict(db.iter_line(line))`
-        keyed by the records themselves preserves that; collapsing to
-        `channel.name` yourself reintroduces the same collision `read()`
-        raises on, so do that deliberately if you do it at all.
+        Parameters
+        ----------
+        line : str or tuple or LineRecord
+            A line name, a `(name, occurrence)` pair, or a `LineRecord`.
+
+        Yields
+        ------
+        channel : ChannelRecord
+            The channel itself, not just its name -- deliberately, so
+            that if two channels share a name and both have data on
+            this line, both still come through as distinct,
+            fully-identified entries. `dict(db.iter_line(line))` keyed
+            by the records themselves preserves that; collapsing to
+            `channel.name` yourself reintroduces the same collision
+            `read()` raises on, so do that deliberately if you do it
+            at all.
+        values : numpy.ndarray
+            Same as `read(line, channel)` would give for that exact
+            channel.
+
+        Notes
+        -----
+        Uses `_channels_with_data_on_line` directly rather than one
+        `read()` call per channel (saving the repeated name lookups).
 
         A `rayon`-based parallel batch decoder was tried for this and
-        removed: benchmarked against this project's real sample corpus,
-        it was consistently ~3x *slower* than plain sequential calls at
-        every scale tried, since this format's chunks are small enough
-        that the Rust decoder (`pygdb._native`) already finishes each one
-        in a fraction of a millisecond -- not enough work per chunk to
-        amortize rayon's per-task dispatch cost. See `rust/src/lib.rs`'s
-        module doc for the full note.
+        removed: benchmarked against this project's real sample
+        corpus, it was consistently ~3x *slower* than plain sequential
+        calls at every scale tried, since this format's chunks are
+        small enough that the Rust decoder (`pygdb._native`) already
+        finishes each one in a fraction of a millisecond -- not enough
+        work per chunk to amortize rayon's per-task dispatch cost. See
+        `rust/src/lib.rs`'s module doc for the full note.
         """
         line_rec = self._resolve_line(line)
         for c, blob in self._channels_with_data_on_line(line_rec):
@@ -570,14 +742,42 @@ class GDB:
 
     def _disambiguate_names(self, line_rec: LineRecord, decoded: List[Tuple[ChannelRecord, np.ndarray]]):
         """
-        Yield `(var_name, channel, values)` for every `(channel, values)`
-        pair in `decoded`, disambiguating any channel name shared by more
-        than one channel **in this file's channel table** -- shared by
-        `to_xarray`, `to_geoh5`, and `to_dataframe`, which all need the
-        exact same numbering so a name collision resolves identically
-        (and matches `channel()`'s own `(name, occurrence)` numbering)
-        regardless of export format or which line is being processed.
+        Resolve a stable, file-wide `var_name` for every decoded channel.
 
+        Shared by `to_xarray`, `to_geoh5`, and `to_dataframe`, which
+        all need the exact same numbering so a name collision resolves
+        identically (and matches `channel()`'s own `(name,
+        occurrence)` numbering) regardless of export format or which
+        line is being processed.
+
+        Parameters
+        ----------
+        line_rec : LineRecord
+            The line `decoded` came from (used only for the warning
+            message).
+        decoded : list of (ChannelRecord, numpy.ndarray)
+            `(channel, values)` pairs, as gathered by
+            `_channels_with_data_on_line` + `read_blob_values`.
+
+        Yields
+        ------
+        var_name : str
+            The channel's variable name.
+        channel : ChannelRecord
+            The channel itself.
+        values : numpy.ndarray
+            Its decoded values, unchanged.
+
+        Warns
+        -----
+        GDBParseWarning
+            Whenever a channel with a file-wide duplicate name has
+            data on a line, regardless of whether its sibling does
+            too, since a caller not expecting a bracket-suffixed name
+            should be told why one showed up.
+
+        Notes
+        -----
         A channel's `var_name` is resolved **file-wide**, not per line:
         for a name shared by more than one channel anywhere in
         `self.channels` (confirmed structurally possible -- see
@@ -598,11 +798,7 @@ class GDB:
         line where its same-named sibling has no data at all -- so
         `to_geoh5`/`to_dataframe`'s whole-file modes (which call this
         once per line) can't end up naming the same channel differently
-        depending on which line is being processed. Raises a
-        `GDBParseWarning` whenever a channel with a file-wide duplicate
-        has data on a line, regardless of whether its sibling does too,
-        since a caller not expecting a bracket-suffixed name should be
-        told why one showed up.
+        depending on which line is being processed.
 
         `stacklevel=3` here (rather than the usual `2`) accounts for
         this being a generator a caller iterates via a `for` loop --
@@ -632,25 +828,43 @@ class GDB:
 
     def to_xarray(self, line: Optional[LineRef] = None) -> "xr.Dataset":
         """
-        Build an `xarray.Dataset`. Needs the optional `xarray`
-        dependency (`pip install python-gdb[xarray]`), imported lazily
-        here so importing `pygdb` itself never requires it.
+        Build an `xarray.Dataset`.
 
-        `line` given: one data variable per channel that has data on
-        that line, sharing a common `"station"` dimension -- see
-        `_to_xarray_one_line`'s docstring for the full single-line
-        behavior (array-channel `_bin` dimensions, the `_station`
-        dimension-splitting escape hatch for a row-count mismatch,
-        `line_name`/`line_category` attrs).
+        Needs the optional `xarray` dependency (`pip install
+        python-gdb[xarray]`), imported lazily here so importing
+        `pygdb` itself never requires it.
 
-        `line` omitted (the default): every line with real data,
-        stacked along a new `"line"` dimension into one `Dataset` --
-        see `_to_xarray_whole_file`'s docstring for how row-count
-        mismatches and channels missing on some lines are filled
-        (`NaN`/`""`/the channel's own Geosoft dummy value, recorded as
-        each variable's `_FillValue` attr) rather than each getting its
-        own dimension the way single-line mode does.
+        Parameters
+        ----------
+        line : str, int, or LineRecord, optional
+            If given, scope the export to that one line only -- one
+            data variable per channel that has data on that line,
+            sharing a common `"station"` dimension. See
+            `_to_xarray_one_line`'s docstring for the full single-line
+            behavior (array-channel `_bin` dimensions, the `_station`
+            dimension-splitting escape hatch for a row-count mismatch,
+            `line_name`/`line_category` attrs).
 
+            If omitted (the default), export every line with real
+            data, stacked along a new `"line"` dimension into one
+            `Dataset` -- see `_to_xarray_whole_file`'s docstring for
+            how row-count mismatches and channels missing on some
+            lines are filled (`NaN`/`""`/the channel's own Geosoft
+            dummy value, recorded as each variable's `_FillValue`
+            attr) rather than each getting its own dimension the way
+            single-line mode does.
+
+        Returns
+        -------
+        xarray.Dataset
+
+        Raises
+        ------
+        ImportError
+            If the optional `xarray` dependency isn't installed.
+
+        Notes
+        -----
         Either way, a channel name shared by more than one channel in
         this file's table is disambiguated as `f"{name}[{occurrence}]"`
         the same way, resolved **file-wide** (not per line) so a given
@@ -671,10 +885,32 @@ class GDB:
 
     def _to_xarray_one_line(self, line_rec: LineRecord, xr) -> "xr.Dataset":
         """
-        `to_xarray(line)`'s single-line implementation -- one data
-        variable per channel that has data on `line_rec`, sharing a
-        common `"station"` dimension.
+        `to_xarray(line)`'s single-line implementation.
 
+        One data variable per channel that has data on `line_rec`,
+        sharing a common `"station"` dimension.
+
+        Parameters
+        ----------
+        line_rec : LineRecord
+            The line to export.
+        xr : module
+            The already-imported `xarray` module (passed in by
+            `to_xarray` rather than imported again here).
+
+        Returns
+        -------
+        xarray.Dataset
+
+        Warns
+        -----
+        GDBParseWarning
+            If channels on this line don't all decode to the same row
+            count (a truncated/corrupt file -- truncation only ever
+            shortens a channel, never lengthens it).
+
+        Notes
+        -----
         A VA/array channel (docs/spec.md section 5) gets its own
         second dimension, `f"{name}_bin"` -- deliberately *not* shared
         with any other array channel even when their `array_width`
@@ -684,15 +920,12 @@ class GDB:
         rename dimensions yourself afterward if you know two channels
         genuinely do.
 
-        If channels on this line don't all decode to the same row
-        count (a truncated/corrupt file -- truncation only ever
-        shortens a channel, never lengthens it), the *shorter*
-        channel(s) keep their full (shorter) data rather than being cut
-        down further, or cutting the other channels down to match: a
-        short channel gets its own first dimension, `f"{name}_station"`,
-        instead of the shared `"station"` (the same "give it its own
-        dimension rather than lose data to fit one" principle as the
-        array-channel case above). Raises a `GDBParseWarning`.
+        A short channel (see Warns) keeps its full (shorter) data
+        rather than being cut down further, or cutting the other
+        channels down to match: it gets its own first dimension,
+        `f"{name}_station"`, instead of the shared `"station"` (the
+        same "give it its own dimension rather than lose data to fit
+        one" principle as the array-channel case above).
 
         No channel is auto-promoted to a coordinate -- `"station"` is a
         bare integer range index, and every channel (however
@@ -744,17 +977,40 @@ class GDB:
 
     def _to_xarray_whole_file(self, xr) -> "xr.Dataset":
         """
-        `to_xarray()`'s whole-file implementation -- every line with
-        real data, stacked along a new `"line"` dimension into one
-        `Dataset`. `"line"` is a real, indexing coordinate (`ds.sel(
-        line="L1000")`, `ds.groupby("line")`) and `"line_category"` a
-        secondary, non-indexing coordinate on the same dimension --
-        richer than a flat identifying column, since xarray has
-        first-class dimension/coordinate support a plain table doesn't.
-        Lines with no populated channels at all are skipped entirely,
-        same as `to_geoh5`/`to_dataframe`; if *no* line has any data,
-        returns a plain empty `xr.Dataset()`.
+        `to_xarray()`'s whole-file implementation.
 
+        Every line with real data, stacked along a new `"line"`
+        dimension into one `Dataset`.
+
+        Parameters
+        ----------
+        xr : module
+            The already-imported `xarray` module (passed in by
+            `to_xarray` rather than imported again here).
+
+        Returns
+        -------
+        xarray.Dataset
+            `"line"` is a real, indexing coordinate (`ds.sel(
+            line="L1000")`, `ds.groupby("line")`) and `"line_category"`
+            a secondary, non-indexing coordinate on the same dimension
+            -- richer than a flat identifying column, since xarray has
+            first-class dimension/coordinate support a plain table
+            doesn't. Lines with no populated channels at all are
+            skipped entirely, same as `to_geoh5`/`to_dataframe`; if
+            *no* line has any data, returns a plain empty
+            `xr.Dataset()`.
+
+        Warns
+        -----
+        GDBParseWarning
+            A genuine row-count mismatch *within* one line (not just
+            the normal cross-line variation in station count) still
+            raises this, the same signal single-line mode gives for
+            it, just filled instead of dimension-split.
+
+        Notes
+        -----
         Unlike single-line mode, there's no per-channel/per-line
         dimension-splitting escape hatch here -- an `xr.Dataset`
         variable is one dense `(line, station[, bin])` array, so every
@@ -776,11 +1032,7 @@ class GDB:
         variable's `_FillValue` attr -- the real CF/netCDF-convention
         attribute name existing xarray/netCDF tooling already knows to
         look for, so it's discoverable programmatically (`ds.to_netcdf(
-        ...)` included) rather than needing to be known out of band. A
-        genuine row-count mismatch *within* one line (not just the
-        normal cross-line variation in station count) still raises a
-        `GDBParseWarning`, the same signal single-line mode gives for
-        it, just filled instead of dimension-split.
+        ...)` included) rather than needing to be known out of band.
 
         A VA/array channel's second dimension, `f"{name}_bin"`, is
         sized from `array_width` -- a fixed, file-wide channel-table
@@ -901,8 +1153,9 @@ class GDB:
         z_channel: Optional[str] = None,
     ) -> None:
         """
-        Export every line's data to a new `.geoh5` file at `path` --
-        one `Points` object per line (holding real per-line data,
+        Export every line's data to a new `.geoh5` file at `path`.
+
+        One `Points` object per line (holding real per-line data,
         i.e. it has at least one channel with data), grouped under one
         `ContainerGroup` named after this `.gdb` file, inside a
         `geoh5py.Workspace`. Needs the optional `geoh5py` dependency
@@ -915,25 +1168,44 @@ class GDB:
         natural unit is one file holding a whole survey's worth of named
         objects, not one line at a time.
 
-        **Vertex geometry**: `x_channel`/`y_channel`/`z_channel` name
-        the channels providing each line's `Points.vertices`. Left
-        unset (`None`, the default for all three), this first tries
-        `self.coordinate_channels` -- this file's own internal
-        registry of which real channel plays which coordinate role
-        (docs/provenance/notes.md section 6.8b), directly decoded, not
-        guessed -- confirmed present and correct on 100% of this
-        project's real sample corpus for X/Y. Only when that registry
-        doesn't confirm a role does this fall back to the literal names
-        `"Easting"`/`"Northing"` (X/Y) or no channel at all (Z, meaning
-        every vertex gets `Z = 0.0`). Passing an explicit channel name
-        always wins over both. A line missing its resolved X or Y
-        channel is **skipped entirely** (no `Points` object created for
-        it), with a `GDBParseWarning`, rather than guessed at or
-        defaulted to `(0, 0)` -- this reader never guesses what a
-        channel means when it can't confirm one (see `to_xarray`'s
-        docstring); a missing Z, by contrast, is normal and never
-        blocks export.
+        Parameters
+        ----------
+        path : str
+            Path to the `.geoh5` file to create (or append to --
+            opened with `Workspace(path, mode="a")`).
+        x_channel, y_channel, z_channel : str, optional
+            Name the channels providing each line's `Points.vertices`.
+            Left unset (`None`, the default for all three), this first
+            tries `self.coordinate_channels` -- this file's own
+            internal registry of which real channel plays which
+            coordinate role (docs/provenance/notes.md section 6.8b),
+            directly decoded, not guessed -- confirmed present and
+            correct on 100% of this project's real sample corpus for
+            X/Y. Only when that registry doesn't confirm a role does
+            this fall back to the literal names `"Easting"`/
+            `"Northing"` (X/Y) or no channel at all (Z, meaning every
+            vertex gets `Z = 0.0`). Passing an explicit channel name
+            always wins over both.
 
+        Raises
+        ------
+        ImportError
+            If the optional `geoh5py` dependency isn't installed.
+
+        Warns
+        -----
+        GDBParseWarning
+            A line missing its resolved X or Y channel is **skipped
+            entirely** (no `Points` object created for it) rather than
+            guessed at or defaulted to `(0, 0)` -- this reader never
+            guesses what a channel means when it can't confirm one
+            (see `to_xarray`'s docstring); a missing Z, by contrast, is
+            normal and never blocks export. Also raised for a
+            duplicate channel name (see Notes) and a row-count
+            mismatch (see Notes).
+
+        Notes
+        -----
         **Array/VA channels** (docs/spec.md section 5): `.geoh5` (per
         `geoh5py`, checked directly against its real `data/` module
         source) has no `Data` type holding more than one value per
@@ -950,15 +1222,14 @@ class GDB:
         **Duplicate channel names**: disambiguated exactly like
         `to_xarray` (see `_disambiguate_names`) -- `f"{name}[{occurrence}]"`
         for every occurrence after the first, same numbering as
-        `channel(("name", occurrence))`, with a `GDBParseWarning`.
+        `channel(("name", occurrence))`.
 
         **Row-count mismatches**: `.geoh5` `Data` with `VERTEX`
         association must match the parent object's vertex count
         exactly -- there's no analogue to `to_xarray`'s per-channel
         dimension escape hatch. A channel that decodes to a different
         row count than this line's vertex count (from `x_channel`) is
-        **skipped** (that channel only, not the whole line), with a
-        `GDBParseWarning`.
+        **skipped** (that channel only, not the whole line).
 
         **Not attempted**: coordinate-system/CRS export --
         `self.coordinate_systems` only returns best-effort names (no
@@ -1136,18 +1407,57 @@ class GDB:
         pd,
     ) -> np.ndarray:
         """
-        Pad `values` (a decoded channel's array, or one column of an
-        array channel) out to `row_count` -- the max row count across
-        every channel on this line, the same convention `to_xarray`
-        uses for its own "give the short channel its own dimension"
-        case. `pandas` has no such escape hatch (every column in one
-        `DataFrame` shares one row count) and no such *need* for one
-        either: unlike `to_xarray` (needs consistent-length dimensions
-        for array ops) or `to_geoh5` (a `.geoh5` `Data`'s association
-        must match its object's vertex count exactly, a hard format
-        constraint, so a mismatched channel is skipped instead),
-        padding a ragged column with missing values is completely
-        ordinary, idiomatic pandas.
+        Pad `values` out to `row_count`.
+
+        `values` is a decoded channel's array, or one column of an
+        array channel. `row_count` is the max row count across every
+        channel on this line, the same convention `to_xarray` uses for
+        its own "give the short channel its own dimension" case.
+
+        Parameters
+        ----------
+        values : numpy.ndarray
+            The decoded values to pad.
+        row_count : int
+            The target length -- the max row count across this line's
+            channels.
+        line_rec : LineRecord
+            The line `values` came from, used only for the warning
+            message.
+        channel : ChannelRecord
+            The channel `values` came from, used only for the warning
+            message.
+        var_name : str
+            The name `values` will be exported under, used only for
+            the warning message.
+        pd : module
+            The already-imported `pandas` module (passed in by
+            `to_dataframe` rather than imported again here).
+
+        Returns
+        -------
+        numpy.ndarray
+            `values` unchanged if it's already `row_count` long,
+            otherwise padded out to that length with pandas' own
+            per-dtype missing-value representation.
+
+        Warns
+        -----
+        GDBParseWarning
+            If `values` is shorter than `row_count` (a likely
+            truncated/corrupt file).
+
+        Notes
+        -----
+        `pandas` has no escape hatch equivalent to `to_xarray`'s own
+        dimension-splitting (every column in one `DataFrame` shares
+        one row count) and no such *need* for one either: unlike
+        `to_xarray` (needs consistent-length dimensions for array ops)
+        or `to_geoh5` (a `.geoh5` `Data`'s association must match its
+        object's vertex count exactly, a hard format constraint, so a
+        mismatched channel is skipped instead), padding a ragged
+        column with missing values is completely ordinary, idiomatic
+        pandas.
 
         Goes through `pandas.Series(values).reindex(range(row_count))`
         rather than hand-rolled `numpy` padding: reindexing to a
@@ -1173,31 +1483,55 @@ class GDB:
 
     def to_dataframe(self, line: Optional[LineRef] = None) -> "pd.DataFrame":
         """
-        Build a `pandas.DataFrame` -- one row per station. Needs the
-        optional `pandas` dependency (`pip install python-gdb[pandas]`),
-        imported lazily here so importing `pygdb` itself never requires
-        it.
+        Build a `pandas.DataFrame` -- one row per station.
 
-        `line` given: scoped to that one line only, mirroring
-        `to_xarray(line)`'s exact scope. `df.attrs` gets `line_name`,
-        `line_category` (`line_rec.category_name`), and `path` -- the
-        same three keys `to_xarray`'s `Dataset.attrs` carries -- rather
-        than a `"line"` column, since every row already belongs to the
-        one given line.
+        Needs the optional `pandas` dependency (`pip install
+        python-gdb[pandas]`), imported lazily here so importing
+        `pygdb` itself never requires it.
 
-        `line` omitted (the default): every line with real data,
-        concatenated into one table -- `"line"`/`"line_category"`
-        columns are added so rows from different lines stay
-        distinguishable (`pandas.DataFrame.attrs` is a single,
-        frame-level dict, not one per line, so it can't hold this the
-        way single-line mode's `df.attrs` does). A real channel can
-        collide with one of these two reserved names -- confirmed real,
-        not hypothetical: a real Ontario sample file has a channel
-        literally named `"line"` -- in which case the *channel's* own
-        column is renamed `f"channel_{name}"` (with a `GDBParseWarning`)
-        rather than silently overwriting the reserved column every
-        whole-file caller relies on to tell rows apart.
+        Parameters
+        ----------
+        line : str, int, or LineRecord, optional
+            If given, scope the export to that one line only,
+            mirroring `to_xarray(line)`'s exact scope. `df.attrs` gets
+            `line_name`, `line_category` (`line_rec.category_name`),
+            and `path` -- the same three keys `to_xarray`'s
+            `Dataset.attrs` carries -- rather than a `"line"` column,
+            since every row already belongs to the one given line.
 
+            If omitted (the default), export every line with real
+            data, concatenated into one table -- `"line"`/
+            `"line_category"` columns are added so rows from different
+            lines stay distinguishable (`pandas.DataFrame.attrs` is a
+            single, frame-level dict, not one per line, so it can't
+            hold this the way single-line mode's `df.attrs` does). See
+            Warns for what happens if a real channel collides with one
+            of these two reserved names.
+
+        Returns
+        -------
+        pandas.DataFrame
+
+        Raises
+        ------
+        ImportError
+            If the optional `pandas` dependency isn't installed.
+
+        Warns
+        -----
+        GDBParseWarning
+            In whole-file mode, if a real channel collides with the
+            reserved `"line"`/`"line_category"` column names --
+            confirmed real, not hypothetical: a real Ontario sample
+            file has a channel literally named `"line"` -- in which
+            case the *channel's* own column is renamed
+            `f"channel_{name}"` rather than silently overwriting the
+            reserved column every whole-file caller relies on to tell
+            rows apart. Also raised for a duplicate channel name (see
+            Notes) and a row-count mismatch (see Notes).
+
+        Notes
+        -----
         A VA/array channel (docs/spec.md section 5) is exported as one
         column per element, `f"{name}[{j}]"` for `j` in
         `range(array_width)` -- the same flattening `to_geoh5` uses,
@@ -1207,7 +1541,7 @@ class GDB:
         If two channels share a name and both have data on a line, the
         second (and any later) occurrence's column is disambiguated as
         `f"{name}[{occurrence}]"`, identical numbering to `to_xarray`/
-        `to_geoh5` (see `_disambiguate_names`), with a `GDBParseWarning`.
+        `to_geoh5` (see `_disambiguate_names`).
 
         If channels on one line don't all decode to the same row count
         (a truncated/corrupt file), the short channel's column is
@@ -1215,15 +1549,15 @@ class GDB:
         that line's channels, rather than being dropped or forcing
         other channels to truncate to match -- see `_pad_to_length`'s
         docstring for why padding, specifically, is the right default
-        here where it wasn't for `to_xarray`/`to_geoh5`. Also raises a
-        `GDBParseWarning`. A channel entirely absent on one line in
-        whole-file mode (present on some lines, not others -- a
-        normal, sparse case, docs/spec.md section 1) needs no special
-        handling here: it's simply missing from that line's own
-        per-line frame, and `pandas.concat`'s ordinary union-of-columns
-        behavior fills the gap with missing values across the whole
-        table -- no warning, since a channel simply not being on a
-        line is the format's normal baseline, not a sign of trouble.
+        here where it wasn't for `to_xarray`/`to_geoh5`. A channel
+        entirely absent on one line in whole-file mode (present on
+        some lines, not others -- a normal, sparse case, docs/spec.md
+        section 1) needs no special handling here: it's simply missing
+        from that line's own per-line frame, and `pandas.concat`'s
+        ordinary union-of-columns behavior fills the gap with missing
+        values across the whole table -- no warning, since a channel
+        simply not being on a line is the format's normal baseline,
+        not a sign of trouble.
         """
         try:
             import pandas as pd

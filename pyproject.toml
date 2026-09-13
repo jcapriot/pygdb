@@ -37,9 +37,16 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 
+[project.urls]
+Homepage = "https://github.com/jcapriot/pygdb"
+Repository = "https://github.com/jcapriot/pygdb"
+Documentation = "https://jcapriot.github.io/pygdb/"
+Issues = "https://github.com/jcapriot/pygdb/issues"
+
 [project.optional-dependencies]
 docs = [
     "zensical",
+    "mkdocstrings-python",
 ]
 dev = [
     "pytest>=7.0",

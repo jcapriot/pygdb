@@ -41,13 +41,13 @@ except ImportError:
 
 class GRDParseWarning(RuntimeWarning):
     """
-    Warned when this reader hits a truncated file or a compressed block
-    that fails to decompress -- see `gdb_reader.GDBParseWarning` for the
-    same design rationale applied here: return whatever grid data was
-    successfully decoded (padded with the header's own dummy value for
-    the missing tail, so the array shape still matches `shape_e *
-    shape_v`) rather than raising and discarding a whole grid over one
-    bad/missing block.
+    Warned on a truncated file or a compressed block that fails to decompress.
+
+    See `gdb_reader.GDBParseWarning` for the same design rationale
+    applied here: return whatever grid data was successfully decoded
+    (padded with the header's own dummy value for the missing tail, so
+    the array shape still matches `shape_e * shape_v`) rather than
+    raising and discarding a whole grid over one bad/missing block.
     """
 
 
@@ -125,6 +125,27 @@ def _array_typecode(element_size: int, sign_flag: int) -> str:
 
 
 def parse_header(header_bytes: bytes) -> GrdHeader:
+    """
+    Parse a `.grd` file's 512-byte version-2 header.
+
+    Parameters
+    ----------
+    header_bytes : bytes
+        The first `HEADER_SIZE` (512) bytes of the file.
+
+    Returns
+    -------
+    GrdHeader
+        The parsed header.
+
+    Raises
+    ------
+    ValueError
+        If fewer than `HEADER_SIZE` bytes are given.
+    NotImplementedError
+        If the element-size field (`ES`) doesn't match one of this
+        format's recognized values.
+    """
     if len(header_bytes) < HEADER_SIZE:
         raise ValueError(f".grd header must be {HEADER_SIZE} bytes, got {len(header_bytes)}")
 
@@ -156,46 +177,70 @@ def _decompress_body(body: bytes, expected_total_size: int = 0):
     """
     Decompress the post-header bytes of a compressed .grd file.
 
-    Layout (all confirmed by round-tripping a real compressed file to an
-    exact byte-for-byte match against its real uncompressed twin -- see
-    ../docs/provenance/notes.md section 4):
+    Parameters
+    ----------
+    body : bytes
+        The file's bytes immediately following the 512-byte header.
+    expected_total_size : int, optional
+        In practice `shape_e * shape_v * element_size`, the grid's own
+        declared total size (see `read_grd`). Only a capacity hint for
+        the native path (`pygdb._native.decompress_grd_blocks`, the
+        same `flate2`/`zlib-rs` decompressor validated against
+        `.gdb`'s `DB_COMP_SIZE` data): it seeds the output buffer's
+        pre-allocation to cut down on reallocations while
+        concatenating blocks, but a wrong value never affects
+        correctness, only how many times that buffer has to grow.
 
-      offset 0..7   : 8-byte signature/comp-type field (not decoded)
-      offset 8      : n_blocks            (int32)
-      offset 12     : vectors_per_block   (int32)
-      offset 16     : n_blocks x int64 -- absolute file offset of each
-                       block's slot (offsets are absolute against the
-                       *whole file*, i.e. already include the 512-byte
-                       header)
-      offset 16+8N  : n_blocks x int32 -- length in bytes of each block's
-                       slot, INCLUDING the 16-byte per-block sub-header
-                       below (this differs slightly from how the
-                       Loop3D reader frames the same arithmetic, but
-                       lands on the identical byte range)
+    Returns
+    -------
+    bytearray
+        The decompressed bytes, concatenated across every block. Not
+        `bytes` -- `array.array.frombytes()` (the only consumer, in
+        `read_grd`) accepts any buffer-protocol object, so converting
+        to immutable `bytes` first would only pay for a full,
+        whole-grid-sized copy with no benefit.
 
-      Each block's slot (at its absolute file offset, i.e.
-      `body[offset - HEADER_SIZE : ...]` here since `body` starts right
-      after the header):
+    Warns
+    -----
+    GRDParseWarning
+        If the block table itself is truncated/unreadable, or an
+        individual block is truncated or fails to decompress -- in
+        every case, returns whatever was successfully decoded before
+        the problem rather than raising.
+
+    Notes
+    -----
+    Layout (all confirmed by round-tripping a real compressed file to
+    an exact byte-for-byte match against its real uncompressed twin --
+    see ../docs/provenance/notes.md section 4):
+
+    ::
+
+        offset 0..7   : 8-byte signature/comp-type field (not decoded)
+        offset 8      : n_blocks            (int32)
+        offset 12     : vectors_per_block   (int32)
+        offset 16     : n_blocks x int64 -- absolute file offset of each
+                         block's slot (offsets are absolute against the
+                         *whole file*, i.e. already include the 512-byte
+                         header)
+        offset 16+8N  : n_blocks x int32 -- length in bytes of each block's
+                         slot, INCLUDING the 16-byte per-block sub-header
+                         below (this differs slightly from how the
+                         Loop3D reader frames the same arithmetic, but
+                         lands on the identical byte range)
+
+    Each block's slot (at its absolute file offset, i.e.
+    `body[offset - HEADER_SIZE : ...]` here since `body` starts right
+    after the header):
+
+    ::
+
         16 bytes  : a per-block sub-header. Confirmed present and its
                     length confirmed exactly (skipping exactly 16 bytes
                     always lands on a valid zlib stream, 0x78 0x01, in
                     every real block we tested). Internal meaning of the
                     16 bytes is NOT fully understood -- see docs/provenance/notes.md.
         remainder : a standalone zlib stream for that block.
-
-    `expected_total_size` (in practice `shape_e * shape_v * element_size`,
-    the grid's own declared total size -- see `read_grd`) is only a
-    capacity hint for the native path (`pygdb._native.decompress_grd_blocks`,
-    the same `flate2`/`zlib-rs` decompressor validated against `.gdb`'s
-    `DB_COMP_SIZE` data): it seeds the output buffer's pre-allocation to
-    cut down on reallocations while concatenating blocks, but a wrong
-    value never affects correctness, only how many times that buffer
-    has to grow.
-
-    Returns a `bytearray`, not `bytes` -- `array.array.frombytes()` (the
-    only consumer, in `read_grd`) accepts any buffer-protocol object, so
-    converting to immutable `bytes` first would only pay for a full,
-    whole-grid-sized copy with no benefit.
 
     Dispatches the whole per-block decompress-and-concatenate loop to
     `pygdb._native.decompress_grd_blocks` when it's available (one
@@ -256,25 +301,43 @@ def _decompress_body(body: bytes, expected_total_size: int = 0):
 
 def read_grd(path: str):
     """
-    Read a .grd file and return (header, values) where `values` is an
-    `array.array` of the grid's raw (unscaled) element values in
-    on-disk order (row-major per the file's own `ordering`/KX flag).
-    numpy is a dependency of the `pygdb` package as a whole (see
-    `gdb_reader.py`'s VA/array-channel decoding), but this module's own
-    `.grd` reading doesn't need it -- a grid's shape is already fully
-    known from `shape_e`/`shape_v`, so reshaping is left to the caller
-    rather than done here.
+    Read a `.grd` file.
 
-    A file too short to even hold the 512-byte header raises `ValueError`
-    (there's nothing to return at all in that case). Beyond that, this
-    degrades gracefully rather than hard-crashing: a truncated/corrupt
-    compressed block is skipped (see `_decompress_body`), and a decoded
-    element count that doesn't match `shape_e * shape_v` -- which for a
-    real, complete file never happens, so it's always a sign of trouble
-    -- is reported as a `GRDParseWarning` rather than a raised
-    `ValueError`; `values` is returned exactly as long as what was
-    actually decoded, so a caller can check `len(values)` against
-    `header.shape_e * header.shape_v` itself if it needs to know.
+    Parameters
+    ----------
+    path : str
+        Path to the `.grd` file.
+
+    Returns
+    -------
+    header : GrdHeader
+        The parsed 512-byte header.
+    values : array.array
+        The grid's raw (unscaled) element values in on-disk order
+        (row-major per the file's own `ordering`/KX flag). numpy is a
+        dependency of the `pygdb` package as a whole (see
+        `gdb_reader.py`'s VA/array-channel decoding), but this
+        module's own `.grd` reading doesn't need it -- a grid's shape
+        is already fully known from `shape_e`/`shape_v`, so reshaping
+        is left to the caller rather than done here.
+
+    Raises
+    ------
+    ValueError
+        If `path` is too short to even hold the 512-byte header --
+        there's nothing to return at all in that case.
+
+    Warns
+    -----
+    GRDParseWarning
+        If a compressed block is truncated or fails to decompress
+        (see `_decompress_body`), or if the decoded element count
+        doesn't match `shape_e * shape_v` -- which for a real,
+        complete file never happens, so it's always a sign of trouble.
+        `values` is returned exactly as long as what was actually
+        decoded rather than raising; a caller can check `len(values)`
+        against `header.shape_e * header.shape_v` itself if it needs
+        to know.
     """
     with open(path, "rb") as f:
         raw = f.read()
@@ -314,6 +377,21 @@ def read_grd(path: str):
 
 
 def dummy_value(header: GrdHeader):
+    """
+    The "no data" sentinel value for a grid's element type.
+
+    Parameters
+    ----------
+    header : GrdHeader
+        The grid's parsed header, as returned by `parse_header` (or
+        `read_grd`).
+
+    Returns
+    -------
+    int or float
+        The vendor-published dummy value matching `header`'s element
+        size/sign (see `_DUMMIES`).
+    """
     typecode = _array_typecode(header.element_size, header.sign_flag)
     return _DUMMIES[typecode]
 
