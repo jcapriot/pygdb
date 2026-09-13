@@ -2923,3 +2923,127 @@ non-sampled LZRW1 validator from an earlier round) against a real file
 to confirm the `LZRW1DecodeError` change didn't affect its own,
 separate, from-scratch validation logic -- still 1,759/1,759 chunks,
 zero failures, unchanged from before.
+
+## Session 4 — `DB_CHAN_X`/`DB_CHAN_Y`/`DB_CHAN_Z` channel-role registry keys (2026-09-13)
+
+A different kind of question this time: not "what does this format
+mean" but a downstream, practical one -- does the format itself help
+pick which channels are the X/Y/Z coordinates for a `.geoh5`-export
+feature built on top of this reader, rather than guessing from
+channel-naming conventions? That export's `x_channel`/`y_channel`/
+`z_channel` parameters currently default to the literal strings
+`"Easting"`/`"Northing"`, which only exactly match a minority of real
+files' actual channel names.
+
+### 4.1 Re-opening NOTES.md §6.8's loose end -- [CONFIRMED] a direct, decodable key -> real-channel-name mapping, on every real file
+
+§6.8's "Angle 2" update had already spotted the literal vendor
+constant names `DB_CHAN_X`/`DB_CHAN_Y` (from the vendor's own
+published `DB_CHAN_X=0 DB_CHAN_Y=1 DB_CHAN_Z=2` enum, §2) as readable
+text in `MLMAG.gdb`'s `"REG "` registry blobs, "sitting right next to"
+coordinate-system metadata -- but stopped there, without pinning down
+the exact byte relationship or checking how far it generalizes. This
+session did both.
+
+**The exact byte structure, confirmed directly.** Dumping the raw
+bytes around the first `DB_CHAN_X` occurrence in `MLMAG.gdb` (real
+offset 745564288) shows it sitting inside the same `"REG "`/`"VV  "`
+nested-tag framing already established in §6.8's Angle 1:
+
+```
+... REG \x02\x00\x00\x00\x01\x00\x00\x00\x00\x1a\xcc\xff
+VV  \x00\x00\x00\x00\x00\xff\xff\xff\x02\x00\x00\x00
+DB_CHAN_X\x00x_nad83\x00 ...
+```
+
+i.e. a NUL-terminated key (`"DB_CHAN_X"`) immediately followed by a
+second NUL-terminated string -- and that second string, `"x_nad83"`,
+is a real, exact channel name in this same file
+(`GDB(path).channel_names` includes it verbatim). Same pattern, same
+file, a few hundred bytes later: `DB_CHAN_Y\x00y_nad83\x00`, and
+`y_nad83` is likewise real. So this is not merely a constant name
+sitting *near* coordinate metadata, as §6.8 first described it -- it's
+a genuine, directly-decodable **key -> channel-name mapping**, naming
+exactly which channel plays the X (or Y, or Z) role, with no
+naming-convention guessing needed at all.
+
+**Corpus-wide check, all 22 real files, all 3 agencies: universal for
+X/Y, real but less common for Z.** Scanned every real `.gdb` file in
+`samples/` for `DB_CHAN_X\0`/`DB_CHAN_Y\0`/`DB_CHAN_Z\0` and decoded
+the NUL-terminated value immediately following each occurrence:
+
+| Key | Present | Value verified against the file's real channel table |
+|---|---|---|
+| `DB_CHAN_X` | 22/22 (100%) | every file |
+| `DB_CHAN_Y` | 22/22 (100%) | every file (see staleness caveat below) |
+| `DB_CHAN_Z` | 5/22 (23%) | every file |
+
+**[CONFIRMED]** on real production data across USGS, GSQ, and Ontario
+deliveries alike -- not an artifact of the one Ontario file that first
+turned it up.
+
+**A real, meaningful "no channel assigned" value, distinct from
+absence.** Three files (`AG106386_Northern Georgetown_Conductivity.gdb`,
+`DB_EM_293.gdb`, `East_Isa_VTEM_Inversion.gdb`) have a `DB_CHAN_Z` key
+whose value is a single literal space character (`" "`) rather than a
+channel name -- confirmed by direct byte inspection, not a parsing
+artifact or a truncated read. Read as Oasis montaj's own explicit
+"this role has no channel" placeholder, distinct from the key not
+existing at all.
+
+**A real complication: stale, superseded copies of the same key can
+coexist in one file, and neither "first" nor "last" wins reliably.**
+Two files have multiple, *differing* occurrences of the same key:
+
+- `SAMAGEM_CDI.gdb` (this project's largest real file, 1.93GB,
+  `DB_COMP_NONE`): four `DB_CHAN_Y` occurrences -- three read `"Yg"`
+  (not a real channel in this file's current channel table) at
+  offsets 205184/207232/1855099264, and one reads `"y_NAD83"` (a real
+  channel) at offset 1855108480, the very last one in the file, right
+  next to a `DB_CHAN_X\0x_NAD83\0` at offset 1855108224. Here the
+  *last* occurrence is the correct one.
+- `DB_Mag_833.gdb`: two `DB_CHAN_Y` occurrences -- `"Northing_AGD66"`
+  (a real channel) at offset 980352, and `"Y"` (not a real channel) at
+  offset 4048256. Here the *first* occurrence is the correct one --
+  the exact opposite of the previous case.
+
+Both are consistent with this format's general append-only,
+never-in-place-edited blob storage model (already established
+elsewhere, e.g. §6.6b's blob-chain findings): re-registering a file's
+X/Y channels in Oasis montaj evidently appends a fresh registry entry
+rather than overwriting the old one in place, and there's no reliable
+*positional* rule (favoring first or last) for picking the live one
+after the fact. **The rule that resolves both real cases correctly:
+validate each candidate value against the file's own real channel
+table (`read_channels()`), and keep whichever occurrence(s) actually
+name a real channel** -- a direct cross-check against data this reader
+already has to parse anyway, not a guess. No file in this corpus had
+two *different* candidate values that both matched real channels, so
+genuine remaining ambiguity (a role reassigned to a different,
+still-live channel) hasn't been observed -- only reasoned about as a
+theoretical edge case this rule alone wouldn't resolve.
+
+**Why this matters, concretely.** The `.geoh5`-export feature's own
+coordinate-channel defaults currently hardcode the literal names
+`"Easting"`/`"Northing"`, which (checked directly against this same
+22-file corpus) exactly match only 3 of 22 real files -- every other
+file uses a different real convention (`EASTING`/`NORTHING`,
+`MGA_East`/`MGA_North`, `x_nad83`/`y_nad83`, `UTMX`/`UTMY`, plain
+`x`/`y`, ...). This registry mechanism, once decoded, resolves the
+*correct* channel on every single file in the corpus (100% for X/Y) --
+a dramatically better default than any hardcoded name convention could
+be, with no guessing involved at all.
+
+**What's still open:** the exact binary field boundaries around the
+key/value pair (same honest gap as the rest of §6.7/§6.8's `"REG "`
+framing -- found by searching for readable text within an
+already-tag-framed region, not by parsing a byte-exact record layout);
+whether a file can have genuine, unresolvable ambiguity (two differing
+values that both match real, currently-live channels) -- not observed
+in this 22-file corpus, but not proven impossible either.
+
+**Write-up.** Added `NOTES.md` §6.8b with the same findings, framed as
+a direct continuation of §6.8 rather than by session. **Not yet wired
+into a reader function** -- this session was scoped to confirming the
+finding and its reliability, not implementing a decoder or changing
+`to_geoh5`'s defaults.
