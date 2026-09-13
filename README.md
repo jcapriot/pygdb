@@ -21,7 +21,10 @@ real, publicly downloaded `.gdb` files. No Geosoft software of any kind
 Desktop, or the free Geosoft Viewer) was installed, imported, or
 executed at any point in producing it.
 
-Reading only — writing or mutating `.gdb`/`.grd` files is out of scope.
+Reading only — writing or mutating `.gdb`/`.grd` files (Geosoft's own
+proprietary formats) is out of scope. Exporting what's been read into a
+different, openly-specified format is a separate concern and *is*
+supported -- see `to_xarray`/`to_geoh5` below.
 
 ## Installation
 
@@ -48,6 +51,8 @@ db = GDB("example.gdb")
 
 db.compression           # CompressionInfo(code=0, name='DB_COMP_NONE', ...)
 db.coordinate_systems     # ['NAD83 / UTM zone 11N', 'WGS 84'] (best-effort, may be [])
+db.coordinate_channels    # {'X': 'Easting', 'Y': 'Northing', 'Z': None} (from the
+                          #  file's own internal registry, may be all-None)
 
 db.line_names[:5]         # ['L1000', 'L1001', 'L1010', 'L1020', 'L1030']
 db.channels_on_line("L1000")   # channels that actually have data on this line
@@ -64,6 +69,11 @@ functions `GDB` is built on.
 (`pip install python-gdb[xarray]`, an optional dependency) — see
 [the docs](docs/index.md#exporting-to-xarray) for how VA/array channels
 and duplicate channel names come through.
+
+`db.to_geoh5("survey.geoh5")` exports the whole file to a
+`geoh5py.Workspace` (`pip install python-gdb[geoh5]`, an optional
+dependency) — see [the docs](docs/index.md#exporting-to-geoh5) for how
+line geometry and VA/array channels come through.
 
 ## Optional Rust-accelerated backend
 

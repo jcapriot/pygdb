@@ -82,6 +82,16 @@ def test_gdb_coordinate_systems_empty_when_none_present(db):
     assert db.coordinate_systems == []
 
 
+def test_gdb_coordinate_channels_all_none_when_no_registry_present(db):
+    """
+    The shared `db` fixture has no injected REG/IPJ registry content, so
+    `coordinate_channels` (docs/provenance/notes.md section 6.8b) should
+    resolve nothing -- same "empty/None means not present, not a bug"
+    contract as `coordinate_systems`.
+    """
+    assert db.coordinate_channels == {"X": None, "Y": None, "Z": None}
+
+
 def test_gdb_channels_on_line_reflects_sparse_grid(db):
     assert set(db.channels_on_line("L100")) == {"Fiducial", "Easting", "Depths"}
     assert set(db.channels_on_line("L200")) == {"Fiducial", "Easting"}
@@ -157,6 +167,42 @@ def test_gdb_calibrates_line_indices_around_a_phantom_first_slot(tmp_path):
     # And the corrected indices should be directly visible too.
     assert db.line("L100").index == 1
     assert db.line("L200").index == 2
+
+
+def test_gdb_calibration_does_not_shift_indices_on_a_tied_score(tmp_path):
+    """
+    Regression test for a real bug found while building `to_geoh5`
+    (not by design): a line with genuinely zero populated channels
+    contributes no evidence either way to `_calibrate_line_indices`'s
+    offset search, which could let a spurious non-zero offset *tie*
+    the correct offset 0 and win purely by being checked first (the
+    original scan went `-4, -3, ..., 4` and only strictly-better scores
+    replaced the current best) -- silently shifting every line's index,
+    not just the empty one's, so an unrelated line would start reading
+    a different line's data.
+
+    Two channels, two lines: one with real data on both channels, one
+    with none at all. Before the fix, this exact shape mapped the
+    populated line's data onto the *empty* line and left the real line
+    with nothing.
+    """
+    channels = [
+        ChannelSpec("Easting", dtype_code=5),
+        ChannelSpec("Northing", dtype_code=5),
+    ]
+    lines = [
+        LineSpec("L100", data={"Easting": [1.0], "Northing": [2.0]}),
+        LineSpec("L_EMPTY", data={}),
+    ]
+    path = tmp_path / "tied_calibration.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    assert db.line("L100").index == 0
+    assert db.line("L_EMPTY").index == 1
+    assert set(db.channels_on_line("L100")) == {"Easting", "Northing"}
+    assert db.channels_on_line("L_EMPTY") == []
+    npt.assert_array_equal(db.read("L100", "Easting"), [1.0])
 
 
 # -- duplicate-channel-name disambiguation regression tests -------------------
@@ -459,3 +505,310 @@ def test_gdb_to_xarray_raises_import_error_with_install_hint(db, monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "xarray", None)
     with pytest.raises(ImportError, match=r"pip install python-gdb\[xarray\]"):
         db.to_xarray("L100")
+
+
+# -- GDB.to_geoh5 ---------------------------------------------------------
+#
+# Unlike to_xarray, to_geoh5 needs real Easting/Northing geometry on every
+# line it exports, so it gets its own channel/line fixture rather than
+# reusing the module-level CHANNELS/LINES (which has no Northing channel).
+
+GEOH5_CHANNELS = [
+    ChannelSpec("Fiducial", dtype_code=3),
+    ChannelSpec("Easting", dtype_code=5),
+    ChannelSpec("Northing", dtype_code=5),
+    ChannelSpec("Depths", dtype_code=5, array_width=3),
+]
+GEOH5_LINES = [
+    LineSpec("L100", data={
+        "Fiducial": [1, 2, 3],
+        "Easting": [100.0, 100.5, 101.0],
+        "Northing": [200.0, 200.5, 201.0],
+        "Depths": [0.0, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0, 10.5, 12.0],
+    }),
+    LineSpec("L200", data={
+        "Fiducial": [10, 11],
+        "Easting": [300.0, 300.5],
+        "Northing": [400.0, 400.5],
+        # no Depths on this line
+    }),
+]
+
+
+@pytest.fixture
+def geoh5_db(tmp_path):
+    path = tmp_path / "geoh5_test.gdb"
+    path.write_bytes(build_gdb_bytes(GEOH5_CHANNELS, GEOH5_LINES, comp_level=0))
+    return GDB(str(path))
+
+
+def _open_geoh5(path):
+    from geoh5py.workspace import Workspace
+
+    return Workspace(str(path), mode="r")
+
+
+def _points_by_name(group):
+    return {c.name: c for c in group.children}
+
+
+def test_gdb_to_geoh5_scalar_and_array_channels(geoh5_db, tmp_path):
+    out = tmp_path / "out.geoh5"
+    geoh5_db.to_geoh5(str(out))
+
+    with _open_geoh5(out) as ws:
+        assert len(ws.root.children) == 1
+        file_group = ws.root.children[0]
+        assert file_group.name == "geoh5_test"
+
+        points = _points_by_name(file_group)["L100"]
+        npt.assert_array_equal(
+            points.vertices,
+            [[100.0, 200.0, 0.0], [100.5, 200.5, 0.0], [101.0, 201.0, 0.0]],
+        )
+
+        data = {c.name: c for c in points.children}
+        npt.assert_array_equal(data["Fiducial"].values, [1, 2, 3])
+        assert data["line_category"].values == "NORMAL"
+
+        npt.assert_array_equal(data["Depths[0]"].values, [0.0, 4.5, 9.0])
+        npt.assert_array_equal(data["Depths[1]"].values, [1.5, 6.0, 10.5])
+        npt.assert_array_equal(data["Depths[2]"].values, [3.0, 7.5, 12.0])
+        [depths_group] = [g for g in points.property_groups if g.name == "Depths"]
+        assert len(depths_group.properties) == 3
+        assert "GS_LONG" in data["Fiducial"].entity_type.description
+
+
+def test_gdb_to_geoh5_channel_missing_on_one_line_is_just_absent(geoh5_db, tmp_path):
+    """L200 has no `Depths` -- its Points object should exist (Easting/
+    Northing are present) but simply have no Depths[*] children or
+    PropertyGroup, the same "sparse grid" behavior as everywhere else in
+    this reader -- not a warning-worthy anomaly."""
+    out = tmp_path / "out.geoh5"
+    geoh5_db.to_geoh5(str(out))
+
+    with _open_geoh5(out) as ws:
+        points = _points_by_name(ws.root.children[0])["L200"]
+        names = {c.name for c in points.children}
+        assert not any(n.startswith("Depths") for n in names)
+        assert points.property_groups in (None, [])
+
+
+def test_gdb_to_geoh5_line_with_no_populated_channels_is_skipped_entirely(tmp_path):
+    channels = [
+        ChannelSpec("Easting", dtype_code=5),
+        ChannelSpec("Northing", dtype_code=5),
+    ]
+    lines = [
+        LineSpec("L100", data={"Easting": [1.0], "Northing": [2.0]}),
+        LineSpec("L_EMPTY", data={}),
+    ]
+    path = tmp_path / "empty_line.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    out = tmp_path / "out.geoh5"
+    db.to_geoh5(str(out))
+
+    with _open_geoh5(out) as ws:
+        names = {c.name for c in ws.root.children[0].children}
+        assert names == {"L100"}
+
+
+def test_gdb_to_geoh5_disambiguates_duplicate_channel_names(tmp_path):
+    from pygdb import GDBParseWarning
+
+    channels = [
+        ChannelSpec("Easting", dtype_code=5),
+        ChannelSpec("Northing", dtype_code=5),
+        ChannelSpec("Dup", dtype_code=5),
+        ChannelSpec("Dup", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={
+        "Easting": [1.0, 2.0], "Northing": [3.0, 4.0], "Dup": [10.0, 20.0],
+    })]
+    path = tmp_path / "dup_geoh5.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    out = tmp_path / "out.geoh5"
+    with pytest.warns(GDBParseWarning, match=r"Dup"):
+        db.to_geoh5(str(out))
+
+    with _open_geoh5(out) as ws:
+        points = ws.root.children[0].children[0]
+        data = {c.name: c for c in points.children}
+        assert {"Dup", "Dup[1]"} <= set(data)
+        npt.assert_array_equal(data["Dup"].values, [10.0, 20.0])
+        npt.assert_array_equal(data["Dup[1]"].values, [10.0, 20.0])
+    assert db.channel(("Dup", 1)).name == "Dup"
+
+
+def test_gdb_to_geoh5_row_count_mismatch_skips_that_channel(tmp_path):
+    from pygdb import GDBParseWarning
+
+    channels = [
+        ChannelSpec("Easting", dtype_code=5),
+        ChannelSpec("Northing", dtype_code=5),
+        ChannelSpec("Short", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={
+        "Easting": [1.0, 2.0, 3.0], "Northing": [4.0, 5.0, 6.0],
+        "Short": [10.0, 20.0],  # one row short of the vertex count
+    })]
+    path = tmp_path / "mismatch_geoh5.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    out = tmp_path / "out.geoh5"
+    with pytest.warns(GDBParseWarning, match=r"Short"):
+        db.to_geoh5(str(out))
+
+    with _open_geoh5(out) as ws:
+        points = ws.root.children[0].children[0]
+        assert points.n_vertices == 3
+        assert "Short" not in {c.name for c in points.children}
+
+
+def test_gdb_to_geoh5_missing_xy_channel_skips_the_line(tmp_path):
+    from pygdb import GDBParseWarning
+
+    channels = [
+        ChannelSpec("Easting", dtype_code=5),
+        ChannelSpec("Northing", dtype_code=5),
+        ChannelSpec("Fiducial", dtype_code=3),
+    ]
+    lines = [
+        LineSpec("L100", data={"Easting": [1.0], "Northing": [2.0], "Fiducial": [1]}),
+        # L200 has real data but no Northing -- can't be geometrized.
+        LineSpec("L200", data={"Easting": [1.0], "Fiducial": [2]}),
+    ]
+    path = tmp_path / "missing_xy.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    out = tmp_path / "out.geoh5"
+    with pytest.warns(GDBParseWarning, match=r"Northing"):
+        db.to_geoh5(str(out))
+
+    with _open_geoh5(out) as ws:
+        names = {c.name for c in ws.root.children[0].children}
+        assert names == {"L100"}
+
+
+def test_gdb_to_geoh5_z_channel_defaults_to_zero_and_can_be_overridden(tmp_path):
+    channels = [
+        ChannelSpec("Easting", dtype_code=5),
+        ChannelSpec("Northing", dtype_code=5),
+        ChannelSpec("Elevation", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={
+        "Easting": [1.0, 2.0], "Northing": [3.0, 4.0], "Elevation": [5.0, 6.0],
+    })]
+    path = tmp_path / "elev.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    out_default = tmp_path / "no_z.geoh5"
+    db.to_geoh5(str(out_default))
+    with _open_geoh5(out_default) as ws:
+        points = ws.root.children[0].children[0]
+        npt.assert_array_equal(points.vertices[:, 2], [0.0, 0.0])
+
+    out_z = tmp_path / "with_z.geoh5"
+    db.to_geoh5(str(out_z), z_channel="Elevation")
+    with _open_geoh5(out_z) as ws:
+        points = ws.root.children[0].children[0]
+        npt.assert_array_equal(points.vertices[:, 2], [5.0, 6.0])
+
+
+def test_gdb_to_geoh5_custom_xy_channel_names(tmp_path):
+    channels = [
+        ChannelSpec("Longitude", dtype_code=5),
+        ChannelSpec("Latitude", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={"Longitude": [10.0, 11.0], "Latitude": [20.0, 21.0]})]
+    path = tmp_path / "custom_xy.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    out = tmp_path / "out.geoh5"
+    db.to_geoh5(str(out), x_channel="Longitude", y_channel="Latitude")
+
+    with _open_geoh5(out) as ws:
+        points = ws.root.children[0].children[0]
+        npt.assert_array_equal(points.vertices[:, :2], [[10.0, 20.0], [11.0, 21.0]])
+
+
+def _inject_channel_role_blob(data: bytes, blob_index: int, role: str, value: str, page_size: int) -> bytes:
+    """See tests/test_registry.py's identical helper for the byte-shape
+    rationale (docs/provenance/notes.md section 6.8b)."""
+    marker = f"DB_CHAN_{role}".encode("ascii") + b"\x00" + value.encode("ascii") + b"\x00"
+    body = marker + b"\x00" * 40
+    blob_bytes = bytearray(pack_plain_blob(blob_index, [], dtype_code=5, page_size=page_size))
+    blob_bytes[48:48 + len(body)] = body
+    return bytes(data) + bytes(blob_bytes)
+
+
+def test_gdb_to_geoh5_uses_registry_channel_roles_when_not_overridden(tmp_path):
+    """
+    docs/provenance/notes.md section 6.8b: when a file's own internal
+    registry confirms which channel plays the X/Y role, `to_geoh5`
+    should use it automatically -- deliberately using channel names
+    ("MyX"/"MyY") that don't match the "Easting"/"Northing" hardcoded
+    fallback at all, so this only passes if the registry lookup is
+    actually driving the result, not coincidentally matching a default.
+    """
+    channels = [
+        ChannelSpec("MyX", dtype_code=5),
+        ChannelSpec("MyY", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={"MyX": [5.0, 6.0], "MyY": [7.0, 8.0]})]
+    page_size = 256
+    data = build_gdb_bytes(channels, lines, page_size=page_size)
+    data = _inject_channel_role_blob(data, 50 * len(channels), "X", "MyX", page_size)
+    data = _inject_channel_role_blob(data, 51 * len(channels), "Y", "MyY", page_size)
+    path = tmp_path / "registry_xy.gdb"
+    path.write_bytes(data)
+    db = GDB(str(path))
+
+    out = tmp_path / "out.geoh5"
+    db.to_geoh5(str(out))  # no x_channel/y_channel given
+
+    with _open_geoh5(out) as ws:
+        points = ws.root.children[0].children[0]
+        npt.assert_array_equal(points.vertices[:, :2], [[5.0, 7.0], [6.0, 8.0]])
+
+
+def test_gdb_to_geoh5_explicit_channel_overrides_registry(tmp_path):
+    """An explicitly-passed x_channel/y_channel must win over whatever
+    the registry confirms, not just over the hardcoded fallback."""
+    channels = [
+        ChannelSpec("MyX", dtype_code=5),
+        ChannelSpec("MyY", dtype_code=5),
+        ChannelSpec("OtherX", dtype_code=5),
+        ChannelSpec("OtherY", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={
+        "MyX": [5.0], "MyY": [7.0], "OtherX": [50.0], "OtherY": [70.0],
+    })]
+    page_size = 256
+    data = build_gdb_bytes(channels, lines, page_size=page_size)
+    data = _inject_channel_role_blob(data, 50 * len(channels), "X", "MyX", page_size)
+    data = _inject_channel_role_blob(data, 51 * len(channels), "Y", "MyY", page_size)
+    path = tmp_path / "registry_override.gdb"
+    path.write_bytes(data)
+    db = GDB(str(path))
+
+    out = tmp_path / "out.geoh5"
+    db.to_geoh5(str(out), x_channel="OtherX", y_channel="OtherY")
+
+    with _open_geoh5(out) as ws:
+        points = ws.root.children[0].children[0]
+        npt.assert_array_equal(points.vertices[:, :2], [[50.0, 70.0]])
+
+
+def test_gdb_to_geoh5_raises_import_error_with_install_hint(geoh5_db, monkeypatch, tmp_path):
+    monkeypatch.setitem(__import__("sys").modules, "geoh5py", None)
+    with pytest.raises(ImportError, match=r"pip install python-gdb\[geoh5\]"):
+        geoh5_db.to_geoh5(str(tmp_path / "out.geoh5"))

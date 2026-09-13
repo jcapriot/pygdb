@@ -67,7 +67,8 @@ In keeping with that:
   `xarray` is optional (`pip install -e ".[xarray]"` or `.[dev]"`,
   which already includes it) -- only `GDB.to_xarray()` needs it,
   imported lazily inside that one method so importing `pygdb` itself
-  never requires it.
+  never requires it. `geoh5py` is optional the same way (`.[geoh5]` or
+  `.[dev]"`) -- only `GDB.to_geoh5()` needs it.
 - `rust/` holds an optional Rust extension (`pygdb._native`) that
   accelerates the reader's real CPU-bound hot paths (LZRW1
   decompression, fixed-width string decoding). This is one package,

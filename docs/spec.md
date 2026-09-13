@@ -709,12 +709,20 @@ on every agency checked:
   northern-hemisphere convention (false northing `0`, not `10000000`)
   and the geodetically correct central meridian (`-81`) for UTM zone
   17N.
-- **Literal vendor-published constant names actually appearing as
-  text**, on the Ontario files: `DB_CHAN_X` and `DB_CHAN_Y` (matching
-  `DB_CHAN_X=0 DB_CHAN_Y=1` from the vendor's own published source, §2)
-  sitting next to an `IPJ_x_nad83:y_nad83` registry key — not found in
-  the USGS file first checked, so this specific angle only pays off on
-  some files, not a miss for the format as a whole.
+- **`DB_CHAN_X`/`DB_CHAN_Y`/`DB_CHAN_Z`** (matching `DB_CHAN_X=0
+  DB_CHAN_Y=1 DB_CHAN_Z=2` from the vendor's own published source, §2)
+  — a NUL-terminated key immediately followed by a second NUL-terminated
+  string naming the **real channel that plays that coordinate role**.
+  **[CONFIRMED]** universal for X/Y across all 22 real files, all 3
+  agencies (23% for Z); every resolved value checked and found to be a
+  real, exact channel name. `provenance/notes.md` §6.8b has the full
+  derivation, including a real complication (this format's append-only
+  blob storage can leave stale, differing copies of the same key --
+  resolved by validating each candidate against the file's own real
+  channel table rather than trusting position). Implemented as
+  `pygdb.registry.find_channel_roles` / `GDB.coordinate_channels`, and
+  used by `GDB.to_geoh5` to pick each line's coordinate channels
+  automatically wherever the registry confirms them.
 
 **Correction — actually [CONFIRMED] universal across all 22 real files,
 not the patterned absence previously documented here.** An earlier

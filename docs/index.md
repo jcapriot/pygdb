@@ -20,7 +20,11 @@ Desktop, or the free Geosoft Viewer) was installed, imported, or
 executed at any point in producing this library. See
 [Provenance](provenance/index.md) for the full research trail.
 
-Reading only — writing or mutating `.gdb`/`.grd` files is out of scope.
+Reading only — writing or mutating `.gdb`/`.grd` files (Geosoft's own
+proprietary formats) is out of scope. Exporting what's been read into a
+different, openly-specified format is a separate concern and *is*
+supported -- see [Exporting to xarray](#exporting-to-xarray) and
+[Exporting to geoh5](#exporting-to-geoh5) below.
 
 ## Installation
 
@@ -50,6 +54,8 @@ db = GDB("example.gdb")
 
 db.compression          # CompressionInfo(code=0, name='DB_COMP_NONE', ...)
 db.coordinate_systems    # ['NAD83 / UTM zone 11N', 'WGS 84'] (best-effort, may be [])
+db.coordinate_channels   # {'X': 'Easting', 'Y': 'Northing', 'Z': None} (from the
+                         #  file's own internal registry, may be all-None)
 
 db.line_names[:5]        # ['L1000', 'L1001', 'L1010', 'L1020', 'L1030']
 db.channels_on_line("L1000")  # channels that actually have data on this line
@@ -99,6 +105,49 @@ as `"name[1]"` rather than silently overwriting the first, with a
 warning explaining why. `xarray` is an optional dependency, imported
 only when `to_xarray()` is actually called -- importing `pygdb` itself
 never needs it.
+
+## Exporting to geoh5
+
+```sh
+pip install python-gdb[geoh5]
+```
+
+```python
+db.to_geoh5("survey.geoh5")   # whole file -> one geoh5py.Workspace
+```
+
+Unlike `to_xarray` (one line, in memory), this is whole-file and writes
+directly to disk: one `Points` object per line (only for lines that
+have real data), grouped under one `ContainerGroup` named after the
+`.gdb` file. Each line's vertices come from an `x_channel=`/`y_channel=`
+pair, left unset by default -- which first tries `db.coordinate_channels`
+(the file's own internal registry of which real channel plays the X/Y/Z
+role, confirmed present and correct on every one of this project's real
+sample files), falling back to `"Easting"`/`"Northing"` only when that
+registry doesn't confirm a role. Pass an explicit channel name to
+override both. A line missing its resolved X or Y channel is skipped
+entirely, with a warning, rather than guessed at. `z_channel=` works the
+same way, except unresolved (no registry match, no fallback) just means
+every vertex gets `Z = 0.0` -- a missing elevation channel is normal
+and never blocks export.
+
+A VA/array channel is exported as one `Data` entry per column
+(`"name[0]"`, `"name[1]"`, ...), tied back together with a
+`PropertyGroup` named after the channel -- `.geoh5` has no `Data` type
+that holds more than one value per vertex, so this mirrors the same
+"one value per gate, grouped" pattern `geoh5py`'s own built-in survey
+types use internally for multi-gate data. Duplicate channel names are
+disambiguated the same way `to_xarray` does (`"name[1]"`, with a
+warning), and a channel that decodes to a different row count than its
+line's vertex count is skipped (that channel only), since `.geoh5`
+`Data` must match its object's vertex count exactly -- there's no
+per-channel-dimension escape hatch the way xarray has.
+
+Coordinate-system/CRS export isn't attempted: `db.coordinate_systems`
+only returns best-effort names, not real EPSG codes or projection
+definitions, which isn't enough to populate `.geoh5`'s CRS metadata
+correctly. `geoh5py` is an optional dependency, imported only when
+`to_geoh5()` is actually called.
 
 ## Optional Rust-accelerated backend
 
