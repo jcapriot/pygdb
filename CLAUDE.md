@@ -34,6 +34,25 @@ recorded and the scope kept narrow — not assumed as standing access.
 holds regardless of how many files changed or how confident the
 change is.
 
+## Docstrings
+
+Python docstrings (`pygdb/*.py`) use **numpydoc** style — `Parameters`,
+`Returns`/`Yields`, `Raises`, `Warns`, `Attributes` (for dataclasses),
+`Examples`, and `Notes` sections, per the
+[numpydoc format](https://numpydoc.readthedocs.io/en/latest/format.html).
+`Notes` is this project's catch-all for the extended rationale/
+provenance prose this codebase tends to accumulate (confidence
+markers, real-file citations, performance numbers, rejected
+alternatives) — mechanical facts (parameters, return values, raised
+exceptions, emitted warnings) belong in their own proper sections
+instead of being folded into prose. This applies to every docstring
+that exists; a genuinely public function/property/method without one
+should get a new one, but an already-undocumented private
+(`_`-prefixed) helper doesn't need one added just for this pass. Rust
+doc comments (`rust/src/lib.rs`) and test docstrings (`tests/*.py`)
+are out of scope for numpydoc — the former isn't a Python convention,
+the latter is prose about test intent, not an API surface.
+
 ## Rust (`rust/src/lib.rs`)
 
 **No `unsafe` blocks, ever — including when it would be faster.** If a

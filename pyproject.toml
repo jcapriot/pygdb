@@ -40,6 +40,7 @@ classifiers = [
 [project.optional-dependencies]
 docs = [
     "zensical",
+    "mkdocstrings-python",
 ]
 dev = [
     "pytest>=7.0",

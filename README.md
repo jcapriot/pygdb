@@ -141,6 +141,9 @@ zensical serve
   for the `.gdb`/`.grd` on-disk format, with a confidence rating
   (confirmed / likely / guess / unknown) on every field. Updated as
   more real example files are tested against it.
+- [`docs/reference.md`](docs/reference.md) — API reference for
+  `pygdb`'s public surface, generated from its own numpydoc-style
+  docstrings via [`mkdocstrings`](https://mkdocstrings.github.io/).
 - [`docs/contributing.md`](docs/contributing.md) — how to report bugs
   (reproducible example files welcome) and this project's hard
   boundary on reverse engineering.

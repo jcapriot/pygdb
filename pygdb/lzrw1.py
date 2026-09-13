@@ -95,27 +95,50 @@ KNOWN_MARKER = MARKER_COMPRESSED
 
 def lzrw1_decompress(data: bytes, start: int, decompressed_length: int) -> bytearray:
     """
-    Decompress exactly `decompressed_length` bytes of canonical LZRW1
-    data (Ross Williams' algorithm, no FLAG_BYTES prefix) starting at
-    `data[start:]`. Returns the decompressed bytes as a writable
-    `bytearray` -- not `bytes` -- so that a caller building a numpy array
-    on top of it (`gdb_reader._decode_numeric_or_string`) gets a
-    genuinely writable array with no extra copy, matching this reader's
-    string-decode path (see `rust/src/lib.rs`'s
-    `decode_fixed_width_strings_ucs4`). Both backends already build their
-    result in a mutable buffer internally (`bytearray`/`&mut [u8]`); the
-    only change from an earlier version of this function is returning
-    that buffer directly instead of wrapping it in an immutable `bytes`
-    on the way out, which bought nothing but an unnecessary copy.
+    Decompress canonical LZRW1 data (Ross Williams' algorithm, no
+    FLAG_BYTES prefix) starting at `data[start:]`.
 
+    Parameters
+    ----------
+    data : bytes
+        The compressed source buffer.
+    start : int
+        Offset into `data` where the LZRW1 byte stream begins.
+    decompressed_length : int
+        Exact number of bytes to produce.
+
+    Returns
+    -------
+    bytearray
+        The decompressed bytes, as a writable `bytearray` -- not
+        `bytes` -- so that a caller building a numpy array on top of
+        it (`gdb_reader._decode_numeric_or_string`) gets a genuinely
+        writable array with no extra copy, matching this reader's
+        string-decode path (see `rust/src/lib.rs`'s
+        `decode_fixed_width_strings_ucs4`). Both backends already
+        build their result in a mutable buffer internally
+        (`bytearray`/`&mut [u8]`); the only change from an earlier
+        version of this function is returning that buffer directly
+        instead of wrapping it in an immutable `bytes` on the way out,
+        which bought nothing but an unnecessary copy.
+
+    Raises
+    ------
+    IndexError
+        If `data` runs out before `decompressed_length` bytes have
+        been produced (truncated or corrupt input).
+
+    Notes
+    -----
     Dispatches to the compiled `pygdb._native` extension when it's
     available (same algorithm, ported to Rust -- see `rust/src/lib.rs`;
     ~16x faster on real DB_COMP_SPEED data, since this per-byte loop is
-    this reader's one CPU-bound hot path), falling back to the pure-Python
-    `_lzrw1_decompress_py` below when it isn't. `_native` raises
-    `IndexError` under the same truncated/corrupt-input conditions as the
-    pure-Python version, so callers (`decode_speed_chunk`) don't need to
-    know which backend produced the error.
+    this reader's one CPU-bound hot path), falling back to the
+    pure-Python `_lzrw1_decompress_py` below when it isn't. `_native`
+    raises `IndexError` under the same truncated/corrupt-input
+    conditions as the pure-Python version, so callers
+    (`decode_speed_chunk`) don't need to know which backend produced
+    the error.
     """
     if _native_ext is not None:
         return _native_ext.lzrw1_decompress(data, start, decompressed_length)
@@ -124,21 +147,38 @@ def lzrw1_decompress(data: bytes, start: int, decompressed_length: int) -> bytea
 
 def _lzrw1_decompress_py(data: bytes, start: int, decompressed_length: int) -> bytearray:
     """
-    Pure-Python reference implementation of `lzrw1_decompress` -- kept as
-    the always-available fallback when `pygdb._native` isn't built, and
-    as the documented, clean-room-derived source of truth for the
-    algorithm.
+    Pure-Python reference implementation of `lzrw1_decompress`.
 
+    Kept as the always-available fallback when `pygdb._native` isn't
+    built, and as the documented, clean-room-derived source of truth
+    for the algorithm.
+
+    Parameters
+    ----------
+    data : bytes
+        The compressed source buffer.
+    start : int
+        Offset into `data` where the LZRW1 byte stream begins.
+    decompressed_length : int
+        Exact number of bytes to produce.
+
+    Returns
+    -------
+    bytearray
+        The decompressed bytes.
+
+    Notes
+    -----
     This is a direct, literal port of the core loop in Ross Williams'
-    own public-domain `lzrw1_decompress()` (see module docstring for the
-    source URL) -- same control-word/control-bit walk, same nibble
-    packing for copy-item offset/length. The only functional change from
-    his reference is that this operates on a `bytes` object with an
-    explicit output-length stop condition instead of a fixed-size output
-    buffer, and does not skip his 4-byte FLAG_BYTES prefix (Geosoft's
-    on-disk chunks don't have it -- the equivalent flag lives in the
-    12-byte length sub-header's `marker` field instead, see
-    `decode_speed_chunk`).
+    own public-domain `lzrw1_decompress()` (see module docstring for
+    the source URL) -- same control-word/control-bit walk, same
+    nibble packing for copy-item offset/length. The only functional
+    change from his reference is that this operates on a `bytes`
+    object with an explicit output-length stop condition instead of a
+    fixed-size output buffer, and does not skip his 4-byte FLAG_BYTES
+    prefix (Geosoft's on-disk chunks don't have it -- the equivalent
+    flag lives in the 12-byte length sub-header's `marker` field
+    instead, see `decode_speed_chunk`).
     """
     p = start
     out = bytearray()
@@ -186,21 +226,50 @@ class SpeedChunk:
 
 class LZRW1DecodeError(Exception):
     """
-    Raised by `decode_speed_chunk`/`parse_chunk_header` when a Speed-mode
-    chunk can't be decoded: truncated/corrupt data, or a subtype/marker
-    this module doesn't recognize. A single, deliberately narrow
-    exception type (rather than a bare `AssertionError`/`IndexError`/
-    `struct.error` grab-bag) so callers -- notably
-    `gdb_reader.read_blob_values` -- can catch exactly this and fail
-    gracefully (return whatever was already decoded elsewhere, emit a
-    clear warning) instead of crashing. See docs/provenance/notes.md's "reader
-    robustness" notes for the design rationale; this reader is not meant
-    to hard-crash on a truncated download or an unrecognized real-world
-    variant, per an explicit engineering request from the coordinator.
+    Raised when a Speed-mode chunk can't be decoded.
+
+    Raised by `decode_speed_chunk`/`parse_chunk_header` for
+    truncated/corrupt data, or a subtype/marker this module doesn't
+    recognize. A single, deliberately narrow exception type (rather
+    than a bare `AssertionError`/`IndexError`/`struct.error`
+    grab-bag) so callers -- notably `gdb_reader.read_blob_values` --
+    can catch exactly this and fail gracefully (return whatever was
+    already decoded elsewhere, emit a clear warning) instead of
+    crashing.
+
+    Notes
+    -----
+    See docs/provenance/notes.md's "reader robustness" notes for the
+    design rationale; this reader is not meant to hard-crash on a
+    truncated download or an unrecognized real-world variant, per an
+    explicit engineering request from the coordinator.
     """
 
 
 def parse_chunk_header(data: bytes, magic_offset: int) -> SpeedChunk:
+    """
+    Parse the 28-byte chunk header starting at `data[magic_offset:]`.
+
+    Parameters
+    ----------
+    data : bytes
+        Buffer containing the chunk header (the 16-byte shared magic
+        sub-header immediately followed by the 12-byte length
+        sub-header).
+    magic_offset : int
+        Offset into `data` where the 16-byte magic sub-header starts.
+
+    Returns
+    -------
+    SpeedChunk
+        The parsed chunk header.
+
+    Raises
+    ------
+    LZRW1DecodeError
+        If fewer than 28 bytes are available from `magic_offset`
+        (truncated data).
+    """
     try:
         subtype, _reserved = struct.unpack_from("<ii", data, magic_offset + 8)
         header_start = magic_offset + 16
@@ -225,23 +294,40 @@ def parse_chunk_header(data: bytes, magic_offset: int) -> SpeedChunk:
 
 def decode_speed_chunk(data: bytes, chunk: SpeedChunk):
     """
-    Decode one DB_COMP_SPEED chunk's data -- transparently handling both
-    the LZRW1-compressed case and the stored-raw case (see module
-    docstring point 3). Raises `LZRW1DecodeError` (never a bare
-    `AssertionError`/`IndexError`) if the chunk doesn't look like a
-    real, well-formed Speed chunk (wrong subtype, implausible lengths,
-    an unrecognized marker value, or truncated payload data) -- callers
-    should catch this one type and treat it as "this chunk couldn't be
-    decoded," not as a program bug.
+    Decode one DB_COMP_SPEED chunk's data.
 
-    The compressed case always returns a writable `bytearray` (see
-    `lzrw1_decompress`). The stored-raw case returns a slice of `data`
-    itself -- a `bytearray` slice if `data` is a `bytearray` (a fresh,
-    independent, still-writable copy; slicing a mutable buffer can't
-    share storage the way immutable `bytes` slicing sometimes does), or
-    plain read-only `bytes` if `data` is `bytes`. Callers that want a
-    writable result end-to-end (`gdb_reader.read_blob_values`) pass a
-    `bytearray` in.
+    Transparently handles both the LZRW1-compressed case and the
+    stored-raw case (see module docstring point 3).
+
+    Parameters
+    ----------
+    data : bytes or bytearray
+        Buffer containing the chunk's payload.
+    chunk : SpeedChunk
+        The chunk header, as returned by `parse_chunk_header`.
+
+    Returns
+    -------
+    bytearray or bytes
+        The compressed case always returns a writable `bytearray`
+        (see `lzrw1_decompress`). The stored-raw case returns a slice
+        of `data` itself -- a `bytearray` slice if `data` is a
+        `bytearray` (a fresh, independent, still-writable copy;
+        slicing a mutable buffer can't share storage the way
+        immutable `bytes` slicing sometimes does), or plain read-only
+        `bytes` if `data` is `bytes`. Callers that want a writable
+        result end-to-end (`gdb_reader.read_blob_values`) pass a
+        `bytearray` in.
+
+    Raises
+    ------
+    LZRW1DecodeError
+        If the chunk doesn't look like a real, well-formed Speed
+        chunk (wrong subtype, implausible lengths, an unrecognized
+        marker value, or truncated payload data) -- never a bare
+        `AssertionError`/`IndexError`; callers should catch this one
+        type and treat it as "this chunk couldn't be decoded," not as
+        a program bug.
     """
     if chunk.subtype != DB_COMP_SPEED:
         raise LZRW1DecodeError(f"not a Speed chunk (subtype={chunk.subtype})")
@@ -277,14 +363,29 @@ def decode_speed_chunk(data: bytes, chunk: SpeedChunk):
 
 def find_speed_chunks(data: bytes):
     """
-    Yield SpeedChunk for every DB_COMP_SPEED (subtype==1) chunk found in
-    `data` by scanning for the shared 16-byte magic. A magic-byte match
-    too close to the end of `data` to hold a full 28-byte chunk header
-    (e.g. a truncated file, or a coincidental match inside real data
-    right before EOF -- both real, observed cases elsewhere in this
-    project) is skipped with a warning rather than raising -- this is a
-    scanning helper, not a strict decoder, so it degrades gracefully and
-    keeps looking rather than aborting the whole scan.
+    Yield every DB_COMP_SPEED (subtype==1) chunk found in `data`.
+
+    Scans for the shared 16-byte magic byte-by-byte.
+
+    Parameters
+    ----------
+    data : bytes
+        Buffer to scan.
+
+    Yields
+    ------
+    SpeedChunk
+        Each chunk found, in order of discovery.
+
+    Notes
+    -----
+    A magic-byte match too close to the end of `data` to hold a full
+    28-byte chunk header (e.g. a truncated file, or a coincidental
+    match inside real data right before EOF -- both real, observed
+    cases elsewhere in this project) is skipped with a
+    `RuntimeWarning` rather than raising -- this is a scanning helper,
+    not a strict decoder, so it degrades gracefully and keeps looking
+    rather than aborting the whole scan.
     """
     start = 0
     while True:
