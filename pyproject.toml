@@ -45,6 +45,7 @@ dev = [
     "pytest>=7.0",
     "xarray",
     "geoh5py",
+    "pandas",
 ]
 # GDB.to_xarray() -- a per-line export, lazily imported only when that
 # method is actually called (see pygdb/gdb.py), so importing pygdb
@@ -61,6 +62,13 @@ xarray = [
 # -e ".[dev]"`.
 geoh5 = [
     "geoh5py",
+]
+# GDB.to_dataframe() -- lazily imported only when that method is
+# actually called (see pygdb/gdb.py), so importing pygdb itself never
+# requires pandas. Included in `dev` too, so the full test suite
+# (which exercises this path) runs with a plain `pip install -e ".[dev]"`.
+pandas = [
+    "pandas",
 ]
 
 # pygdb is pure Python at heart (see pygdb/lzrw1.py's `_native`

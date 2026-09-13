@@ -149,6 +149,48 @@ definitions, which isn't enough to populate `.geoh5`'s CRS metadata
 correctly. `geoh5py` is an optional dependency, imported only when
 `to_geoh5()` is actually called.
 
+## Exporting to pandas
+
+```sh
+pip install python-gdb[pandas]
+```
+
+```python
+db.to_dataframe()          # whole file -> one DataFrame, all lines
+                            # concatenated, with "line"/"line_category"
+                            # columns added to tell rows apart
+db.to_dataframe("L1000")   # one line only -> no "line" column;
+                            # df.attrs has line_name/line_category/path
+                            # instead, same three keys to_xarray uses
+```
+
+A VA/array channel is exported as one column per element
+(`"name[0]"`, `"name[1]"`, ...) -- the same flattening `to_geoh5` uses,
+for the same reason: there's no natural "one cell holds an array"
+representation in a plain 2D table. Duplicate channel names are
+disambiguated the same way (`"name[1]"`, with a warning).
+
+Row-count mismatches are handled differently here than in either
+sibling export, deliberately: a channel that decodes shorter than its
+line's other channels is **padded with `NaN`** out to match (with a
+warning), not given its own dimension (`to_xarray`) or skipped
+(`to_geoh5`) -- `pandas` has no structural reason to avoid this the way
+the other two formats do, and NaN-padding a ragged column is completely
+ordinary, idiomatic pandas. A channel present on some lines but not
+others in whole-file mode needs no special handling at all: it's just
+missing from that line's own frame, and `pandas.concat`'s normal
+union-of-columns behavior NaN-fills the gap automatically.
+
+One real wrinkle worth knowing: a channel can happen to share a name
+with a column this method always adds in whole-file mode (`"line"`/
+`"line_category"`) -- confirmed real, not hypothetical (a real sample
+file has a channel literally named `"line"`). When that happens, the
+*channel's* column is renamed `"channel_<name>"` instead, with a
+warning -- `"line"` always means which survey line a row came from.
+
+`pandas` is an optional dependency, imported only when `to_dataframe()`
+is actually called.
+
 ## Optional Rust-accelerated backend
 
 The pure-Python code in `pygdb/` is always the reference implementation

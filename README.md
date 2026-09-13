@@ -24,7 +24,7 @@ executed at any point in producing it.
 Reading only — writing or mutating `.gdb`/`.grd` files (Geosoft's own
 proprietary formats) is out of scope. Exporting what's been read into a
 different, openly-specified format is a separate concern and *is*
-supported -- see `to_xarray`/`to_geoh5` below.
+supported -- see `to_xarray`/`to_geoh5`/`to_dataframe` below.
 
 ## Installation
 
@@ -74,6 +74,12 @@ and duplicate channel names come through.
 `geoh5py.Workspace` (`pip install python-gdb[geoh5]`, an optional
 dependency) — see [the docs](docs/index.md#exporting-to-geoh5) for how
 line geometry and VA/array channels come through.
+
+`db.to_dataframe()` exports the whole file (or `db.to_dataframe("L1000")`
+for just one line) to a `pandas.DataFrame` (`pip install
+python-gdb[pandas]`, an optional dependency) — see
+[the docs](docs/index.md#exporting-to-pandas) for how row-count
+mismatches and VA/array channels come through.
 
 ## Optional Rust-accelerated backend
 

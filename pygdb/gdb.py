@@ -922,3 +922,176 @@ class GDB:
                                 "description": description,
                             },
                         })
+
+    def _pad_to_length(
+        self,
+        values: np.ndarray,
+        row_count: int,
+        line_rec: LineRecord,
+        channel: ChannelRecord,
+        var_name: str,
+        pd,
+    ) -> np.ndarray:
+        """
+        Pad `values` (a decoded channel's array, or one column of an
+        array channel) out to `row_count` -- the max row count across
+        every channel on this line, the same convention `to_xarray`
+        uses for its own "give the short channel its own dimension"
+        case. `pandas` has no such escape hatch (every column in one
+        `DataFrame` shares one row count) and no such *need* for one
+        either: unlike `to_xarray` (needs consistent-length dimensions
+        for array ops) or `to_geoh5` (a `.geoh5` `Data`'s association
+        must match its object's vertex count exactly, a hard format
+        constraint, so a mismatched channel is skipped instead),
+        padding a ragged column with missing values is completely
+        ordinary, idiomatic pandas.
+
+        Goes through `pandas.Series(values).reindex(range(row_count))`
+        rather than hand-rolled `numpy` padding: reindexing to a
+        longer range introduces `NaN` (or `None`, for an object/string
+        dtype) at the new positions and upcasts the column's dtype
+        accordingly on its own, however pandas represents "missing"
+        for that particular dtype -- this needs no per-dtype logic of
+        its own here, unlike `numpy.full(..., numpy.nan)`, which would
+        raise or silently misbehave for a non-float array (e.g. a
+        string channel's fixed-width `<U{n}>` dtype).
+        """
+        if len(values) == row_count:
+            return values
+        warnings.warn(
+            f"{self.path}: line {line_rec.name!r} channel {channel.name!r} "
+            f"decoded {len(values)} row(s), expected {row_count} (the max "
+            f"across this line's channels) -- likely truncated; padding "
+            f"{var_name!r} with missing values rather than dropping the "
+            f"channel or truncating the others to match",
+            GDBParseWarning, stacklevel=3,
+        )
+        return pd.Series(values).reindex(range(row_count)).to_numpy()
+
+    def to_dataframe(self, line: Optional[LineRef] = None) -> "pd.DataFrame":
+        """
+        Build a `pandas.DataFrame` -- one row per station. Needs the
+        optional `pandas` dependency (`pip install python-gdb[pandas]`),
+        imported lazily here so importing `pygdb` itself never requires
+        it.
+
+        `line` given: scoped to that one line only, mirroring
+        `to_xarray(line)`'s exact scope. `df.attrs` gets `line_name`,
+        `line_category` (`line_rec.category_name`), and `path` -- the
+        same three keys `to_xarray`'s `Dataset.attrs` carries -- rather
+        than a `"line"` column, since every row already belongs to the
+        one given line.
+
+        `line` omitted (the default): every line with real data,
+        concatenated into one table -- `"line"`/`"line_category"`
+        columns are added so rows from different lines stay
+        distinguishable (`pandas.DataFrame.attrs` is a single,
+        frame-level dict, not one per line, so it can't hold this the
+        way single-line mode's `df.attrs` does). A real channel can
+        collide with one of these two reserved names -- confirmed real,
+        not hypothetical: a real Ontario sample file has a channel
+        literally named `"line"` -- in which case the *channel's* own
+        column is renamed `f"channel_{name}"` (with a `GDBParseWarning`)
+        rather than silently overwriting the reserved column every
+        whole-file caller relies on to tell rows apart.
+
+        A VA/array channel (docs/spec.md section 5) is exported as one
+        column per element, `f"{name}[{j}]"` for `j` in
+        `range(array_width)` -- the same flattening `to_geoh5` uses,
+        for the same reason: there's no natural "one cell holds an
+        array" representation in a plain 2D table.
+
+        If two channels share a name and both have data on a line, the
+        second (and any later) occurrence's column is disambiguated as
+        `f"{name}[{occurrence}]"`, identical numbering to `to_xarray`/
+        `to_geoh5` (see `_disambiguate_names`), with a `GDBParseWarning`.
+
+        If channels on one line don't all decode to the same row count
+        (a truncated/corrupt file), the short channel's column is
+        padded with missing values out to the max row count across
+        that line's channels, rather than being dropped or forcing
+        other channels to truncate to match -- see `_pad_to_length`'s
+        docstring for why padding, specifically, is the right default
+        here where it wasn't for `to_xarray`/`to_geoh5`. Also raises a
+        `GDBParseWarning`. A channel entirely absent on one line in
+        whole-file mode (present on some lines, not others -- a
+        normal, sparse case, docs/spec.md section 1) needs no special
+        handling here: it's simply missing from that line's own
+        per-line frame, and `pandas.concat`'s ordinary union-of-columns
+        behavior fills the gap with missing values across the whole
+        table -- no warning, since a channel simply not being on a
+        line is the format's normal baseline, not a sign of trouble.
+        """
+        try:
+            import pandas as pd
+        except ImportError as e:
+            raise ImportError(
+                "to_dataframe() needs the optional 'pandas' dependency -- "
+                "install with `pip install python-gdb[pandas]`"
+            ) from e
+
+        whole_file = line is None
+        line_recs = self.lines if whole_file else [self._resolve_line(line)]
+
+        frames = []
+        for line_rec in line_recs:
+            pairs = self._channels_with_data_on_line(line_rec)
+            if not pairs:
+                continue
+
+            decoded = [
+                (c, read_blob_values(
+                    self.path, blob, c,
+                    comp_level=self.comp_level or 0, page_size=self.page_size,
+                    file=self._file,
+                ))
+                for c, blob in pairs
+            ]
+            row_count = max((len(values) for _c, values in decoded), default=0)
+
+            columns: Dict[str, object] = {}
+            if whole_file:
+                columns["line"] = [line_rec.name] * row_count
+                columns["line_category"] = [line_rec.category_name] * row_count
+
+            for var_name, c, values in self._disambiguate_names(line_rec, decoded):
+                if var_name in columns:
+                    # A real channel can collide with "line"/"line_category"
+                    # (confirmed real: a real Ontario file has a channel
+                    # literally named "line") -- caught here generically,
+                    # not just for those two names, since any future
+                    # reserved column would hit the same hazard. Rename the
+                    # channel's own column rather than silently letting it
+                    # overwrite the reserved one.
+                    original = var_name
+                    var_name = f"channel_{var_name}"
+                    warnings.warn(
+                        f"{self.path}: line {line_rec.name!r} has a channel "
+                        f"named {original!r}, which collides with a column "
+                        f"name this method already uses -- using {var_name!r} "
+                        f"for this channel's own data instead",
+                        GDBParseWarning, stacklevel=2,
+                    )
+                if c.is_array:
+                    for j in range(c.array_width):
+                        columns[f"{var_name}[{j}]"] = self._pad_to_length(
+                            values[:, j], row_count, line_rec, c, f"{var_name}[{j}]", pd,
+                        )
+                else:
+                    columns[var_name] = self._pad_to_length(
+                        values, row_count, line_rec, c, var_name, pd,
+                    )
+            frames.append(pd.DataFrame(columns))
+
+        if not frames:
+            return pd.DataFrame()
+
+        df = pd.concat(frames, ignore_index=True)
+        if not whole_file:
+            line_rec = line_recs[0]
+            df.attrs = {
+                "line_name": line_rec.name,
+                "line_category": line_rec.category_name,
+                "path": self.path,
+            }
+        return df

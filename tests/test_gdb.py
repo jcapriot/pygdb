@@ -4,6 +4,7 @@ Unit tests for the pygdb.GDB high-level facade.
 
 from __future__ import annotations
 
+import numpy as np
 import numpy.testing as npt
 import pytest
 
@@ -812,3 +813,151 @@ def test_gdb_to_geoh5_raises_import_error_with_install_hint(geoh5_db, monkeypatc
     monkeypatch.setitem(__import__("sys").modules, "geoh5py", None)
     with pytest.raises(ImportError, match=r"pip install python-gdb\[geoh5\]"):
         geoh5_db.to_geoh5(str(tmp_path / "out.geoh5"))
+
+
+# -- GDB.to_dataframe -------------------------------------------------------
+
+
+def test_gdb_to_dataframe_whole_file_scalar_and_array_channels(db):
+    """
+    Whole-file mode (default): every populated line concatenated, with
+    "line"/"line_category" columns added. L100 has real Depths data;
+    L200 has none at all -- confirms a channel entirely absent on one
+    line gets NaN-filled there by pandas.concat's own union-of-columns
+    behavior, while Fiducial/Easting (present on both lines) stay
+    real, non-NaN values throughout.
+    """
+    df = db.to_dataframe()
+
+    assert set(df.columns) == {
+        "line", "line_category", "Fiducial", "Easting",
+        "Depths[0]", "Depths[1]", "Depths[2]",
+    }
+    assert len(df) == 5  # 3 rows from L100 + 2 from L200
+
+    l100 = df[df["line"] == "L100"].reset_index(drop=True)
+    assert list(l100["line_category"]) == ["NORMAL"] * 3
+    npt.assert_array_equal(l100["Fiducial"], [1, 2, 3])
+    npt.assert_array_equal(l100["Easting"], [100.0, 100.5, 101.0])
+    npt.assert_array_equal(
+        l100[["Depths[0]", "Depths[1]", "Depths[2]"]].to_numpy(),
+        [[0.0, 1.5, 3.0], [4.5, 6.0, 7.5], [9.0, 10.5, 12.0]],
+    )
+
+    l200 = df[df["line"] == "L200"].reset_index(drop=True)
+    npt.assert_array_equal(l200["Fiducial"], [10, 11])
+    npt.assert_array_equal(l200["Easting"], [200.0, 200.5])
+    assert l200[["Depths[0]", "Depths[1]", "Depths[2]"]].isna().all().all()
+
+
+def test_gdb_to_dataframe_single_line_has_no_line_columns_but_sets_attrs(db):
+    df = db.to_dataframe("L100")
+
+    assert "line" not in df.columns
+    assert "line_category" not in df.columns
+    assert set(df.columns) == {"Fiducial", "Easting", "Depths[0]", "Depths[1]", "Depths[2]"}
+    npt.assert_array_equal(df["Fiducial"], [1, 2, 3])
+
+    assert df.attrs["line_name"] == "L100"
+    assert df.attrs["line_category"] == "NORMAL"
+    assert df.attrs["path"] == db.path
+
+
+def test_gdb_to_dataframe_no_data_on_line_has_no_channel_columns(db):
+    df = db.to_dataframe("L200")  # no Depths on L200
+    assert set(df.columns) == {"Fiducial", "Easting"}
+
+
+def test_gdb_to_dataframe_row_count_mismatch_pads_with_nan(tmp_path):
+    """
+    Unlike to_xarray (short channel gets its own dimension) or to_geoh5
+    (short channel is skipped), pandas pads the short channel's column
+    with NaN out to the line's max row count -- ordinary, idiomatic
+    pandas, and the only one of the three formats without a real
+    structural reason to do otherwise.
+    """
+    from pygdb import GDBParseWarning
+
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("Short", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={
+        "Fiducial": [1, 2, 3],
+        "Short": [10.0, 20.0],  # one row short of Fiducial's 3
+    })]
+    path = tmp_path / "mismatch_df.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    with pytest.warns(GDBParseWarning, match=r"Short"):
+        df = db.to_dataframe("L100")
+
+    npt.assert_array_equal(df["Fiducial"], [1, 2, 3])
+    npt.assert_array_equal(df["Short"].to_numpy(), [10.0, 20.0, np.nan])
+
+
+def test_gdb_to_dataframe_disambiguates_duplicate_channel_names(tmp_path):
+    from pygdb import GDBParseWarning
+
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("Dup", dtype_code=5),
+        ChannelSpec("Dup", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={"Fiducial": [1, 2], "Dup": [10.0, 20.0]})]
+    path = tmp_path / "dup_df.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    with pytest.warns(GDBParseWarning, match=r"Dup"):
+        df = db.to_dataframe("L100")
+
+    assert {"Dup", "Dup[1]"} <= set(df.columns)
+    npt.assert_array_equal(df["Dup"], [10.0, 20.0])
+    npt.assert_array_equal(df["Dup[1]"], [10.0, 20.0])
+    assert db.channel(("Dup", 1)).name == "Dup"
+
+
+def test_gdb_to_dataframe_channel_named_line_does_not_clobber_the_line_column(tmp_path):
+    """
+    Regression test for a real finding, made by testing against a real
+    Ontario sample file (`MLMAG.gdb`): it has a channel literally named
+    "line", which silently overwrote the synthetic whole-file "line"
+    identity column before this was fixed. The channel's own column
+    must be renamed instead, with a warning -- the reserved "line"
+    column always means "which survey line this row is from."
+    """
+    from pygdb import GDBParseWarning
+
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("line", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={"Fiducial": [1, 2], "line": [1001.0, 1001.0]})]
+    path = tmp_path / "channel_named_line.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    with pytest.warns(GDBParseWarning, match=r"collides"):
+        df = db.to_dataframe()
+
+    assert list(df["line"]) == ["L100", "L100"]  # the real line identity, untouched
+    npt.assert_array_equal(df["channel_line"], [1001.0, 1001.0])  # the channel's own data
+
+
+def test_gdb_to_dataframe_no_lines_have_data_returns_empty_dataframe(tmp_path):
+    channels = [ChannelSpec("Fiducial", dtype_code=3)]
+    lines = [LineSpec("L100", data={})]
+    path = tmp_path / "empty_df.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    df = db.to_dataframe()
+    assert len(df) == 0
+
+
+def test_gdb_to_dataframe_raises_import_error_with_install_hint(db, monkeypatch):
+    monkeypatch.setitem(__import__("sys").modules, "pandas", None)
+    with pytest.raises(ImportError, match=r"pip install python-gdb\[pandas\]"):
+        db.to_dataframe()
