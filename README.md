@@ -51,6 +51,8 @@ db = GDB("example.gdb")
 
 db.compression           # CompressionInfo(code=0, name='DB_COMP_NONE', ...)
 db.coordinate_systems     # ['NAD83 / UTM zone 11N', 'WGS 84'] (best-effort, may be [])
+db.coordinate_channels    # {'X': 'Easting', 'Y': 'Northing', 'Z': None} (from the
+                          #  file's own internal registry, may be all-None)
 
 db.line_names[:5]         # ['L1000', 'L1001', 'L1010', 'L1020', 'L1030']
 db.channels_on_line("L1000")   # channels that actually have data on this line

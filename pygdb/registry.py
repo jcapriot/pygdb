@@ -26,9 +26,16 @@ from __future__ import annotations
 
 import re
 import warnings
-from typing import List, Optional
+from typing import Dict, Iterable, List, Optional
 
-from .gdb_reader import GDBParseWarning, check_magic, header_fields, iter_blobs, read_lines
+from .gdb_reader import (
+    GDBParseWarning,
+    check_magic,
+    header_fields,
+    iter_blobs,
+    read_channels,
+    read_lines,
+)
 
 
 def _warn(msg: str) -> None:
@@ -102,3 +109,133 @@ def find_coordinate_systems(path: str, max_real_line_slot: Optional[int] = None)
                 seen.add(name)
                 names.append(name)
     return names
+
+
+# The vendor's own published `DB_CHAN_X=0 DB_CHAN_Y=1 DB_CHAN_Z=2` enum
+# (docs/spec.md section 2), found -- on every one of the 22 real files
+# this project has tested, 100% for X/Y, 23% for Z -- as a NUL-terminated
+# key immediately followed by a second NUL-terminated string naming the
+# real channel that plays that coordinate role. See
+# docs/provenance/notes.md section 6.8b for the full derivation: this
+# sits inside the same "REG "/"VV  " administrative-blob framing
+# `find_coordinate_systems` already scans, so `find_channel_roles` walks
+# the identical blob set, just looking for a different marker.
+_CHANNEL_ROLE_KEYS = {
+    "X": b"DB_CHAN_X\x00",
+    "Y": b"DB_CHAN_Y\x00",
+    "Z": b"DB_CHAN_Z\x00",
+}
+
+
+def find_channel_roles(
+    path: str,
+    max_real_line_slot: Optional[int] = None,
+    channel_names: Optional[Iterable[str]] = None,
+) -> Dict[str, Optional[str]]:
+    """
+    Scan `path` for which real channel plays the X/Y/Z coordinate role,
+    per the file's own internal registry (docs/provenance/notes.md
+    section 6.8b) -- a directly-decodable alternative to guessing from
+    channel-naming conventions (`"Easting"`/`"Northing"` and similar
+    aren't consistent enough across real files to guess safely; see
+    `gdb.GDB.to_xarray`'s docstring for why this reader avoids that kind
+    of guess elsewhere too).
+
+    Returns `{"X": ..., "Y": ..., "Z": ...}`, always all three keys; a
+    role with no confirmed real-channel assignment (the registry key is
+    absent, its value doesn't match any real channel in `channel_names`,
+    or -- a real, confirmed case -- its value is a single blank space,
+    Oasis montaj's own "no channel assigned to this role" placeholder)
+    maps to `None` rather than being omitted, so a caller doesn't need
+    to distinguish "not found" from "found but unusable."
+
+    A real complication, found by testing (section 6.8b): this format's
+    append-only blob storage can leave *multiple, differing* stale
+    copies of the same registry key in one file when a role gets
+    re-registered (confirmed on 2 of 22 real files) -- and neither
+    "prefer the first occurrence" nor "prefer the last" resolves both
+    real cases correctly (one needs each). The robust rule used here
+    instead: collect every candidate value found for a role, and keep
+    whichever one(s) actually name a real, current channel (checked
+    against `channel_names`) -- a direct cross-check against data this
+    reader already parses, not a positional guess. If more than one
+    *different* candidate both validate as real channels (genuine
+    ambiguity -- not yet observed on any real file), this warns and
+    returns `None` for that role rather than silently picking one.
+
+    `channel_names`: the file's own real channel names, used for the
+    validation above. If not given, this calls `read_channels(path)`
+    itself (an extra table scan) -- pass `[c.name for c in
+    db.channels]` if the caller already has it, mirroring
+    `max_real_line_slot`'s own "pass it if you already have it" pattern.
+
+    Fails gracefully like `find_coordinate_systems`: a bad magic or
+    truncated header returns all-`None` with a `GDBParseWarning` rather
+    than raising.
+    """
+    with open(path, "rb") as f:
+        header = f.read(128)
+    if not check_magic(header):
+        _warn(f"{path}: does not start with the expected '!CBD' magic -- "
+              f"no channel roles")
+        return {role: None for role in _CHANNEL_ROLE_KEYS}
+    fields = header_fields(header)
+    chans_max = fields["chans_max"]
+    page_size = fields["page_size"]
+    if chans_max is None or not page_size:
+        _warn(f"{path}: header too short to read chans_max/page_size -- "
+              f"no channel roles")
+        return {role: None for role in _CHANNEL_ROLE_KEYS}
+
+    if max_real_line_slot is None:
+        lines = read_lines(path)
+        max_real_line_slot = max((line.index for line in lines), default=-1)
+
+    if channel_names is None:
+        channel_names = {c.name for c in read_channels(path)}
+    else:
+        channel_names = set(channel_names)
+
+    candidates: Dict[str, List[str]] = {role: [] for role in _CHANNEL_ROLE_KEYS}
+    with open(path, "rb") as f:
+        for blob in iter_blobs(path):
+            line_slot, _channel_slot = blob.line_channel(chans_max)
+            if line_slot <= max_real_line_slot:
+                continue  # a real survey line's data, not administrative metadata
+            f.seek(blob.offset)
+            # Read the blob's own full declared extent, not a fixed-size
+            # probe: unlike `find_coordinate_systems`'s IPJ name marker
+            # (confirmed to sit near the start of its blob), a real file
+            # was found where `DB_CHAN_X` sits 20096 bytes into a
+            # 32768-byte blob -- comfortably past a `_PROBE_SIZE=2000`
+            # window, which would silently miss it. Capped well above
+            # any real blob size seen in this project's corpus (largest
+            # ~16KB decompressed per the Rust-plan notes) purely as a
+            # guard against a corrupt/absurd `n_pages` value, not a
+            # tuned-to-real-data limit the way `_PROBE_SIZE` is.
+            blob_size = min(blob.n_pages * page_size, 50_000_000)
+            chunk = f.read(blob_size)
+            for role, key in _CHANNEL_ROLE_KEYS.items():
+                idx = chunk.find(key)
+                if idx == -1:
+                    continue
+                start = idx + len(key)
+                end = chunk.find(b"\x00", start)
+                if end == -1:
+                    continue  # truncated read -- the value ran past the probe window
+                candidates[role].append(chunk[start:end].decode("ascii", errors="replace"))
+
+    roles: Dict[str, Optional[str]] = {}
+    for role, values in candidates.items():
+        valid = {v for v in values if v in channel_names}
+        if len(valid) > 1:
+            _warn(
+                f"{path}: found {len(valid)} different real channels "
+                f"registered for the {role} coordinate role ({sorted(valid)!r}) "
+                f"across stale/duplicate registry entries -- ambiguous, not "
+                f"using any of them"
+            )
+            roles[role] = None
+        else:
+            roles[role] = next(iter(valid), None)
+    return roles

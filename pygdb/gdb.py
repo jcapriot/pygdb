@@ -32,7 +32,7 @@ from .gdb_reader import (
     read_channels,
     read_lines,
 )
-from .registry import find_coordinate_systems
+from .registry import find_channel_roles, find_coordinate_systems
 
 # docs/spec.md section 7
 _DB_COMP_NAMES = {
@@ -127,6 +127,7 @@ class GDB:
         self._lines_by_name: Optional[Dict[str, List[LineRecord]]] = None
         self._blob_index: Optional[Dict[Tuple[int, int], BlobHeader]] = None
         self._coordinate_systems: Optional[List[str]] = None
+        self._coordinate_channels: Optional[Dict[str, Optional[str]]] = None
 
     def __repr__(self) -> str:
         return f"GDB({self.path!r})"
@@ -184,6 +185,31 @@ class GDB:
                 self.path, max_real_line_slot=max_real_line_slot
             )
         return self._coordinate_systems
+
+    @property
+    def coordinate_channels(self) -> Dict[str, Optional[str]]:
+        """
+        Which real channel plays the X/Y/Z coordinate role, per this
+        file's own internal registry (docs/provenance/notes.md section
+        6.8b) -- a directly-decodable alternative to guessing from
+        channel-naming conventions. Always `{"X": ..., "Y": ..., "Z":
+        ...}`; a role this file's registry doesn't confirm a real
+        channel for (absent entirely, or a real but ambiguous/blank
+        entry -- see `find_channel_roles`) is `None`, not omitted.
+
+        Confirmed present and correctly resolvable on every one of this
+        project's 22 real sample files for X/Y (100%), 2 of 22 for Z --
+        `to_geoh5` uses this as its coordinate-channel default, falling
+        back to `"Easting"`/`"Northing"` only when a role isn't
+        confirmed here.
+        """
+        if self._coordinate_channels is None:
+            max_real_line_slot = max((line.index for line in self.lines), default=-1)
+            self._coordinate_channels = find_channel_roles(
+                self.path, max_real_line_slot=max_real_line_slot,
+                channel_names=self.channel_names,
+            )
+        return self._coordinate_channels
 
     # -- channels / lines ----------------------------------------------------
 
@@ -688,8 +714,8 @@ class GDB:
         self,
         path: str,
         *,
-        x_channel: str = "Easting",
-        y_channel: str = "Northing",
+        x_channel: Optional[str] = None,
+        y_channel: Optional[str] = None,
         z_channel: Optional[str] = None,
     ) -> None:
         """
@@ -707,18 +733,24 @@ class GDB:
         natural unit is one file holding a whole survey's worth of named
         objects, not one line at a time.
 
-        **Vertex geometry**: `x_channel`/`y_channel` (default
-        `"Easting"`/`"Northing"`, matching this project's own validated
-        real sample corpus, but fully overridable for a file that uses
-        different names) provide each line's `Points.vertices`; a line
-        missing either is **skipped entirely** (no `Points` object
-        created for it), with a `GDBParseWarning`, rather than guessed
-        at or defaulted to `(0, 0)` -- this reader never guesses what a
-        channel means (see `to_xarray`'s docstring), only defaults for
-        the common case. `z_channel` is optional: `None` (the default)
-        or simply absent on a given line means every vertex gets `Z =
-        0.0` -- unlike a missing X/Y, a missing elevation channel is
-        normal and shouldn't block export.
+        **Vertex geometry**: `x_channel`/`y_channel`/`z_channel` name
+        the channels providing each line's `Points.vertices`. Left
+        unset (`None`, the default for all three), this first tries
+        `self.coordinate_channels` -- this file's own internal
+        registry of which real channel plays which coordinate role
+        (docs/provenance/notes.md section 6.8b), directly decoded, not
+        guessed -- confirmed present and correct on 100% of this
+        project's real sample corpus for X/Y. Only when that registry
+        doesn't confirm a role does this fall back to the literal names
+        `"Easting"`/`"Northing"` (X/Y) or no channel at all (Z, meaning
+        every vertex gets `Z = 0.0`). Passing an explicit channel name
+        always wins over both. A line missing its resolved X or Y
+        channel is **skipped entirely** (no `Points` object created for
+        it), with a `GDBParseWarning`, rather than guessed at or
+        defaulted to `(0, 0)` -- this reader never guesses what a
+        channel means when it can't confirm one (see `to_xarray`'s
+        docstring); a missing Z, by contrast, is normal and never
+        blocks export.
 
         **Array/VA channels** (docs/spec.md section 5): `.geoh5` (per
         `geoh5py`, checked directly against its real `data/` module
@@ -770,6 +802,15 @@ class GDB:
         from geoh5py.groups import ContainerGroup
         from geoh5py.objects import Points
         from geoh5py.workspace import Workspace
+
+        if x_channel is None or y_channel is None or z_channel is None:
+            detected = self.coordinate_channels
+            if x_channel is None:
+                x_channel = detected["X"] or "Easting"
+            if y_channel is None:
+                y_channel = detected["Y"] or "Northing"
+            if z_channel is None:
+                z_channel = detected["Z"]  # stays None (all-zero Z) if unconfirmed
 
         with Workspace(path, mode="a") as ws:
             file_group = ws.create_entity(ContainerGroup, entity={"name": Path(self.path).stem})

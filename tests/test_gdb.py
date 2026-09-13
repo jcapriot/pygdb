@@ -82,6 +82,16 @@ def test_gdb_coordinate_systems_empty_when_none_present(db):
     assert db.coordinate_systems == []
 
 
+def test_gdb_coordinate_channels_all_none_when_no_registry_present(db):
+    """
+    The shared `db` fixture has no injected REG/IPJ registry content, so
+    `coordinate_channels` (docs/provenance/notes.md section 6.8b) should
+    resolve nothing -- same "empty/None means not present, not a bug"
+    contract as `coordinate_systems`.
+    """
+    assert db.coordinate_channels == {"X": None, "Y": None, "Z": None}
+
+
 def test_gdb_channels_on_line_reflects_sparse_grid(db):
     assert set(db.channels_on_line("L100")) == {"Fiducial", "Easting", "Depths"}
     assert set(db.channels_on_line("L200")) == {"Fiducial", "Easting"}
@@ -728,6 +738,74 @@ def test_gdb_to_geoh5_custom_xy_channel_names(tmp_path):
     with _open_geoh5(out) as ws:
         points = ws.root.children[0].children[0]
         npt.assert_array_equal(points.vertices[:, :2], [[10.0, 20.0], [11.0, 21.0]])
+
+
+def _inject_channel_role_blob(data: bytes, blob_index: int, role: str, value: str, page_size: int) -> bytes:
+    """See tests/test_registry.py's identical helper for the byte-shape
+    rationale (docs/provenance/notes.md section 6.8b)."""
+    marker = f"DB_CHAN_{role}".encode("ascii") + b"\x00" + value.encode("ascii") + b"\x00"
+    body = marker + b"\x00" * 40
+    blob_bytes = bytearray(pack_plain_blob(blob_index, [], dtype_code=5, page_size=page_size))
+    blob_bytes[48:48 + len(body)] = body
+    return bytes(data) + bytes(blob_bytes)
+
+
+def test_gdb_to_geoh5_uses_registry_channel_roles_when_not_overridden(tmp_path):
+    """
+    docs/provenance/notes.md section 6.8b: when a file's own internal
+    registry confirms which channel plays the X/Y role, `to_geoh5`
+    should use it automatically -- deliberately using channel names
+    ("MyX"/"MyY") that don't match the "Easting"/"Northing" hardcoded
+    fallback at all, so this only passes if the registry lookup is
+    actually driving the result, not coincidentally matching a default.
+    """
+    channels = [
+        ChannelSpec("MyX", dtype_code=5),
+        ChannelSpec("MyY", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={"MyX": [5.0, 6.0], "MyY": [7.0, 8.0]})]
+    page_size = 256
+    data = build_gdb_bytes(channels, lines, page_size=page_size)
+    data = _inject_channel_role_blob(data, 50 * len(channels), "X", "MyX", page_size)
+    data = _inject_channel_role_blob(data, 51 * len(channels), "Y", "MyY", page_size)
+    path = tmp_path / "registry_xy.gdb"
+    path.write_bytes(data)
+    db = GDB(str(path))
+
+    out = tmp_path / "out.geoh5"
+    db.to_geoh5(str(out))  # no x_channel/y_channel given
+
+    with _open_geoh5(out) as ws:
+        points = ws.root.children[0].children[0]
+        npt.assert_array_equal(points.vertices[:, :2], [[5.0, 7.0], [6.0, 8.0]])
+
+
+def test_gdb_to_geoh5_explicit_channel_overrides_registry(tmp_path):
+    """An explicitly-passed x_channel/y_channel must win over whatever
+    the registry confirms, not just over the hardcoded fallback."""
+    channels = [
+        ChannelSpec("MyX", dtype_code=5),
+        ChannelSpec("MyY", dtype_code=5),
+        ChannelSpec("OtherX", dtype_code=5),
+        ChannelSpec("OtherY", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={
+        "MyX": [5.0], "MyY": [7.0], "OtherX": [50.0], "OtherY": [70.0],
+    })]
+    page_size = 256
+    data = build_gdb_bytes(channels, lines, page_size=page_size)
+    data = _inject_channel_role_blob(data, 50 * len(channels), "X", "MyX", page_size)
+    data = _inject_channel_role_blob(data, 51 * len(channels), "Y", "MyY", page_size)
+    path = tmp_path / "registry_override.gdb"
+    path.write_bytes(data)
+    db = GDB(str(path))
+
+    out = tmp_path / "out.geoh5"
+    db.to_geoh5(str(out), x_channel="OtherX", y_channel="OtherY")
+
+    with _open_geoh5(out) as ws:
+        points = ws.root.children[0].children[0]
+        npt.assert_array_equal(points.vertices[:, :2], [[50.0, 70.0]])
 
 
 def test_gdb_to_geoh5_raises_import_error_with_install_hint(geoh5_db, monkeypatch, tmp_path):

@@ -54,6 +54,8 @@ db = GDB("example.gdb")
 
 db.compression          # CompressionInfo(code=0, name='DB_COMP_NONE', ...)
 db.coordinate_systems    # ['NAD83 / UTM zone 11N', 'WGS 84'] (best-effort, may be [])
+db.coordinate_channels   # {'X': 'Easting', 'Y': 'Northing', 'Z': None} (from the
+                         #  file's own internal registry, may be all-None)
 
 db.line_names[:5]        # ['L1000', 'L1001', 'L1010', 'L1020', 'L1030']
 db.channels_on_line("L1000")  # channels that actually have data on this line
@@ -117,12 +119,17 @@ db.to_geoh5("survey.geoh5")   # whole file -> one geoh5py.Workspace
 Unlike `to_xarray` (one line, in memory), this is whole-file and writes
 directly to disk: one `Points` object per line (only for lines that
 have real data), grouped under one `ContainerGroup` named after the
-`.gdb` file. Each line's vertices come from an `Easting`/`Northing`
-channel pair by default (`x_channel=`/`y_channel=` to override, for a
-file that names them differently); a line missing either is skipped
-entirely, with a warning, rather than guessed at. `z_channel=` is
-optional -- unset (the default) or simply absent on a given line means
-every vertex gets `Z = 0.0`.
+`.gdb` file. Each line's vertices come from an `x_channel=`/`y_channel=`
+pair, left unset by default -- which first tries `db.coordinate_channels`
+(the file's own internal registry of which real channel plays the X/Y/Z
+role, confirmed present and correct on every one of this project's real
+sample files), falling back to `"Easting"`/`"Northing"` only when that
+registry doesn't confirm a role. Pass an explicit channel name to
+override both. A line missing its resolved X or Y channel is skipped
+entirely, with a warning, rather than guessed at. `z_channel=` works the
+same way, except unresolved (no registry match, no fallback) just means
+every vertex gets `Z = 0.0` -- a missing elevation channel is normal
+and never blocks export.
 
 A VA/array channel is exported as one `Data` entry per column
 (`"name[0]"`, `"name[1]"`, ...), tied back together with a
