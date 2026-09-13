@@ -128,9 +128,12 @@ option — `abi3t` only exists from 3.15 onward).
 ## Documentation
 
 Full documentation — the format specification, usage, contributing
-guide, and research provenance — lives under [`docs/`](docs/index.md)
-and is built with [Zensical](https://zensical.org/). To view it
-locally:
+guide, and research provenance — is published at
+**[jcapriot.github.io/pygdb](https://jcapriot.github.io/pygdb/)**,
+built from [`docs/`](docs/index.md) with [Zensical](https://zensical.org/)
+(published on every GitHub Release — see
+[`.github/workflows/docs.yml`](.github/workflows/docs.yml)). To view a
+work-in-progress version locally instead:
 
 ```sh
 pip install -e ".[docs]"

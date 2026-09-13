@@ -2,6 +2,7 @@
 site_name = "pygdb"
 site_description = "A clean-room Python reader for Geosoft .gdb database and .grd grid files"
 site_author = "Joseph Capriotti"
+site_url = "https://jcapriot.github.io/pygdb/"
 docs_dir = "docs"
 
 nav = [
