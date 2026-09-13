@@ -24,6 +24,8 @@ from .gdb_reader import (
     BlobHeader,
     ChannelRecord,
     GDBParseWarning,
+    GS_TYPE_DUMMY_VALUE,
+    GS_TYPE_NUMPY_DTYPE,
     LineRecord,
     check_magic,
     header_fields,
@@ -570,20 +572,37 @@ class GDB:
         """
         Yield `(var_name, channel, values)` for every `(channel, values)`
         pair in `decoded`, disambiguating any channel name shared by more
-        than one populated channel on this line -- shared by `to_xarray`
-        and `to_geoh5`, which both need the exact same numbering so a
-        name collision resolves identically (and matches `channel()`'s
-        own `(name, occurrence)` numbering) regardless of export format.
+        than one channel **in this file's channel table** -- shared by
+        `to_xarray`, `to_geoh5`, and `to_dataframe`, which all need the
+        exact same numbering so a name collision resolves identically
+        (and matches `channel()`'s own `(name, occurrence)` numbering)
+        regardless of export format or which line is being processed.
 
-        For a name shared by more than one populated channel (confirmed
-        structurally possible, though never yet observed with data on
-        both -- see `channel()`'s docstring), every occurrence after the
-        first is disambiguated as `f"{name}[{occurrence}]"`, `occurrence`
-        being the same 0-based index into every channel sharing that
-        name (in `.channels` order) that `channel()`'s `(name,
-        occurrence)` form uses. Raises a `GDBParseWarning` when this
-        actually triggers, since a caller not expecting a
-        bracket-suffixed name should be told why one showed up.
+        A channel's `var_name` is resolved **file-wide**, not per line:
+        for a name shared by more than one channel anywhere in
+        `self.channels` (confirmed structurally possible -- see
+        `channel()`'s docstring), the first (lowest-`occurrence`) one
+        keeps the bare name and every other gets `f"{name}[{occurrence}]"`,
+        `occurrence` being the same 0-based index into every channel
+        sharing that name (in `.channels` order) that `channel()`'s
+        `(name, occurrence)` form uses. This is deliberately **not**
+        "only if a sibling with the same name also has data on this
+        specific line": a per-line rule would let the same channel
+        resolve to a bare name on one line and a bracket-suffixed name
+        on another (whichever sibling happens to be populated there),
+        which is both unstable across calls and, worse, leaves a caller
+        looking at a bare, unsuffixed name with no way to tell *which*
+        of the file's same-named channels they're actually looking at.
+        Resolving once, file-wide, means a given `ChannelRecord` always
+        exports under the same `var_name` everywhere -- including a
+        line where its same-named sibling has no data at all -- so
+        `to_geoh5`/`to_dataframe`'s whole-file modes (which call this
+        once per line) can't end up naming the same channel differently
+        depending on which line is being processed. Raises a
+        `GDBParseWarning` whenever a channel with a file-wide duplicate
+        has data on a line, regardless of whether its sibling does too,
+        since a caller not expecting a bracket-suffixed name should be
+        told why one showed up.
 
         `stacklevel=3` here (rather than the usual `2`) accounts for
         this being a generator a caller iterates via a `for` loop --
@@ -593,34 +612,68 @@ class GDB:
         if self._channels_by_name is None:
             self.channels  # populate the cache (for occurrence numbering)
 
-        name_counts: Dict[str, int] = {}
-        for c, _values in decoded:
-            name_counts[c.name] = name_counts.get(c.name, 0) + 1
-
-        seen_so_far: Dict[str, int] = {}
         for c, values in decoded:
-            seen_so_far[c.name] = seen_so_far.get(c.name, 0) + 1
-            if name_counts[c.name] > 1:
-                occurrence = self._channels_by_name[c.name].index(c)
-                var_name = c.name if seen_so_far[c.name] == 1 else f"{c.name}[{occurrence}]"
+            siblings = self._channels_by_name[c.name]
+            if len(siblings) > 1:
+                occurrence = siblings.index(c)
+                var_name = c.name if occurrence == 0 else f"{c.name}[{occurrence}]"
                 warnings.warn(
-                    f"{self.path}: line {line_rec.name!r} has {name_counts[c.name]} "
-                    f"channels named {c.name!r} with data -- using {var_name!r} "
-                    f"for occurrence {occurrence} (pass (name, occurrence) to "
-                    f"channel() for the same numbering)",
+                    f"{self.path}: line {line_rec.name!r}: channel {c.name!r} "
+                    f"is one of {len(siblings)} channels sharing that name in "
+                    f"this file's channel table -- using {var_name!r} for "
+                    f"occurrence {occurrence} (pass (name, occurrence) to "
+                    f"channel() for the same numbering), regardless of "
+                    f"whether the others also have data on this line",
                     GDBParseWarning, stacklevel=3,
                 )
             else:
                 var_name = c.name
             yield var_name, c, values
 
-    def to_xarray(self, line: LineRef) -> "xr.Dataset":
+    def to_xarray(self, line: Optional[LineRef] = None) -> "xr.Dataset":
         """
-        Build an `xarray.Dataset` for every channel that has data on
-        `line` -- one data variable per channel, sharing a common
-        `"station"` dimension. Needs the optional `xarray` dependency
-        (`pip install python-gdb[xarray]`), imported lazily here so
-        importing `pygdb` itself never requires it.
+        Build an `xarray.Dataset`. Needs the optional `xarray`
+        dependency (`pip install python-gdb[xarray]`), imported lazily
+        here so importing `pygdb` itself never requires it.
+
+        `line` given: one data variable per channel that has data on
+        that line, sharing a common `"station"` dimension -- see
+        `_to_xarray_one_line`'s docstring for the full single-line
+        behavior (array-channel `_bin` dimensions, the `_station`
+        dimension-splitting escape hatch for a row-count mismatch,
+        `line_name`/`line_category` attrs).
+
+        `line` omitted (the default): every line with real data,
+        stacked along a new `"line"` dimension into one `Dataset` --
+        see `_to_xarray_whole_file`'s docstring for how row-count
+        mismatches and channels missing on some lines are filled
+        (`NaN`/`""`/the channel's own Geosoft dummy value, recorded as
+        each variable's `_FillValue` attr) rather than each getting its
+        own dimension the way single-line mode does.
+
+        Either way, a channel name shared by more than one channel in
+        this file's table is disambiguated as `f"{name}[{occurrence}]"`
+        the same way, resolved **file-wide** (not per line) so a given
+        channel's variable name never depends on which line(s) are
+        being exported -- see `_disambiguate_names`.
+        """
+        try:
+            import xarray as xr
+        except ImportError as e:
+            raise ImportError(
+                "to_xarray() needs the optional 'xarray' dependency -- "
+                "install with `pip install python-gdb[xarray]`"
+            ) from e
+
+        if line is not None:
+            return self._to_xarray_one_line(self._resolve_line(line), xr)
+        return self._to_xarray_whole_file(xr)
+
+    def _to_xarray_one_line(self, line_rec: LineRecord, xr) -> "xr.Dataset":
+        """
+        `to_xarray(line)`'s single-line implementation -- one data
+        variable per channel that has data on `line_rec`, sharing a
+        common `"station"` dimension.
 
         A VA/array channel (docs/spec.md section 5) gets its own
         second dimension, `f"{name}_bin"` -- deliberately *not* shared
@@ -631,18 +684,6 @@ class GDB:
         rename dimensions yourself afterward if you know two channels
         genuinely do.
 
-        If two channels share a name and both have data on this line
-        (confirmed structurally possible -- see `channel()`'s
-        docstring -- though never yet observed with data on both), the
-        variable name for every occurrence after the first is
-        disambiguated as `f"{name}[{occurrence}]"`, `occurrence` being
-        the same 0-based index into every channel sharing that name (in
-        `.channels` order) that `channel()`'s `(name, occurrence)` form
-        uses -- so `ds["UTC[1]"]` and `db.channel(("UTC", 1))` refer to
-        the same channel. Raises a `GDBParseWarning` when this actually
-        triggers, since a caller not expecting a bracket-suffixed
-        variable name should be told why one showed up.
-
         If channels on this line don't all decode to the same row
         count (a truncated/corrupt file -- truncation only ever
         shortens a channel, never lengthens it), the *shorter*
@@ -651,7 +692,7 @@ class GDB:
         short channel gets its own first dimension, `f"{name}_station"`,
         instead of the shared `"station"` (the same "give it its own
         dimension rather than lose data to fit one" principle as the
-        array-channel case above). Also raises a `GDBParseWarning`.
+        array-channel case above). Raises a `GDBParseWarning`.
 
         No channel is auto-promoted to a coordinate -- `"station"` is a
         bare integer range index, and every channel (however
@@ -660,15 +701,6 @@ class GDB:
         names its channels consistently enough for this reader to
         guess which one(s) you'd want without risking guessing wrong.
         """
-        try:
-            import xarray as xr
-        except ImportError as e:
-            raise ImportError(
-                "to_xarray() needs the optional 'xarray' dependency -- "
-                "install with `pip install python-gdb[xarray]`"
-            ) from e
-
-        line_rec = self._resolve_line(line)
         decoded = [
             (c, read_blob_values(
                 self.path, blob, c,
@@ -692,7 +724,7 @@ class GDB:
                     f"truncated; keeping its own {len(values)}-row dimension "
                     f"{station_dim!r} rather than cutting other channels down "
                     f"to match",
-                    GDBParseWarning, stacklevel=2,
+                    GDBParseWarning, stacklevel=3,
                 )
 
             dims = (station_dim, f"{var_name}_bin") if c.is_array else (station_dim,)
@@ -708,6 +740,156 @@ class GDB:
                 "line_category": line_rec.category_name,
                 "path": self.path,
             },
+        )
+
+    def _to_xarray_whole_file(self, xr) -> "xr.Dataset":
+        """
+        `to_xarray()`'s whole-file implementation -- every line with
+        real data, stacked along a new `"line"` dimension into one
+        `Dataset`. `"line"` is a real, indexing coordinate (`ds.sel(
+        line="L1000")`, `ds.groupby("line")`) and `"line_category"` a
+        secondary, non-indexing coordinate on the same dimension --
+        richer than a flat identifying column, since xarray has
+        first-class dimension/coordinate support a plain table doesn't.
+        Lines with no populated channels at all are skipped entirely,
+        same as `to_geoh5`/`to_dataframe`; if *no* line has any data,
+        returns a plain empty `xr.Dataset()`.
+
+        Unlike single-line mode, there's no per-channel/per-line
+        dimension-splitting escape hatch here -- an `xr.Dataset`
+        variable is one dense `(line, station[, bin])` array, so every
+        line has to share one common `"station"` length (the max
+        across every included line's own row count) and one common set
+        of channels. Both real gaps this creates -- a channel that
+        decodes shorter than its own line's other channels, and a
+        channel simply absent on some lines entirely (this format's
+        normal sparse grid, docs/spec.md section 1/6.1) -- are filled
+        with a value appropriate to that channel's own data type,
+        rather than each getting its own dimension: `NaN` for a float
+        channel, `""` for a string channel, and Geosoft's own
+        published per-type "no data" sentinel
+        (`gdb_reader.GS_TYPE_DUMMY_VALUE`) for every integer type --
+        the same convention this reader already relies on seeing as a
+        legitimate in-band "no data" marker in real decoded values
+        (e.g. `rDUMMY=-1.0E32`), not an invented placeholder. Whichever
+        fill value was actually used for a variable is recorded as that
+        variable's `_FillValue` attr -- the real CF/netCDF-convention
+        attribute name existing xarray/netCDF tooling already knows to
+        look for, so it's discoverable programmatically (`ds.to_netcdf(
+        ...)` included) rather than needing to be known out of band. A
+        genuine row-count mismatch *within* one line (not just the
+        normal cross-line variation in station count) still raises a
+        `GDBParseWarning`, the same signal single-line mode gives for
+        it, just filled instead of dimension-split.
+
+        A VA/array channel's second dimension, `f"{name}_bin"`, is
+        sized from `array_width` -- a fixed, file-wide channel-table
+        property (confirmed: a channel's definition never varies by
+        line), so unlike the station length there's no per-line width
+        to reconcile. A string channel's dtype width (`<U{n}>`) *can*
+        legitimately differ line to line, so this uses the largest `n`
+        actually decoded anywhere in the file for that channel, once.
+        """
+        line_entries = []
+        for line_rec in self.lines:
+            pairs = self._channels_with_data_on_line(line_rec)
+            if not pairs:
+                continue
+            decoded = [
+                (c, read_blob_values(
+                    self.path, blob, c,
+                    comp_level=self.comp_level or 0, page_size=self.page_size,
+                    file=self._file,
+                ))
+                for c, blob in pairs
+            ]
+            row_count = max((len(values) for _c, values in decoded), default=0)
+            line_entries.append((line_rec, decoded, row_count))
+
+        if not line_entries:
+            return xr.Dataset()
+
+        max_station = max(row_count for _lr, _d, row_count in line_entries)
+        n_lines = len(line_entries)
+
+        channel_var_names: Dict[ChannelRecord, str] = {}
+        channel_order: List[ChannelRecord] = []
+        channel_line_values: Dict[ChannelRecord, List[Tuple[int, np.ndarray]]] = {}
+
+        for line_index, (line_rec, decoded, row_count) in enumerate(line_entries):
+            for var_name, c, values in self._disambiguate_names(line_rec, decoded):
+                if len(values) != row_count:
+                    warnings.warn(
+                        f"{self.path}: line {line_rec.name!r} channel "
+                        f"{c.name!r} decoded {len(values)} row(s), expected "
+                        f"{row_count} (the max across this line's channels) "
+                        f"-- likely truncated; filling the shortfall with "
+                        f"{var_name!r}'s dummy/missing value rather than "
+                        f"cutting other channels down to match",
+                        GDBParseWarning, stacklevel=2,
+                    )
+                if var_name in ("line", "line_category"):
+                    # A real channel can collide with one of the two
+                    # reserved coordinate names (confirmed real: a real
+                    # Ontario sample file has a channel literally named
+                    # "line") -- xarray itself refuses to build a
+                    # Dataset with the same name in both data_vars and
+                    # coords, so this has to be caught here rather than
+                    # left to raise. Rename the *channel's* variable,
+                    # not the reserved coordinate every whole-file
+                    # caller relies on to select/group by line.
+                    original = var_name
+                    var_name = f"channel_{var_name}"
+                    warnings.warn(
+                        f"{self.path}: channel {original!r} collides with a "
+                        f"coordinate name this method always adds in "
+                        f"whole-file mode -- using {var_name!r} for this "
+                        f"channel's own data instead",
+                        GDBParseWarning, stacklevel=2,
+                    )
+                channel_var_names[c] = var_name
+                if c not in channel_line_values:
+                    channel_order.append(c)
+                    channel_line_values[c] = []
+                channel_line_values[c].append((line_index, values))
+
+        char_size = np.dtype("<U1").itemsize
+        data_vars = {}
+        for c in channel_order:
+            var_name = channel_var_names[c]
+            line_values = channel_line_values[c]
+            shape = (n_lines, max_station, c.array_width) if c.is_array else (n_lines, max_station)
+
+            if c.is_string:
+                fill = ""
+                global_max_len = max(
+                    (v.dtype.itemsize // char_size for _li, v in line_values), default=0,
+                )
+                arr = np.full(shape, fill, dtype=f"<U{global_max_len}")
+            else:
+                fill = GS_TYPE_DUMMY_VALUE[c.dtype_code]
+                arr = np.full(shape, fill, dtype=GS_TYPE_NUMPY_DTYPE[c.dtype_code])
+
+            for line_index, values in line_values:
+                n = min(len(values), max_station)
+                if c.is_array:
+                    arr[line_index, :n, :] = values[:n]
+                else:
+                    arr[line_index, :n] = values[:n]
+
+            dims = ("line", "station", f"{var_name}_bin") if c.is_array else ("line", "station")
+            attrs = {"type_name": c.type_name, "format_name": c.format_name, "_FillValue": fill}
+            if c.is_array:
+                attrs["array_basetype_name"] = c.array_basetype_name
+            data_vars[var_name] = (dims, arr, attrs)
+
+        return xr.Dataset(
+            data_vars,
+            coords={
+                "line": (["line"], [lr.name for lr, _d, _rc in line_entries]),
+                "line_category": (["line"], [lr.category_name for lr, _d, _rc in line_entries]),
+            },
+            attrs={"path": self.path},
         )
 
     def to_geoh5(
@@ -889,6 +1071,27 @@ class GDB:
                 for var_name, c, values in self._disambiguate_names(line_rec, decoded):
                     if c in geometry_channels:
                         continue
+                    if var_name == "line_category":
+                        # A real channel can collide with the object-
+                        # level metadata key added above (confirmed
+                        # real risk -- see the "line"/"line_category"
+                        # collisions already found in to_dataframe/
+                        # to_xarray). geoh5py's own `add_data` already
+                        # auto-renames on a name clash (so this isn't a
+                        # data-loss risk the way it was for a plain
+                        # dict/Dataset), but it does so silently -- warn
+                        # explicitly here too, for the same reason this
+                        # reader warns everywhere else a name had to
+                        # change unexpectedly.
+                        original = var_name
+                        var_name = f"channel_{var_name}"
+                        warnings.warn(
+                            f"{self.path}: line {line_rec.name!r} channel "
+                            f"{original!r} collides with the object-level "
+                            f"metadata key this method always adds -- using "
+                            f"{var_name!r} for this channel's own data instead",
+                            GDBParseWarning, stacklevel=2,
+                        )
                     if len(values) != n_vertices:
                         warnings.warn(
                             f"{self.path}: line {line_rec.name!r} channel {c.name!r} "
