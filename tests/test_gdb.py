@@ -467,6 +467,46 @@ def test_gdb_to_xarray_disambiguates_duplicate_channel_names(tmp_path):
     assert db.channel(("Dup", 1)).name == "Dup"
 
 
+def test_gdb_to_xarray_disambiguates_file_wide_even_if_only_one_occurrence_has_data(tmp_path):
+    """
+    Regression test: `_disambiguate_names` resolves a channel's
+    variable name from the file's *whole* channel table, not from which
+    of its same-named siblings happen to have data on the line being
+    exported. Two channels are named "Dup" here, but only the second
+    (occurrence 1) has any data on L100 -- under the old per-line rule
+    ("suffix only if a sibling also has data on this line"), this
+    channel would have exported as a bare "Dup", indistinguishable from
+    the file's other "Dup" channel. It must still resolve to "Dup[1]",
+    its real, stable, file-wide occurrence name.
+    """
+    from pygdb import GDBParseWarning
+
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("Dup", dtype_code=5),  # occurrence 0 -- no data anywhere
+        ChannelSpec("Dup", dtype_code=5),  # occurrence 1 -- has data on L100
+    ]
+    lines = [LineSpec("L100", data={"Fiducial": [1, 2]})]  # "Dup" omitted:
+    # LineSpec.data is keyed by name, so it can't target just one of two
+    # same-named channels -- the second occurrence's blob is appended
+    # manually below instead.
+    page_size = 64
+    data = build_gdb_bytes(channels, lines, page_size=page_size)
+    dup_occurrence_1_blob_index = 0 * len(channels) + 2  # line 0, chan_index 2
+    data += pack_plain_blob(dup_occurrence_1_blob_index, [30.0, 40.0], dtype_code=5, page_size=page_size)
+    path = tmp_path / "dup_only_second_populated.gdb"
+    path.write_bytes(data)
+    db = GDB(str(path))
+
+    with pytest.warns(GDBParseWarning, match=r"Dup"):
+        ds = db.to_xarray("L100")
+
+    assert "Dup[1]" in ds.data_vars
+    assert "Dup" not in ds.data_vars
+    npt.assert_array_equal(ds["Dup[1]"].values, [30.0, 40.0])
+    assert db.channel(("Dup", 1)).name == "Dup"
+
+
 def test_gdb_to_xarray_row_count_mismatch_gets_its_own_dimension(tmp_path):
     """
     Two channels on the same line with genuinely different row counts
@@ -506,6 +546,148 @@ def test_gdb_to_xarray_raises_import_error_with_install_hint(db, monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "xarray", None)
     with pytest.raises(ImportError, match=r"pip install python-gdb\[xarray\]"):
         db.to_xarray("L100")
+
+
+# -- GDB.to_xarray whole-file mode (to_xarray(line=None)) -------------------
+
+
+def test_gdb_to_xarray_whole_file_scalar_and_array_channels(db):
+    ds = db.to_xarray()
+
+    assert ds.sizes["line"] == 2
+    npt.assert_array_equal(ds.coords["line"].values, ["L100", "L200"])
+    npt.assert_array_equal(ds.coords["line_category"].values, ["NORMAL", "NORMAL"])
+    assert set(ds.data_vars) == {"Fiducial", "Easting", "Depths"}
+    assert ds.sizes["station"] == 3  # L100's row count, the max across both lines
+
+    l100 = ds.sel(line="L100")
+    npt.assert_array_equal(l100["Fiducial"].values, [1, 2, 3])
+    npt.assert_array_equal(
+        l100["Depths"].values, [[0.0, 1.5, 3.0], [4.5, 6.0, 7.5], [9.0, 10.5, 12.0]],
+    )
+
+    # L200 has only 2 rows and no Depths at all -- both gaps filled per
+    # dtype: Fiducial/Easting (present but short) get their own dummy
+    # in the trailing slot; Depths (absent entirely) is all dummy.
+    l200 = ds.sel(line="L200")
+    npt.assert_array_equal(l200["Fiducial"].values, [10, 11, -2147483647])
+    npt.assert_array_equal(l200["Easting"].values, [200.0, 200.5, -1.0e32])
+    assert np.all(l200["Depths"].values == -1.0e32)
+
+    assert ds["Fiducial"].attrs["_FillValue"] == -2147483647
+    assert ds["Easting"].attrs["_FillValue"] == -1.0e32
+    assert ds["Depths"].attrs["_FillValue"] == -1.0e32
+
+
+def test_gdb_to_xarray_whole_file_integer_channel_missing_on_one_line_uses_dummy_value(tmp_path):
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("Count", dtype_code=3),  # GS_LONG
+    ]
+    lines = [
+        LineSpec("L100", data={"Fiducial": [1, 2], "Count": [5, 6]}),
+        LineSpec("L200", data={"Fiducial": [10, 11]}),  # no Count at all
+    ]
+    path = tmp_path / "int_missing.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    ds = db.to_xarray()
+    assert ds["Count"].attrs["_FillValue"] == -2147483647
+    npt.assert_array_equal(ds.sel(line="L100")["Count"].values, [5, 6])
+    npt.assert_array_equal(ds.sel(line="L200")["Count"].values, [-2147483647, -2147483647])
+
+
+def test_gdb_to_xarray_whole_file_string_channel_missing_on_one_line_uses_empty_fill(tmp_path):
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("Name", dtype_code=-8, string_width=8),
+    ]
+    lines = [
+        LineSpec("L100", data={"Fiducial": [1, 2], "Name": ["ab", "wxyz"]}),  # max_len=4
+        LineSpec("L200", data={"Fiducial": [10, 11]}),  # no Name at all
+    ]
+    path = tmp_path / "str_missing.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    ds = db.to_xarray()
+    assert ds["Name"].attrs["_FillValue"] == ""
+    assert ds["Name"].dtype.kind == "U"
+    # dtype width matches the global max across every line, not just
+    # whichever line the fill happens to appear on.
+    assert ds["Name"].dtype.itemsize // np.dtype("<U1").itemsize == 4
+    npt.assert_array_equal(ds.sel(line="L100")["Name"].values, ["ab", "wxyz"])
+    npt.assert_array_equal(ds.sel(line="L200")["Name"].values, ["", ""])
+
+
+def test_gdb_to_xarray_whole_file_row_count_mismatch_within_line_is_filled_not_dimensioned(tmp_path):
+    """
+    Unlike single-line mode's `_station`-dimension escape hatch, a
+    genuine row-count mismatch *within* one line in whole-file mode is
+    filled (like every other gap in this mode), not given its own
+    dimension -- there's no per-channel-dimension concept once "line"
+    is a real axis.
+    """
+    from pygdb import GDBParseWarning
+
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("Short", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={
+        "Fiducial": [1, 2, 3],
+        "Short": [10.0, 20.0],  # one row short of Fiducial's 3
+    })]
+    path = tmp_path / "mismatch_whole_file.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    with pytest.warns(GDBParseWarning, match=r"Short"):
+        ds = db.to_xarray()
+
+    assert ds["Short"].dims == ("line", "station")
+    assert "Short_station" not in ds.dims
+    npt.assert_array_equal(ds["Short"].values[0], [10.0, 20.0, -1.0e32])
+
+
+def test_gdb_to_xarray_whole_file_channel_named_line_does_not_clobber_coordinate(tmp_path):
+    """
+    Regression test for the same real-world collision class found via
+    to_dataframe's own real-corpus testing (a real Ontario file has a
+    channel literally named "line"): the channel's own variable must be
+    renamed, not silently overwrite the "line" identity coordinate every
+    whole-file caller relies on.
+    """
+    from pygdb import GDBParseWarning
+
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("line", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={"Fiducial": [1, 2], "line": [1001.0, 1001.0]})]
+    path = tmp_path / "xr_channel_named_line.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    with pytest.warns(GDBParseWarning, match=r"collides"):
+        ds = db.to_xarray()
+
+    npt.assert_array_equal(ds.coords["line"].values, ["L100"])
+    assert "channel_line" in ds.data_vars
+    npt.assert_array_equal(ds["channel_line"].values[0], [1001.0, 1001.0])
+
+
+def test_gdb_to_xarray_whole_file_no_data_returns_empty_dataset(tmp_path):
+    channels = [ChannelSpec("Fiducial", dtype_code=3)]
+    lines = [LineSpec("L100", data={})]
+    path = tmp_path / "xr_empty.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    ds = db.to_xarray()
+    assert len(ds.data_vars) == 0
+    assert len(ds.dims) == 0
 
 
 # -- GDB.to_geoh5 ---------------------------------------------------------
@@ -645,6 +827,42 @@ def test_gdb_to_geoh5_disambiguates_duplicate_channel_names(tmp_path):
     assert db.channel(("Dup", 1)).name == "Dup"
 
 
+def test_gdb_to_geoh5_disambiguates_file_wide_even_if_only_one_occurrence_has_data(tmp_path):
+    """See the equivalent to_xarray test's docstring: this is the same
+    shared-`_disambiguate_names` regression, exercised through
+    to_geoh5's whole-file loop (which calls it once per line -- without
+    the file-wide fix, the same channel could resolve to "Dup" on one
+    line and "Dup[1]" on another within a single to_geoh5() call)."""
+    from pygdb import GDBParseWarning
+
+    channels = [
+        ChannelSpec("Easting", dtype_code=5),
+        ChannelSpec("Northing", dtype_code=5),
+        ChannelSpec("Dup", dtype_code=5),  # occurrence 0 -- no data anywhere
+        ChannelSpec("Dup", dtype_code=5),  # occurrence 1 -- has data on L100
+    ]
+    lines = [LineSpec("L100", data={"Easting": [1.0, 2.0], "Northing": [3.0, 4.0]})]
+    page_size = 64
+    data = build_gdb_bytes(channels, lines, page_size=page_size)
+    dup_occurrence_1_blob_index = 0 * len(channels) + 3  # line 0, chan_index 3
+    data += pack_plain_blob(dup_occurrence_1_blob_index, [30.0, 40.0], dtype_code=5, page_size=page_size)
+    path = tmp_path / "dup_geoh5_only_second_populated.gdb"
+    path.write_bytes(data)
+    db = GDB(str(path))
+
+    out = tmp_path / "out.geoh5"
+    with pytest.warns(GDBParseWarning, match=r"Dup"):
+        db.to_geoh5(str(out))
+
+    with _open_geoh5(out) as ws:
+        points = ws.root.children[0].children[0]
+        data_by_name = {c.name: c for c in points.children}
+        assert "Dup[1]" in data_by_name
+        assert "Dup" not in data_by_name
+        npt.assert_array_equal(data_by_name["Dup[1]"].values, [30.0, 40.0])
+    assert db.channel(("Dup", 1)).name == "Dup"
+
+
 def test_gdb_to_geoh5_row_count_mismatch_skips_that_channel(tmp_path):
     from pygdb import GDBParseWarning
 
@@ -695,6 +913,42 @@ def test_gdb_to_geoh5_missing_xy_channel_skips_the_line(tmp_path):
     with _open_geoh5(out) as ws:
         names = {c.name for c in ws.root.children[0].children}
         assert names == {"L100"}
+
+
+def test_gdb_to_geoh5_channel_named_line_category_does_not_clobber_metadata(tmp_path):
+    """
+    Regression test for the same collision class found via real-corpus
+    testing in to_dataframe/to_xarray (a channel literally named
+    "line"): here a channel named "line_category" collides with the
+    OBJECT-level metadata key to_geoh5 always adds. geoh5py's own
+    add_data already prevents actual data loss (auto-renames on a name
+    clash), but does so silently -- this reader must warn explicitly
+    too, matching every other renamed-on-collision case.
+    """
+    from pygdb import GDBParseWarning
+
+    channels = [
+        ChannelSpec("Easting", dtype_code=5),
+        ChannelSpec("Northing", dtype_code=5),
+        ChannelSpec("line_category", dtype_code=5),
+    ]
+    lines = [LineSpec("L100", data={
+        "Easting": [1.0, 2.0], "Northing": [3.0, 4.0], "line_category": [99.0, 98.0],
+    })]
+    path = tmp_path / "geoh5_channel_named_line_category.gdb"
+    path.write_bytes(build_gdb_bytes(channels, lines))
+    db = GDB(str(path))
+
+    out = tmp_path / "out.geoh5"
+    with pytest.warns(GDBParseWarning, match=r"collides"):
+        db.to_geoh5(str(out))
+
+    with _open_geoh5(out) as ws:
+        points = ws.root.children[0].children[0]
+        data_by_name = {c.name: c for c in points.children}
+        assert data_by_name["line_category"].values == "NORMAL"
+        assert "channel_line_category" in data_by_name
+        npt.assert_array_equal(data_by_name["channel_line_category"].values, [99.0, 98.0])
 
 
 def test_gdb_to_geoh5_z_channel_defaults_to_zero_and_can_be_overridden(tmp_path):
@@ -916,6 +1170,34 @@ def test_gdb_to_dataframe_disambiguates_duplicate_channel_names(tmp_path):
     assert {"Dup", "Dup[1]"} <= set(df.columns)
     npt.assert_array_equal(df["Dup"], [10.0, 20.0])
     npt.assert_array_equal(df["Dup[1]"], [10.0, 20.0])
+    assert db.channel(("Dup", 1)).name == "Dup"
+
+
+def test_gdb_to_dataframe_disambiguates_file_wide_even_if_only_one_occurrence_has_data(tmp_path):
+    """See the equivalent to_xarray test's docstring: same shared-
+    `_disambiguate_names` regression, exercised through to_dataframe."""
+    from pygdb import GDBParseWarning
+
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("Dup", dtype_code=5),  # occurrence 0 -- no data anywhere
+        ChannelSpec("Dup", dtype_code=5),  # occurrence 1 -- has data on L100
+    ]
+    lines = [LineSpec("L100", data={"Fiducial": [1, 2]})]
+    page_size = 64
+    data = build_gdb_bytes(channels, lines, page_size=page_size)
+    dup_occurrence_1_blob_index = 0 * len(channels) + 2  # line 0, chan_index 2
+    data += pack_plain_blob(dup_occurrence_1_blob_index, [30.0, 40.0], dtype_code=5, page_size=page_size)
+    path = tmp_path / "dup_df_only_second_populated.gdb"
+    path.write_bytes(data)
+    db = GDB(str(path))
+
+    with pytest.warns(GDBParseWarning, match=r"Dup"):
+        df = db.to_dataframe("L100")
+
+    assert "Dup[1]" in df.columns
+    assert "Dup" not in df.columns
+    npt.assert_array_equal(df["Dup[1]"], [30.0, 40.0])
     assert db.channel(("Dup", 1)).name == "Dup"
 
 

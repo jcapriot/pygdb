@@ -77,6 +77,24 @@ rating honestly when adding or citing a field; don't round a `[GUESS]`
 up to `[CONFIRMED]` for convenience, and don't state something as fact
 in code comments or docstrings that the spec itself only guesses at.
 
+**A direct, recurring consequence of channel names being freeform:
+any reserved/synthetic identifier this reader introduces alongside
+real channel-derived names — a column, coordinate, or attribute key
+like `"line"`/`"line_category"` — will eventually collide with a real
+channel that happens to share the name.** This has already happened
+twice, both times found only by testing against a real sample file
+after the fact, not designed in from the start: `to_dataframe`'s
+`"line"` column and `to_xarray`'s `"line"` coordinate were each
+silently clobbered by a real channel literally named `"line"` on the
+very first real file checked in each case (a real Ontario delivery).
+When adding a new reserved name in this same namespace (a future
+export format, a new metadata column), **build in the collision check
+from day one**: detect a channel's resolved variable name matching a
+reserved one, rename the *channel's* column instead (never the
+reserved one every caller relies on) with a `GDBParseWarning`, and add
+a synthetic regression test for exactly that collision immediately —
+don't wait to discover it by chance against real data again.
+
 ## Testing
 
 - Unit tests build synthetic `.gdb`/`.grd` byte fixtures by hand via

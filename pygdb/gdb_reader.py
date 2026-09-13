@@ -156,6 +156,36 @@ GS_TYPE_NUMPY_DTYPE = {
     9: "<u8",   # GS_ULONG64
 }
 
+# Vendor-published per-type "dummy"/no-data sentinel (docs/spec.md
+# section 4, docs/provenance/notes.md section 2) -- keyed identically
+# to `GS_TYPE_NUMPY_DTYPE` above. The byte/short/long/float/double
+# entries (codes 0-6) are **[CONFIRMED]**: independently cross-checked
+# against two unrelated sources (Geosoft's own published constants and
+# the separate, independent Loop3D reader's own table -- see
+# `grd_reader.py`'s `_DUMMIES`, which has the identical values keyed by
+# `array` module typecode instead) and confirmed appearing verbatim as
+# real "no data" markers in real decoded channel values (e.g.
+# `rDUMMY=-1.0E32` in real `Easting`-type channels). `GS_ULONG`'s
+# (code 7) and both 64-bit types' (codes 8-9) dummy values are
+# **[LIKELY]**: vendor-published (`docs/provenance/log.md`'s
+# vendor-constant dump), matching the same enum's pattern exactly, but
+# not yet independently observed as an in-file sentinel the way the
+# others were -- `.grd` files, the one other place this project reads
+# these dummies from, apparently never use 8-byte elements in practice,
+# so there's been no real data to check codes 8-9 against yet either.
+GS_TYPE_DUMMY_VALUE = {
+    0: -127,           # GS_BYTE / GS_S1DM
+    1: 65535,          # GS_USHORT / GS_U2DM
+    2: -32767,         # GS_SHORT / GS_S2DM
+    3: -2147483647,    # GS_LONG / GS_S4DM (== iDUMMY)
+    4: -1.0e32,        # GS_FLOAT / GS_R4DM (== rDUMMY)
+    5: -1.0e32,        # GS_DOUBLE / GS_R8DM (== rDUMMY)
+    6: 255,            # GS_UBYTE / GS_U1DM
+    7: 4294967295,     # GS_ULONG / GS_U4DM -- [LIKELY], see above
+    8: -(2 ** 63),     # GS_LONG64 / GS_S8DM -- [LIKELY], see above
+    9: 2 ** 64 - 1,    # GS_ULONG64 / GS_U8DM -- [LIKELY], see above
+}
+
 DB_CHAN_FORMAT_NAMES = {
     0: "NORMAL",
     1: "EXP",

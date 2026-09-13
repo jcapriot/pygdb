@@ -247,17 +247,20 @@ Display format codes (channel record offset `+92`):
 | 5 | `SIGDIG` |
 | 6 | `HEX` |
 
-Dummy/no-data sentinel values (vendor-published, `provenance/notes.md` §2) —
-**[CONFIRMED]** to appear verbatim in real decoded data:
+Dummy/no-data sentinel values (vendor-published, `provenance/notes.md` §2),
+keyed identically to `gdb_reader.GS_TYPE_NUMPY_DTYPE`/`GS_TYPE_DUMMY_VALUE`:
 
-| Type | Dummy value |
-|---|---|
-| `iDUMMY` (int32) | `-2147483647` |
-| `rDUMMY` (float32/float64) | `-1.0E32` |
-| signed byte | `-127` |
-| unsigned byte | `255` |
-| signed short | `-32767` |
-| unsigned short | `65535` |
+| Type | Dummy value | Confidence |
+|---|---|---|
+| `iDUMMY` (int32) | `-2147483647` | **[CONFIRMED]** — appears verbatim in real decoded data |
+| `rDUMMY` (float32/float64) | `-1.0E32` | **[CONFIRMED]** |
+| signed byte | `-127` | **[CONFIRMED]** |
+| unsigned byte | `255` | **[CONFIRMED]** |
+| signed short | `-32767` | **[CONFIRMED]** |
+| unsigned short | `65535` | **[CONFIRMED]** |
+| unsigned long (`GS_ULONG`) | `4294967295` (`0xFFFFFFFF`) | **[LIKELY]** — vendor-published, matches the same enum's pattern exactly, but not yet independently observed as an in-file sentinel the way the others were |
+| signed 64-bit (`GS_LONG64`) | `-2**63` (`0x8000000000000000`) | **[LIKELY]**, same reasoning — `.grd` files apparently never use 8-byte elements in practice, so there's been no real data to check this against either |
+| unsigned 64-bit (`GS_ULONG64`) | `2**64 - 1` (`0xFFFFFFFFFFFFFFFF`) | **[LIKELY]**, same reasoning |
 
 ---
 

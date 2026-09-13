@@ -86,25 +86,47 @@ pip install python-gdb[xarray]
 
 ```python
 ds = db.to_xarray("L1000")  # one line -> one xarray.Dataset
+ds = db.to_xarray()          # whole file (default) -> every line stacked
+                              # along a new "line" dimension
 
-ds["Easting"]        # a plain (station,) DataArray
+ds["Easting"]        # a plain (station,) DataArray -- (line, station) in
+                       # whole-file mode
 ds["ISPD"]            # a VA/array channel -> (station, ISPD_bin), its
                        # own dimension, not shared with other array
                        # channels even at the same width (see below)
 ```
 
-One `Dataset` per line, sharing a `"station"` dimension across every
-channel. A VA/array channel (see the format specification's [section
-5](spec.md)) gets its own second dimension named after the channel --
-deliberately not shared with any other array channel even when their
-widths happen to match, since that's a coincidence, not a guarantee
-they mean the same thing. If two channels share a name and both have
-data on the same line (rare, but structurally possible -- see
-`channel()`'s docs), the second one's variable name is disambiguated
-as `"name[1]"` rather than silently overwriting the first, with a
-warning explaining why. `xarray` is an optional dependency, imported
-only when `to_xarray()` is actually called -- importing `pygdb` itself
-never needs it.
+One `Dataset` per line by default, sharing a `"station"` dimension
+across every channel; pass `line=None` (or call `to_xarray()` with no
+argument) for the whole file instead, with a real `"line"` coordinate
+(`ds.sel(line="L1000")`, `ds.groupby("line")`) and a secondary
+`"line_category"` coordinate alongside it. A VA/array channel (see the
+format specification's [section 5](spec.md)) gets its own second
+dimension named after the channel -- deliberately not shared with any
+other array channel even when their widths happen to match, since
+that's a coincidence, not a guarantee they mean the same thing. If two
+channels share a name anywhere in the file's channel table (rare, but
+structurally possible -- see `channel()`'s docs), the second one's
+variable name is disambiguated as `"name[1]"` rather than silently
+overwriting the first, with a warning explaining why -- resolved once
+for the whole file, so the same channel's name never depends on which
+line you're looking at.
+
+In whole-file mode, every line has to share one common station count
+and one common set of channels, unlike single-line mode's per-channel
+dimension-splitting escape hatch -- a channel that decodes short, or
+is simply absent on some lines (this format's normal sparse grid), is
+filled with a value matching its own data type instead: `NaN` for
+float channels, `""` for string channels, and Geosoft's own published
+per-type "no data" sentinel for every integer type (the same
+convention real files already use for individual missing values, e.g.
+`rDUMMY=-1.0E32`). Whichever value was used is recorded as that
+variable's `_FillValue` attribute -- the standard CF/netCDF convention
+name, so it's discoverable programmatically (including by
+`ds.to_netcdf(...)`) rather than needing to be known in advance.
+
+`xarray` is an optional dependency, imported only when `to_xarray()`
+is actually called -- importing `pygdb` itself never needs it.
 
 ## Exporting to geoh5
 

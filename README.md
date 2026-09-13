@@ -65,10 +65,12 @@ db.read("L1000", "Easting")    # random access by (line name, channel name)
 See [the docs](docs/index.md) for the lower-level, slot-index-based
 functions `GDB` is built on.
 
-`db.to_xarray("L1000")` exports one line to an `xarray.Dataset`
-(`pip install python-gdb[xarray]`, an optional dependency) — see
-[the docs](docs/index.md#exporting-to-xarray) for how VA/array channels
-and duplicate channel names come through.
+`db.to_xarray("L1000")` exports one line (or `db.to_xarray()` for the
+whole file, every line stacked along a `"line"` coordinate) to an
+`xarray.Dataset` (`pip install python-gdb[xarray]`, an optional
+dependency) — see
+[the docs](docs/index.md#exporting-to-xarray) for how VA/array channels,
+duplicate channel names, and whole-file fill values come through.
 
 `db.to_geoh5("survey.geoh5")` exports the whole file to a
 `geoh5py.Workspace` (`pip install python-gdb[geoh5]`, an optional
