@@ -93,11 +93,20 @@ MARKER_STORED_RAW = -253635901   # 0xF0E1D2C3 -- payload is stored verbatim
 KNOWN_MARKER = MARKER_COMPRESSED
 
 
-def lzrw1_decompress(data: bytes, start: int, decompressed_length: int) -> bytes:
+def lzrw1_decompress(data: bytes, start: int, decompressed_length: int) -> bytearray:
     """
     Decompress exactly `decompressed_length` bytes of canonical LZRW1
     data (Ross Williams' algorithm, no FLAG_BYTES prefix) starting at
-    `data[start:]`. Returns the decompressed bytes.
+    `data[start:]`. Returns the decompressed bytes as a writable
+    `bytearray` -- not `bytes` -- so that a caller building a numpy array
+    on top of it (`gdb_reader._decode_numeric_or_string`) gets a
+    genuinely writable array with no extra copy, matching this reader's
+    string-decode path (see `rust/src/lib.rs`'s
+    `decode_fixed_width_strings_ucs4`). Both backends already build their
+    result in a mutable buffer internally (`bytearray`/`&mut [u8]`); the
+    only change from an earlier version of this function is returning
+    that buffer directly instead of wrapping it in an immutable `bytes`
+    on the way out, which bought nothing but an unnecessary copy.
 
     Dispatches to the compiled `pygdb._native` extension when it's
     available (same algorithm, ported to Rust -- see `rust/src/lib.rs`;
@@ -109,11 +118,11 @@ def lzrw1_decompress(data: bytes, start: int, decompressed_length: int) -> bytes
     know which backend produced the error.
     """
     if _native_ext is not None:
-        return bytes(_native_ext.lzrw1_decompress(data, start, decompressed_length))
+        return _native_ext.lzrw1_decompress(data, start, decompressed_length)
     return _lzrw1_decompress_py(data, start, decompressed_length)
 
 
-def _lzrw1_decompress_py(data: bytes, start: int, decompressed_length: int) -> bytes:
+def _lzrw1_decompress_py(data: bytes, start: int, decompressed_length: int) -> bytearray:
     """
     Pure-Python reference implementation of `lzrw1_decompress` -- kept as
     the always-available fallback when `pygdb._native` isn't built, and
@@ -154,7 +163,7 @@ def _lzrw1_decompress_py(data: bytes, start: int, decompressed_length: int) -> b
                 out.append(data[p])
                 p += 1
             control >>= 1
-    return bytes(out)
+    return out
 
 
 @dataclass
@@ -214,7 +223,7 @@ def parse_chunk_header(data: bytes, magic_offset: int) -> SpeedChunk:
     )
 
 
-def decode_speed_chunk(data: bytes, chunk: SpeedChunk) -> bytes:
+def decode_speed_chunk(data: bytes, chunk: SpeedChunk):
     """
     Decode one DB_COMP_SPEED chunk's data -- transparently handling both
     the LZRW1-compressed case and the stored-raw case (see module
@@ -224,6 +233,15 @@ def decode_speed_chunk(data: bytes, chunk: SpeedChunk) -> bytes:
     an unrecognized marker value, or truncated payload data) -- callers
     should catch this one type and treat it as "this chunk couldn't be
     decoded," not as a program bug.
+
+    The compressed case always returns a writable `bytearray` (see
+    `lzrw1_decompress`). The stored-raw case returns a slice of `data`
+    itself -- a `bytearray` slice if `data` is a `bytearray` (a fresh,
+    independent, still-writable copy; slicing a mutable buffer can't
+    share storage the way immutable `bytes` slicing sometimes does), or
+    plain read-only `bytes` if `data` is `bytes`. Callers that want a
+    writable result end-to-end (`gdb_reader.read_blob_values`) pass a
+    `bytearray` in.
     """
     if chunk.subtype != DB_COMP_SPEED:
         raise LZRW1DecodeError(f"not a Speed chunk (subtype={chunk.subtype})")

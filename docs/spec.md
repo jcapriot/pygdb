@@ -321,6 +321,26 @@ count that isn't a whole multiple of `array_width` (truncated/corrupt
 data) warns and drops the incomplete trailing row rather than
 returning a raggedly-shaped result.
 
+Every array `GDB.read()`/`iter_line()` return -- numeric or string,
+scalar or array-channel -- is a writable, independent `ndarray`, not a
+read-only view: this project is fundamentally a file reader with no
+inherent need to mutate decoded values itself, but a caller who wants
+to is never blocked by an artificial restriction, and it's achieved
+with *no extra copy* wherever that's actually possible (every case
+except `zlib`-compressed numeric data, where the stdlib `zlib` module
+has no API to decompress into a caller-supplied buffer, so one
+explicit copy is paid there specifically to keep the result writable
+too). String-typed channels (scalar or array) additionally decode to a
+fixed-width Unicode dtype, `<U{max_len}>` (`max_len` = the longest
+*decoded* record actually present, not the on-disk field width), not
+`dtype=object` -- avoiding one Python `str` allocation per row, and
+sized to the real content rather than a generously-oversized real
+field (e.g. 64 bytes for a 5-character name) specifically because an
+earlier version that used the on-disk width unconditionally measured
+2.5x *slower* than the `dtype=object` approach it replaced. See
+`gdb_reader._decode_numeric_or_string`'s docstring for the full
+reasoning and the exact numbers.
+
 **`GDB.to_xarray(line)`** (optional `xarray` dependency) builds on this
 directly: an array channel's `array_width` becomes a real, named
 second dimension (`f"{channel}_bin"`) on that channel's `DataArray`,

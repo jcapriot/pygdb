@@ -41,7 +41,7 @@ def backend(request, monkeypatch):
     specific backend for the duration of a test -- mirrors
     tests/test_lzrw1.py's `backend` fixture, for the same reason: without
     it, whichever tests use it only ever exercise ONE of
-    `pygdb._native.decode_fixed_width_strings` / the pure-Python fallback
+    `pygdb._native.decode_fixed_width_strings_ucs4` / the pure-Python fallback
     per test run, so a regression in the one NOT currently active
     (typically the pure-Python fallback, since `pygdb._native` is built
     in this dev environment and in CI) would go unnoticed.
@@ -220,10 +220,12 @@ def test_read_blob_values_uncompressed_numeric_and_string(tmp_path):
     blob = find_blob(str(path), line_slot=0, channel_slot=1)
     values = read_blob_values(str(path), blob, channels["Easting"], comp_level=0)
     npt.assert_array_equal(values, [100.0, 100.5, 101.0])
+    assert values.flags.writeable
 
     blob = find_blob(str(path), line_slot=1, channel_slot=2)
     values = read_blob_values(str(path), blob, channels["LineName"], comp_level=0)
     npt.assert_array_equal(values, ["L200", "L200"])
+    assert values.flags.writeable
 
     # dtype sanity: GS_LONG -> int32, GS_DOUBLE -> float64, per
     # GS_TYPE_NUMPY_DTYPE.
@@ -297,7 +299,10 @@ def test_decode_string_array_channel_edge_case(backend):
     raw = b"AB\x00\x00" + b"CD\x00\x00" + b"EF\x00\x00" + b"GH\x00\x00"
     values = _decode_numeric_or_string(raw, channel, row_count=4)
     assert values.shape == (2, 2)
-    assert values.dtype == object
+    # dtype width is the longest *decoded* record (2, for "AB"/"CD"/etc.),
+    # not the on-disk field width (4) -- see _decode_numeric_or_string's
+    # docstring for why.
+    assert values.dtype == np.dtype("<U2")
     npt.assert_array_equal(values, [["AB", "CD"], ["EF", "GH"]])
 
 
@@ -309,8 +314,8 @@ def test_decode_string_channel_edge_cases(tmp_path, backend):
     errors="replace")` exactly). Runs against both backends (see the
     `backend` fixture) -- both must agree with this exact expected
     output, including through the all-ASCII fast path
-    `decode_fixed_width_strings` (rust/src/lib.rs) takes for the first
-    two records here.
+    `decode_fixed_width_strings_ucs4` (rust/src/lib.rs) takes for the
+    first two records here.
     """
     path = tmp_path / "test.gdb"
     path.write_bytes(build_gdb_bytes(SIMPLE_CHANNELS, SIMPLE_LINES))
@@ -324,6 +329,53 @@ def test_decode_string_channel_edge_cases(tmp_path, backend):
     )
     values = _decode_numeric_or_string(raw, channel, row_count=3)
     npt.assert_array_equal(values, ["abc", "exactly8", "��"])
+
+
+def test_decode_string_arrays_are_writable(tmp_path, backend):
+    """
+    String decode results are independent, writable arrays -- not
+    read-only views -- for both backends. The native path specifically
+    returns a `bytearray` (not `bytes`) from Rust (`PyByteArray::new_with`,
+    see rust/src/lib.rs), which is what makes `np.frombuffer(...)` on it
+    writable with no extra copy; the pure-Python fallback is writable by
+    ordinary `np.array()` construction.
+    """
+    path = tmp_path / "test.gdb"
+    path.write_bytes(build_gdb_bytes(SIMPLE_CHANNELS, SIMPLE_LINES))
+    channel = {c.name: c for c in read_channels(str(path))}["LineName"]
+
+    values = _decode_numeric_or_string(b"abc\x00\x00\x00\x00\x00", channel, row_count=1)
+    assert values.flags.writeable
+    values[0] = "xyz"
+    assert values[0] == "xyz"
+
+
+def test_decode_numeric_arrays_are_writable_when_raw_is_a_bytearray(tmp_path):
+    """
+    Numeric decode results are writable whenever `raw` itself is a
+    `bytearray` -- true for all three real on-disk sources
+    `read_blob_values` can hand `_decode_numeric_or_string`: a plain
+    read (`_read_writable`'s `f.readinto(bytearray(...))`), this
+    reader's own LZRW1 decompression (`lzrw1.lzrw1_decompress`, native
+    or pure-Python -- both build their result in a mutable buffer
+    internally now), and zlib decompression (`read_blob_values` wraps
+    stdlib `zlib`'s always-immutable `bytes` output in an explicit
+    `bytearray(...)` copy specifically to keep this consistent, since
+    `zlib` itself has no way to decompress into a caller-supplied
+    buffer). This doesn't exercise the native/Python backend split
+    (`_decode_numeric_or_string`'s numeric branch is backend-agnostic,
+    just `np.frombuffer` over whatever `raw` already is), so it isn't
+    parametrized over `backend` the way the string test above is.
+    """
+    path = tmp_path / "test.gdb"
+    path.write_bytes(build_gdb_bytes(SIMPLE_CHANNELS, SIMPLE_LINES))
+    channel = {c.name: c for c in read_channels(str(path))}["Easting"]
+
+    raw = bytearray(struct.pack("<3d", 1.0, 2.0, 3.0))
+    values = _decode_numeric_or_string(raw, channel, row_count=3)
+    assert values.flags.writeable
+    values[0] = 999.0
+    assert values[0] == 999.0
 
 
 def test_iter_blobs_truncated_file_warns_and_returns_partial(tmp_path):
@@ -361,6 +413,10 @@ def test_read_blob_values_compressed_zlib(tmp_path):
 
     values = read_blob_values(path, blob, channel, comp_level=2, page_size=page_size)
     npt.assert_array_equal(values, [1.5, 2.5, 3.5])
+    # zlib has no API to decompress into a caller-supplied buffer, so
+    # `read_blob_values` pays an explicit `bytearray(...)` copy to keep
+    # this writable anyway -- see `_decode_numeric_or_string`'s docstring.
+    assert values.flags.writeable
 
 
 def test_read_blob_values_compressed_lzrw1(tmp_path):
@@ -380,6 +436,10 @@ def test_read_blob_values_compressed_lzrw1(tmp_path):
 
     values = read_blob_values(path, blob, channel, comp_level=1, page_size=page_size)
     npt.assert_array_equal(values, [42, 43])
+    # LZRW1 decompression builds its result in a mutable buffer directly
+    # (native `PyByteArray::new_with`, or a `bytearray` in the pure-Python
+    # fallback) -- zero-copy writable either way.
+    assert values.flags.writeable
 
 
 def test_read_blob_values_compressed_lzrw1_stored_raw(tmp_path):
@@ -424,6 +484,9 @@ def test_read_blob_values_bare_blob_inside_compressed_file(tmp_path):
     # specific blob has no chunk magic at the expected offset.
     values = read_blob_values(path, blob, channel, comp_level=2, page_size=64)
     npt.assert_array_equal(values, [1.0, 2.0])
+    # Same plain-read path as an ordinary DB_COMP_NONE blob (`_read_writable`
+    # via `f.readinto`) -- writable with no extra copy.
+    assert values.flags.writeable
 
 
 def test_read_blob_values_administrative_blob_negative_row_count_warns(tmp_path):
