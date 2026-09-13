@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import struct
+import zlib
 
 import numpy as np
 import numpy.testing as npt
@@ -20,7 +21,8 @@ import pytest
 
 from pygdb import GDB
 from pygdb.gdb_reader import COMPRESSED_BLOB_HEADER_SIZE, header_fields, iter_blobs
-from pygdb.lzrw1 import CHUNK_MAGIC, DB_COMP_SPEED, _lzrw1_decompress_py, _native_ext, parse_chunk_header
+from pygdb.grd_reader import read_grd
+from pygdb.lzrw1 import CHUNK_MAGIC, DB_COMP_SIZE, DB_COMP_SPEED, _lzrw1_decompress_py, _native_ext, parse_chunk_header
 
 pytestmark = pytest.mark.usefixtures("samples_dir")
 
@@ -249,14 +251,80 @@ def test_lzrw1_backends_agree_on_every_real_compressed_chunk(all_gdb_sample_path
         pytest.skip("no genuinely LZRW1-compressed chunks found in the local corpus")
 
 
+def test_zlib_backends_agree_on_every_real_compressed_chunk(all_gdb_sample_paths):
+    """
+    Cross-checks `pygdb._native.zlib_decompress` (flate2, `zlib-rs`
+    backend -- rust/src/lib.rs) against stdlib `zlib.decompressobj()`
+    on every real `DB_COMP_SIZE` chunk in the local corpus.
+
+    This test exists because a real, non-obvious finding only turned up
+    by running real files through both paths: an earlier version of
+    `zlib_decompress` tried to pre-size its output buffer from
+    `blob.row_count * width` (the same value the plain-read path
+    already trusts for the very same channel), matching the zero-copy
+    technique the LZRW1/string paths use -- but `blob.row_count` turned
+    out to be unpopulated (0) for every real `DB_COMP_SIZE` blob tried,
+    making that guess useless. See `zlib_decompress`'s docstring for
+    the design that replaced it (decompress into a growable Rust
+    buffer, GIL released, then one final copy into the Python object).
+    Captured here as a permanent regression test rather than a one-off
+    script, so a future change to either backend can't silently regress
+    without this catching it.
+
+    Skipped (not failed) if `pygdb._native` isn't built.
+    """
+    if _native_ext is None:
+        pytest.skip("pygdb._native is not built in this environment")
+
+    n_checked = 0
+    for path in all_gdb_sample_paths:
+        with open(path, "rb") as f:
+            header = f.read(128)
+            fields = header_fields(header)
+            if fields["comp_level"] != DB_COMP_SIZE:
+                continue
+            page_size = fields["page_size"]
+            if page_size is None:
+                continue
+            for blob in iter_blobs(path):
+                f.seek(blob.offset + COMPRESSED_BLOB_HEADER_SIZE)
+                probe = f.read(8)
+                if probe != CHUNK_MAGIC:
+                    continue  # "bare" blob, not a chunk-wrapped one at all
+                f.seek(blob.offset + COMPRESSED_BLOB_HEADER_SIZE)
+                span = blob.n_pages * page_size - COMPRESSED_BLOB_HEADER_SIZE
+                raw_span = f.read(span)
+                if len(raw_span) < 16:
+                    continue
+                subtype = struct.unpack_from("<i", raw_span, 8)[0]
+                if subtype != DB_COMP_SIZE:
+                    continue
+                payload = raw_span[16:]
+                try:
+                    stdlib_out = zlib.decompressobj().decompress(payload)
+                except zlib.error:
+                    continue  # corrupt/truncated -- nothing to cross-check
+                native_out = bytes(_native_ext.zlib_decompress(payload))
+                assert native_out == stdlib_out, (
+                    f"{os.path.basename(path)}: blob_index={blob.blob_index} backend mismatch"
+                )
+                n_checked += 1
+
+    if n_checked == 0:
+        pytest.skip("no genuinely DB_COMP_SIZE-compressed chunks found in the local corpus")
+
+
 def test_string_decode_backends_agree_on_every_real_string_channel(all_gdb_sample_paths):
     """
-    Cross-checks pygdb._native's `decode_fixed_width_strings` against
-    the pure-Python reference on every real string-typed channel with
-    data in the corpus -- the same kind of permanent regression coverage
-    as the LZRW1 backend-parity check above, for the other real
+    Cross-checks pygdb._native's `decode_fixed_width_strings_ucs4`
+    against the pure-Python reference on every real string-typed channel
+    with data in the corpus -- the same kind of permanent regression
+    coverage as the LZRW1 backend-parity check above, for the other real
     CPU-bound hot path profiling found (see rust/src/lib.rs's module
-    doc). Skipped (not failed) if `pygdb._native` isn't built.
+    doc). The native function returns a flat UCS-4 buffer rather than a
+    list of str (see its docstring for why) -- reinterpret it the same
+    way `_decode_numeric_or_string` does before comparing. Skipped (not
+    failed) if `pygdb._native` isn't built.
     """
     from pygdb.gdb_reader import _element_width
     from pygdb.gdb_reader import _native_ext as gdb_reader_native_ext
@@ -283,15 +351,40 @@ def test_string_decode_backends_agree_on_every_real_string_channel(all_gdb_sampl
                 n = len(raw) // width
                 if n == 0:
                     continue
-                native_out = gdb_reader_native_ext.decode_fixed_width_strings(raw, width, n)
+                max_len, ucs4 = gdb_reader_native_ext.decode_fixed_width_strings_ucs4(raw, width, n)
+                native_out = list(np.frombuffer(ucs4, dtype=f"<U{max_len}"))
                 py_out = [
                     raw[i * width:(i + 1) * width].split(b"\x00")[0].decode("ascii", errors="replace")
                     for i in range(n)
                 ]
-                assert list(native_out) == py_out, (
+                assert native_out == py_out, (
                     f"{os.path.basename(path)}: channel {c.name!r} line {line.name!r} backend mismatch"
                 )
                 n_checked += 1
 
     if n_checked == 0:
         pytest.skip("no real string channels with data found in the local corpus")
+
+
+def test_grd_compressed_matches_uncompressed_twin(samples_dir):
+    """
+    `samples/loop3d_grd_test/` holds a real compressed .grd and a real
+    uncompressed .grd of the same grid (see grd_reader.py's module
+    docstring and docs/provenance/notes.md section 4 for how this pair
+    established the block layout in the first place). Cross-checking
+    them against each other here also exercises
+    `pygdb._native.decompress_grd_blocks` end-to-end on real,
+    multi-block compressed data -- not just the small synthetic
+    fixtures in test_grd_reader.py.
+    """
+    compressed_path = os.path.join(samples_dir, "loop3d_grd_test", "test_compressed.grd")
+    uncompressed_path = os.path.join(samples_dir, "loop3d_grd_test", "test_uncompressed.grd")
+    if not (os.path.exists(compressed_path) and os.path.exists(uncompressed_path)):
+        pytest.skip("loop3d_grd_test/ pair not present locally")
+
+    header_c, values_c = read_grd(compressed_path)
+    header_u, values_u = read_grd(uncompressed_path)
+
+    assert header_c.is_compressed and not header_u.is_compressed
+    assert (header_c.shape_e, header_c.shape_v) == (header_u.shape_e, header_u.shape_v)
+    assert list(values_c) == list(values_u)

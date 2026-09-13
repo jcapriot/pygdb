@@ -33,6 +33,13 @@ crate-type = ["cdylib"]
 # why the cp315t build identifier stays in the matrix even though its
 # *output* is no longer 3.15t-specific.
 pyo3 = { version = "0.29", features = ["abi3-py312", "abi3t-py315", "extension-module"] }
+# `zlib-rs` backend: a memory-safe, pure-Rust zlib reimplementation
+# (not the same crate as `miniz_oxide`, flate2's other pure-Rust
+# option) tuned to compete with SIMD-accelerated C zlib forks like
+# `zlib-ng` -- still no system zlib/C toolchain dependency, so the
+# cibuildwheel cross-compilation matrix in pyproject.toml stays exactly
+# as simple as the default backend.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 
 [profile.release]
 lto = true

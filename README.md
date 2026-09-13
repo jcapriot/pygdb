@@ -74,9 +74,12 @@ so that an optional Rust extension (`pygdb._native`, source under
 [`rust/`](rust/)) rides along and is used automatically when present:
 it accelerates the two real CPU-bound hot paths profiling found in this
 reader — LZRW1 decompression and fixed-width string decoding — roughly
-3-6x on real files, measured against this project's own sample corpus.
-`pygdb/lzrw1.py`/`pygdb/gdb_reader.py` detect it at import time and fall
-back to plain Python transparently if it isn't there.
+3-6x on real files, measured against this project's own sample corpus,
+and decompresses `DB_COMP_SIZE` (zlib) data ~11% faster than the stdlib
+fallback with one fewer copy, using the `flate2` crate on its
+`zlib-rs` backend. `pygdb/lzrw1.py`/`pygdb/gdb_reader.py` detect it at
+import time and fall back to plain Python transparently if it isn't
+there.
 
 Building it yourself (e.g. for local development, or a platform without
 a published wheel) needs a Rust toolchain:

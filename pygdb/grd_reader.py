@@ -33,6 +33,11 @@ import warnings
 import zlib
 from dataclasses import dataclass, field
 
+try:
+    from . import _native as _native_ext
+except ImportError:
+    _native_ext = None
+
 
 class GRDParseWarning(RuntimeWarning):
     """
@@ -147,7 +152,7 @@ def parse_header(header_bytes: bytes) -> GrdHeader:
     )
 
 
-def _decompress_body(body: bytes) -> bytes:
+def _decompress_body(body: bytes, expected_total_size: int = 0):
     """
     Decompress the post-header bytes of a compressed .grd file.
 
@@ -177,6 +182,28 @@ def _decompress_body(body: bytes) -> bytes:
                     every real block we tested). Internal meaning of the
                     16 bytes is NOT fully understood -- see docs/provenance/notes.md.
         remainder : a standalone zlib stream for that block.
+
+    `expected_total_size` (in practice `shape_e * shape_v * element_size`,
+    the grid's own declared total size -- see `read_grd`) is only a
+    capacity hint for the native path (`pygdb._native.decompress_grd_blocks`,
+    the same `flate2`/`zlib-rs` decompressor validated against `.gdb`'s
+    `DB_COMP_SIZE` data): it seeds the output buffer's pre-allocation to
+    cut down on reallocations while concatenating blocks, but a wrong
+    value never affects correctness, only how many times that buffer
+    has to grow.
+
+    Returns a `bytearray`, not `bytes` -- `array.array.frombytes()` (the
+    only consumer, in `read_grd`) accepts any buffer-protocol object, so
+    converting to immutable `bytes` first would only pay for a full,
+    whole-grid-sized copy with no benefit.
+
+    Dispatches the whole per-block decompress-and-concatenate loop to
+    `pygdb._native.decompress_grd_blocks` when it's available (one
+    Python-object allocation total instead of one per block, and
+    `flate2`/`zlib-rs` instead of stdlib `zlib` for the decompression
+    itself -- ~11% faster per block, measured against this project's
+    `.gdb` `DB_COMP_SIZE` corpus, see `rust/src/lib.rs`), falling back
+    to the pure-Python loop below when it isn't.
     """
     try:
         n_blocks, vectors_per_block = struct.unpack_from("<2i", body, 8)
@@ -189,13 +216,27 @@ def _decompress_body(body: bytes) -> bytes:
         )
         return b""
 
-    out = bytearray()
-    for i, (off, size) in enumerate(zip(offsets, sizes)):
-        rel = off - HEADER_SIZE  # convert absolute file offset -> offset within `body`
-        chunk = body[rel + 16 : rel + size]
-        if len(chunk) < size - 16:
+    # Each block's compressed-payload location within `body`: the
+    # 16-byte per-block sub-header skipped, `size` (which includes that
+    # sub-header) converted to just the payload's own length.
+    payloads = [(off - HEADER_SIZE + 16, size - 16) for off, size in zip(offsets, sizes)]
+
+    if _native_ext is not None:
+        n_decoded, out = _native_ext.decompress_grd_blocks(body, payloads, expected_total_size)
+        if n_decoded < n_blocks:
             _warn(
-                f"block {i} of {n_blocks} is truncated (expected {size - 16} "
+                f"block {n_decoded} of {n_blocks} could not be decoded (truncated "
+                f"or corrupt compressed data) -- stopping here; returning the "
+                f"{n_decoded} block(s) already decompressed rather than the full grid"
+            )
+        return out
+
+    out = bytearray()
+    for i, (rel_off, length) in enumerate(payloads):
+        chunk = body[rel_off : rel_off + length]
+        if len(chunk) < length:
+            _warn(
+                f"block {i} of {n_blocks} is truncated (expected {length} "
                 f"compressed byte(s), only {len(chunk)} available in the file) "
                 f"-- stopping here; returning the {i} block(s) already "
                 f"decompressed rather than the full grid"
@@ -210,7 +251,7 @@ def _decompress_body(body: bytes) -> bytes:
                 f"{i} block(s) already decompressed rather than the full grid"
             )
             break
-    return bytes(out)
+    return out
 
 
 def read_grd(path: str):
@@ -248,7 +289,8 @@ def read_grd(path: str):
     body = raw[HEADER_SIZE:]
 
     if header.is_compressed:
-        body = _decompress_body(body)
+        expected_total_size = header.shape_e * header.shape_v * header.element_size
+        body = _decompress_body(body, expected_total_size)
 
     typecode = _array_typecode(header.element_size, header.sign_flag)
     values = array.array(typecode)

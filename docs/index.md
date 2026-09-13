@@ -108,7 +108,9 @@ maturin so that an optional Rust extension (`pygdb._native`, source
 under `rust/` in the repository) rides along and is used automatically
 when present -- it accelerates LZRW1 decompression and fixed-width
 string decoding, the two real CPU-bound hot paths profiling found in
-this reader, roughly 3-6x on real files. A platform/Python-version
+this reader, roughly 3-6x on real files, and decompresses `DB_COMP_SIZE`
+(zlib) data ~11% faster than the stdlib fallback with one fewer copy,
+using the `flate2` crate on its `zlib-rs` backend. A platform/Python-version
 combination with a published wheel gets it with a plain `pip install
 python-gdb`, no extra step; elsewhere `pip` falls back to building from
 source, which needs a Rust toolchain. For local development: `pip

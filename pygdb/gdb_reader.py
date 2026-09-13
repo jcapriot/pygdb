@@ -996,18 +996,97 @@ def _decode_numeric_or_string(raw: bytes, channel: ChannelRecord, row_count: Opt
     channel, never seen to vary row-to-row, so this reshape is always a
     clean rectangle). Numeric channels get the dtype matching their
     `GS_*` type (`GS_TYPE_NUMPY_DTYPE`); string channels (including the
-    unconfirmed-but-handled case of a *string* array channel) get
-    `dtype=object` holding plain Python `str`, since numpy has no
-    variable-content fixed-dtype string type that round-trips this
-    format's null-padded, variable-actual-length names cleanly.
+    unconfirmed-but-handled case of a *string* array channel) get a
+    fixed-width Unicode dtype, `<U{max_len}>` (`max_len` = the longest
+    *decoded* record actually present, not `width`, the on-disk field
+    size -- see below).
+
+    Both string and numeric results are writable -- this project is
+    fundamentally a file *reader* with no inherent need to mutate
+    decoded values itself, but a caller who wants to is never blocked
+    by an artificial read-only restriction, and the goal throughout is
+    getting there with *no extra copy* wherever that's actually
+    achievable rather than uniformly copying (always writable, always
+    pays for it) or uniformly viewing (always free, never writable).
+    Concretely: string decoding and the plain-read/LZRW1-decompression
+    numeric paths all build their result directly in a Python-owned
+    `bytearray` (native) or `bytearray` (pure-Python) with no separate
+    buffer that then needs copying, so `np.frombuffer(...)` on top of
+    them is writable for free. `zlib`-compressed numeric data
+    (`DB_COMP_SIZE`) is the one case that can't avoid a copy entirely:
+    the native path (`pygdb._native.zlib_decompress`, `flate2` on the
+    `zlib-rs` backend) decompresses into a growable Rust buffer and
+    copies it into the final `bytearray` once; the pure-Python fallback
+    (stdlib `zlib.decompressobj()`, which can only ever hand back
+    immutable `bytes`) pays that same copy plus one more to make the
+    result writable. See `read_blob_values`'s `DB_COMP_SIZE` branch and
+    `rust/src/lib.rs`'s `zlib_decompress` docstring for the full
+    reasoning, including a real finding from testing against this
+    project's sample corpus: `blob.row_count` (trustworthy for the
+    plain-read path) turns out to be unpopulated for compressed blobs,
+    which is why this path can't use the same zero-copy,
+    known-size-upfront technique the other two do.
+
+    `<U{max_len}>` rather than `dtype=object` holding individual Python
+    `str`: building N separate `str` objects and then a *second*
+    container (`np.array(values, dtype=object)`) to hold them measured
+    at ~22% of this operation's total time on real data, just for that
+    double conversion. Sized to `max_len`, not `width`, because a real
+    field is often generously over-sized relative to its actual content
+    (e.g. a 64-byte name field holding 5-character names like "L1000")
+    -- a first version of the native backend sized its buffer to `width`
+    unconditionally and, for exactly this shape of field, that measured
+    2.5x *slower* than the `dtype=object` approach it was meant to
+    replace, from zero-filling and returning ~12x more buffer than the
+    content needed. Computing the real max length first fixed it (see
+    `rust/src/lib.rs`'s `decode_fixed_width_strings_ucs4` docstring for
+    the full numbers) and is mirrored here in the pure-Python fallback
+    for the same reason, and so both backends produce the identical
+    dtype width.
+
+    The native backend returns a `bytearray`, not `bytes` --
+    `PyByteArray::new_with` writes the decoded UCS-4 codepoints directly
+    into a Python-owned buffer, so there's exactly one allocation total
+    (no separate Rust-side buffer that then needs copying across the
+    FFI boundary, unlike returning a plain `Vec<u8>`, which PyO3 would
+    convert to `bytes` by copying it into a second buffer). Since
+    `bytearray` reports itself as writable through the buffer protocol
+    (unlike `bytes`, which is genuinely immutable), `np.frombuffer(...)`
+    on it gives back a real, independent, writable array with no further
+    copy either -- not a risky reinterpret-as-mutable cast, just an
+    honest buffer that happens to already be mutable. The pure-Python
+    fallback's `np.array(values, dtype=...)` is writable by ordinary
+    construction (a fresh, owned buffer, same as always) with nothing
+    extra needed to match.
+
+    For numeric channels, `np.frombuffer(memoryview(raw)[:n*width],
+    dtype=dtype)` is already exactly the right size (no padding to
+    waste, unlike the string case before its own fix) -- skipping
+    `.copy()` is a plain, proportional win that scales with the buffer,
+    measured on real data at ~3x for a small scalar channel (22KB,
+    sub-microsecond either way) up to ~13.6x for a wide VA/array channel
+    (290KB, a few real microseconds saved) -- on top of which it's
+    writable whenever `raw` itself is a `bytearray`, which is now true
+    for every numeric code path (see above): `_read_writable` for plain
+    reads, native/pure-Python `lzrw1_decompress` for `DB_COMP_SPEED`,
+    and an explicit copy in `read_blob_values` for `DB_COMP_SIZE`
+    (`zlib`). `memoryview(raw)[...]` rather than plain `raw[...]`
+    specifically because slicing a `bytearray` directly always
+    allocates a new, independent copy (unlike `bytes`, which can share
+    storage) -- slicing a `memoryview` instead is a real, zero-copy view
+    that also passes through whichever `readonly` flag `raw`'s
+    underlying buffer actually has, so this works unchanged for both
+    writable and (if a caller ever passes plain `bytes`) read-only
+    input.
 
     String-typed channels dispatch to the compiled `pygdb._native`
     extension when it's available (same decode, ported to Rust -- see
-    `rust/src/lib.rs`'s `decode_fixed_width_strings`; profiling found
-    this the second real CPU-bound hot path in this reader besides
+    `rust/src/lib.rs`'s `decode_fixed_width_strings_ucs4`; profiling
+    found this the second real CPU-bound hot path in this reader besides
     LZRW1, unlike numeric decode which stays near memory-bandwidth speed
     via `np.frombuffer` either way), falling back to the pure-Python list
-    comprehension below when it isn't.
+    comprehension below when it isn't -- both backends produce the same
+    `<U{max_len}>`-dtype, writable result either way.
 
     Fails gracefully rather than raising: an unrecognized element type
     returns an empty array with a `GDBParseWarning`; a `raw` buffer
@@ -1054,16 +1133,33 @@ def _decode_numeric_or_string(raw: bytes, channel: ChannelRecord, row_count: Opt
             n = usable_rows * channel.array_width
     if channel.is_string:
         if _native_ext is not None:
-            values = _native_ext.decode_fixed_width_strings(raw, width, n)
+            max_len, ucs4 = _native_ext.decode_fixed_width_strings_ucs4(raw, width, n)
+            arr = np.frombuffer(ucs4, dtype=f"<U{max_len}")
         else:
             values = [
                 raw[i * width : (i + 1) * width].split(b"\x00")[0].decode("ascii", errors="replace")
                 for i in range(n)
             ]
-        arr = np.array(values, dtype=object)
+            # Size the dtype to the longest *decoded* record, not `width`
+            # (the on-disk field size) -- matches the native backend
+            # exactly (see its docstring for why: a generously-sized
+            # real field otherwise wastes space/time proportional to
+            # `width` regardless of how short the actual content is).
+            max_len = max((len(s) for s in values), default=0)
+            arr = np.array(values, dtype=f"<U{max_len}")
     else:
         dtype = GS_TYPE_NUMPY_DTYPE[channel.dtype_code]
-        arr = np.frombuffer(raw[: n * width], dtype=dtype).copy()
+        # `memoryview(raw)[:n*width]` rather than plain `raw[:n*width]`:
+        # slicing a `bytearray` directly always allocates a new,
+        # independent `bytearray` (mutable buffers can't share storage
+        # the way immutable `bytes` can), which would silently defeat
+        # the zero-copy-writable result `raw` was built for whenever `n`
+        # doesn't happen to need the whole buffer. Slicing a
+        # `memoryview` instead is a real view -- no copy either way --
+        # and passes through whichever `readonly` flag the underlying
+        # buffer actually has, so this line works unchanged whether
+        # `raw` is a writable `bytearray` or plain read-only `bytes`.
+        arr = np.frombuffer(memoryview(raw)[: n * width], dtype=dtype)
     if channel.is_array:
         arr = arr.reshape(-1, channel.array_width)
     return arr
@@ -1086,6 +1182,25 @@ def _file_handle(path: str, file: Optional[BinaryIO]):
     else:
         with open(path, "rb") as f:
             yield f
+
+
+def _read_writable(f: BinaryIO, n: int) -> bytearray:
+    """
+    Read up to `n` bytes from `f` into a freshly-allocated, writable
+    `bytearray` -- unlike `f.read(n)`, which always hands back immutable
+    `bytes` no matter what it's read from, this is what lets the numpy
+    array `_decode_numeric_or_string` builds on top end up genuinely
+    writable with no extra copy (see that function's docstring). If the
+    file ends before `n` bytes are available (a truncated download, the
+    same real scenario the old `f.read(n)` call already tolerated), the
+    returned buffer is trimmed to the amount actually read rather than
+    left zero-padded out to `n` -- callers rely on `len()` reflecting
+    real data, not requested size.
+    """
+    buf = bytearray(n)
+    n_read = f.readinto(buf)
+    del buf[n_read:]
+    return buf
 
 
 def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
@@ -1181,7 +1296,7 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
             return np.array([])
         with _file_handle(path, file) as f:
             f.seek(blob.data_offset)
-            raw = f.read(blob.row_count * width)
+            raw = _read_writable(f, blob.row_count * width)
         return _decode_numeric_or_string(raw, channel, blob.row_count)
 
     # comp_level != 0: could still be any of three real on-disk variants
@@ -1219,7 +1334,7 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
             return np.array([])
         with _file_handle(path, file) as f:
             f.seek(blob.data_offset)
-            raw = f.read(blob.row_count * width)
+            raw = _read_writable(f, blob.row_count * width)
         return _decode_numeric_or_string(raw, channel, blob.row_count)
 
     # Compressed (DB_COMP_SPEED / DB_COMP_SIZE): 56-byte blob header,
@@ -1266,15 +1381,38 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
         return np.array([])
     subtype = struct.unpack_from("<i", raw_span, 8)[0]
     if subtype == _lzrw1.DB_COMP_SIZE:
-        try:
-            d = zlib.decompressobj()
-            decompressed = d.decompress(raw_span[16:])
-        except zlib.error as e:
-            _warn(
-                f"blob_index={blob.blob_index}: zlib decompression failed ({e}) "
-                f"-- likely truncated or corrupt compressed data; returning no values"
-            )
-            return np.array([])
+        decompressed = None
+        # `pygdb._native.zlib_decompress` (flate2 on the `zlib-rs`
+        # backend -- see rust/src/lib.rs's docstring) decompresses into
+        # a writable `bytearray` with only one internal copy (Rust's
+        # own growable decode buffer -> the final Python object) --
+        # better than the stdlib fallback below, which pays that same
+        # copy PLUS a second one (`bytes` -> `bytearray`), since stdlib
+        # `zlib` can only ever hand back immutable `bytes`. Falls
+        # through to stdlib on any failure (corrupt/truncated data)
+        # rather than trying to be clever about partial output --
+        # stdlib's own graceful-degradation warning below covers it.
+        if _native_ext is not None:
+            try:
+                decompressed = _native_ext.zlib_decompress(raw_span[16:])
+            except ValueError:
+                decompressed = None
+        if decompressed is None:
+            try:
+                d = zlib.decompressobj()
+                # `zlib`'s stdlib API has no way to decompress into a
+                # caller-supplied buffer -- `decompress()` always hands
+                # back a fresh, immutable `bytes` object. Wrapping it in
+                # a `bytearray` here is a deliberate, explicit copy so
+                # that every numeric channel ends up writable regardless
+                # of which compression mode or backend produced it.
+                decompressed = bytearray(d.decompress(raw_span[16:]))
+            except zlib.error as e:
+                _warn(
+                    f"blob_index={blob.blob_index}: zlib decompression failed ({e}) "
+                    f"-- likely truncated or corrupt compressed data; returning no values"
+                )
+                return np.array([])
     elif subtype == _lzrw1.DB_COMP_SPEED:
         try:
             chunk = _lzrw1.parse_chunk_header(raw_span, 0)
