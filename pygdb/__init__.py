@@ -57,4 +57,13 @@ __all__ = [
     "read_lines",
 ]
 
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    # Reads the installed distribution's metadata -- itself sourced
+    # from rust/Cargo.toml's [package].version via pyproject.toml's
+    # dynamic version (see [project] there), so this never needs its
+    # own hardcoded copy to keep in sync.
+    __version__ = version("python-gdb")
+except PackageNotFoundError:  # pragma: no cover -- only when not installed
+    __version__ = "0.0.0+unknown"

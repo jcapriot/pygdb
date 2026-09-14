@@ -8,7 +8,10 @@ build-backend = "maturin"
 # then `import pygdb`.
 [project]
 name = "python-gdb"
-version = "0.1.0"
+# Version is dynamic, sourced from rust/Cargo.toml's [package].version
+# (maturin's own built-in support, see [tool.maturin] below) -- one
+# version number to bump instead of two staying in sync by hand.
+dynamic = ["version"]
 description = "A clean-room Python reader for Geosoft .gdb database and .grd grid files"
 readme = "README.md"
 license = "MIT"
