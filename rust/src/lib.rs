@@ -48,14 +48,27 @@ fn ping() -> PyResult<String> {
 /// `decode_fixed_width_strings_ucs4` (one allocation total, no separate
 /// Rust `Vec` that then has to be copied across the FFI boundary, and a
 /// genuinely writable result on the Python side with no further copy).
-/// This means the decompression loop below now runs with the GIL held
-/// (a `bytearray`'s buffer is Python-owned, so filling it in place needs
-/// a `Python<'py>` token throughout) rather than under `Python::detach`
-/// as an earlier version of this function did -- an acceptable trade
-/// given this format's chunks are small enough that the whole decode
-/// already finishes in well under a millisecond (see this module's top
-/// doc comment), leaving little for another thread to gain from the GIL
-/// being free during that window anyway.
+///
+/// The decompression loop itself still runs under `Python::detach`
+/// (GIL released), despite writing into a Python-owned `bytearray`
+/// buffer: `new_with` never exposes the bytearray to any Python name
+/// before its fill closure returns, so nothing else can reach it while
+/// the GIL is free, and `data` (this function's `&[u8]` parameter) can
+/// only ever be backed by an immutable `bytes` object -- PyO3's
+/// `&[u8]` extraction rejects anything else, in particular a
+/// `bytearray` -- so it's equally safe to keep reading during that
+/// window regardless of what any other thread does. (An earlier
+/// version of this comment claimed detaching here would need
+/// `unsafe`; that was wrong -- see `zlib_decompress`'s docstring for
+/// why `decode_fixed_width_strings_ucs4` is the one function in this
+/// module that genuinely can't do this safely.) Whether detaching
+/// actually helps in practice is a separate question from whether
+/// it's possible: this format's chunks are documented (this module's
+/// top doc comment) as already decoding in well under a millisecond,
+/// so there's likely little for another thread to gain from the GIL
+/// being free during any one call -- kept here mainly for consistency
+/// with this module's other `new_with` call sites, not because it was
+/// benchmarked as a win on its own.
 #[pyfunction]
 fn lzrw1_decompress<'py>(
     py: Python<'py>,
@@ -64,7 +77,7 @@ fn lzrw1_decompress<'py>(
     decompressed_length: usize,
 ) -> PyResult<Bound<'py, PyByteArray>> {
     PyByteArray::new_with(py, decompressed_length, |buf| {
-        lzrw1_decompress_impl(data, start, buf)
+        py.detach(|| lzrw1_decompress_impl(data, start, buf))
     })
 }
 
@@ -179,16 +192,20 @@ fn lzrw1_decompress_impl(data: &[u8], start: usize, out: &mut [u8]) -> PyResult<
 /// against the stdlib output), then copies that `Vec` into a
 /// `PyByteArray` once at the end (`new_with` sized exactly to the now-
 /// known real length). One real copy either way, same as the stdlib
-/// path's `bytes` -> `bytearray` wrap -- but unlike that wrap, the
-/// decompression work itself never touches a Python object, so it runs
-/// under `Python::detach` (GIL released) the whole time, which the
-/// zero-copy `new_with`-based functions elsewhere in this module
-/// deliberately give up (see their own docstrings) because splitting
-/// allocation from filling isn't possible without `unsafe` there. Here
-/// the allocation (of the *final*, correctly-sized buffer) doesn't
-/// happen until decompression is already finished, so there's nothing
-/// to split -- this GIL-released window is free, not traded against
-/// removing a copy.
+/// path's `bytes` -> `bytearray` wrap -- but both the decompression
+/// *and* that final copy run under `Python::detach` (GIL released),
+/// since neither one touches a Python object still reachable from
+/// anywhere else: `input` is this function's own owned `Vec` (copied
+/// from `data` up front, above), and the target `bytearray` from
+/// `new_with` isn't exposed to any Python name until its fill closure
+/// returns. (An earlier version of this comment claimed the other
+/// `new_with`-based functions in this module give up detaching
+/// because it "isn't possible without `unsafe`" -- that was wrong for
+/// `lzrw1_decompress`/`decompress_grd_blocks`, which now detach too;
+/// see their docstrings. `decode_fixed_width_strings_ucs4` is the one
+/// real exception, and for a different, genuine reason: unlike this
+/// function, it reads its input via a zero-copy borrow that can alias
+/// a live, still-Python-visible `bytearray` -- see its own docstring.)
 #[pyfunction]
 fn zlib_decompress<'py>(py: Python<'py>, data: PyBuffer<u8>) -> PyResult<Bound<'py, PyByteArray>> {
     // Copies the (much smaller) *compressed* input into a plain Rust
@@ -208,7 +225,7 @@ fn zlib_decompress<'py>(py: Python<'py>, data: PyBuffer<u8>) -> PyResult<Bound<'
     })?;
 
     PyByteArray::new_with(py, decompressed.len(), |buf| {
-        buf.copy_from_slice(&decompressed);
+        py.detach(|| buf.copy_from_slice(&decompressed));
         Ok(())
     })
 }
@@ -251,10 +268,16 @@ fn zlib_decompress<'py>(py: Python<'py>, data: PyBuffer<u8>) -> PyResult<Bound<'
 /// for this case; a block's own decompression is all-or-nothing (goes
 /// into a small per-block buffer first, only appended to the
 /// accumulator on success), so a failing block can never leak a
-/// partial, corrupt tail into otherwise-good output. The whole loop
-/// runs under `Python::detach` (GIL released) -- nothing here touches
-/// a Python object until the single copy into the final `bytearray` at
-/// the very end.
+/// partial, corrupt tail into otherwise-good output. The whole
+/// decompression loop, *and* the single copy into the final
+/// `bytearray` at the very end, run under `Python::detach` (GIL
+/// released) -- `body` is copied into this function's own owned `Vec`
+/// up front (below), and the target `bytearray` from `new_with` isn't
+/// exposed to any Python name until its fill closure returns, so
+/// neither one touches a Python object anyone else could reach while
+/// the GIL is free. See `zlib_decompress`'s docstring for why this
+/// holds here and in `lzrw1_decompress`, but not in
+/// `decode_fixed_width_strings_ucs4`.
 #[pyfunction]
 fn decompress_grd_blocks<'py>(
     py: Python<'py>,
@@ -286,7 +309,7 @@ fn decompress_grd_blocks<'py>(
     });
 
     let out = PyByteArray::new_with(py, decompressed.len(), |buf| {
-        buf.copy_from_slice(&decompressed);
+        py.detach(|| buf.copy_from_slice(&decompressed));
         Ok(())
     })?;
     Ok((n_decoded, out))
@@ -405,12 +428,36 @@ fn decode_fixed_width_strings_ucs4<'py>(
     // side either -- `bytearray`'s buffer protocol reports itself as
     // writable, unlike `bytes`', which numpy checks honestly rather
     // than needing any "trust me" unsafe cast.
+    //
+    // Unlike this module's other `new_with` call sites (`lzrw1_decompress`,
+    // `zlib_decompress`, `decompress_grd_blocks`), this fill closure does
+    // *not* run under `Python::detach`, and that's not just an unclaimed
+    // win sitting on the table: `data` above is a zero-copy borrow (via
+    // `PyBuffer::as_slice`) that -- per the comment where it's created --
+    // can alias a live, still-Python-visible `bytearray`. Releasing the
+    // GIL while reading through that borrow would let another thread
+    // resize or otherwise mutate the same `bytearray` concurrently,
+    // which could reallocate its backing buffer out from under this
+    // still-live slice -- a genuine data race/use-after-free, not merely
+    // a theoretical one, since `raw` (see above) is documented to
+    // sometimes really be a `bytearray` a caller still holds a
+    // reference to. Doing this safely would mean copying `data` into an
+    // owned buffer first (`PyBuffer::to_vec`, as `zlib_decompress`/
+    // `decompress_grd_blocks` already do for their own inputs), trading
+    // away this function's zero-copy input read -- worth revisiting with
+    // a real benchmark given this is the one genuine hot path in this
+    // module, but not done here speculatively.
     let out = PyByteArray::new_with(py, count * max_len * 4, |buf| {
-        // Zero-initialized: unused character slots past each record's
-        // own decoded length must stay 0 (numpy's own "end of string"
-        // marker for fixed-width Unicode). `new_with`'s buffer isn't
-        // documented as pre-zeroed, so this is explicit, not assumed.
-        buf.fill(0);
+        // No explicit zeroing needed here: `PyByteArray::new_with`'s own
+        // doc comment guarantees "Before calling `init` the bytearray
+        // is zero-initialised" -- a documented part of its public API,
+        // not an implementation detail this could break on a future
+        // pyo3 upgrade. Unused character slots past each record's own
+        // decoded length staying 0 (numpy's own "end of string" marker
+        // for fixed-width Unicode) falls out of that guarantee for
+        // free; an earlier version of this comment doubted it and
+        // paid for a second, fully redundant zero-pass over the whole
+        // `count * max_len * 4`-byte buffer to be sure.
         for i in 0..count {
             let end = ends[i];
             let record_start = i * width;
