@@ -22,7 +22,16 @@ import pytest
 from pygdb import GDB
 from pygdb.gdb_reader import COMPRESSED_BLOB_HEADER_SIZE, header_fields, iter_blobs
 from pygdb.grd_reader import read_grd
-from pygdb.lzrw1 import CHUNK_MAGIC, DB_COMP_SIZE, DB_COMP_SPEED, _lzrw1_decompress_py, _native_ext, parse_chunk_header
+from pygdb.lzrw1 import (
+    CHUNK_MAGIC,
+    DB_COMP_SIZE,
+    DB_COMP_SPEED,
+    _decode_speed_blob_py,
+    _lzrw1_decompress_py,
+    _native_ext,
+    decode_speed_blob,
+    parse_chunk_header,
+)
 
 pytestmark = pytest.mark.usefixtures("samples_dir")
 
@@ -249,6 +258,57 @@ def test_lzrw1_backends_agree_on_every_real_compressed_chunk(all_gdb_sample_path
 
     if n_checked == 0:
         pytest.skip("no genuinely LZRW1-compressed chunks found in the local corpus")
+
+
+def test_speed_blobs_decode_to_the_size_their_header_declares(all_gdb_sample_paths):
+    """
+    Regression for multi-chunk DB_COMP_SPEED blobs (docs/spec.md section
+    7.3/7.4): a blob is a chain of chunks of at most 16368 decompressed
+    bytes each, and the blob header's `+24` field is the total across all
+    of them. Decoding only the first chunk -- what this reader used to do
+    -- silently truncated every channel longer than 2046 float64 values
+    on a line; this corpus has well over a thousand such blobs.
+
+    For every real Speed blob: the decoded length must equal the header's
+    declared total exactly. Where `pygdb._native` is built, its decoder
+    must also agree with the pure-Python reference on multi-chunk blobs
+    (capped, since the pure-Python decoder is slow).
+    """
+    n_blobs = n_multi = n_cross_checked = 0
+    for path in all_gdb_sample_paths:
+        with open(path, "rb") as f:
+            fields = header_fields(f.read(128))
+            page_size = fields["page_size"]
+            if fields["comp_level"] != DB_COMP_SPEED or page_size is None:
+                continue
+            for blob in iter_blobs(path):
+                f.seek(blob.offset)
+                header = f.read(COMPRESSED_BLOB_HEADER_SIZE)
+                raw_span = f.read(blob.n_pages * page_size - COMPRESSED_BLOB_HEADER_SIZE)
+                if len(header) < COMPRESSED_BLOB_HEADER_SIZE or raw_span[:8] != CHUNK_MAGIC:
+                    continue  # bare blob, not a chunk chain at all
+                if len(raw_span) < 28 or struct.unpack_from("<i", raw_span, 8)[0] != DB_COMP_SPEED:
+                    continue
+                total = struct.unpack_from("<i", header, 24)[0]
+                if total <= 0:
+                    continue
+                out = decode_speed_blob(raw_span, total)
+                assert len(out) == total, (
+                    f"{os.path.basename(path)}: blob_index={blob.blob_index} decoded "
+                    f"{len(out)} byte(s), header declares {total}"
+                )
+                n_blobs += 1
+                if parse_chunk_header(raw_span, 0).decompressed_length < total:
+                    n_multi += 1
+                    if _native_ext is not None and n_cross_checked < 25:
+                        assert bytes(out) == bytes(_decode_speed_blob_py(raw_span, total)), (
+                            f"{os.path.basename(path)}: blob_index={blob.blob_index} backend mismatch"
+                        )
+                        n_cross_checked += 1
+
+    if n_blobs == 0:
+        pytest.skip("no DB_COMP_SPEED chunk chains found in the local corpus")
+    assert n_multi > 0, "expected at least one multi-chunk blob in the corpus this regression covers"
 
 
 def test_zlib_backends_agree_on_every_real_compressed_chunk(all_gdb_sample_paths):

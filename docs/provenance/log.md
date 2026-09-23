@@ -3047,3 +3047,98 @@ a direct continuation of §6.8 rather than by session. **Not yet wired
 into a reader function** -- this session was scoped to confirming the
 finding and its reliability, not implementing a decoder or changing
 `to_geoh5`'s defaults.
+
+
+## Session 5 -- a user-reported silent truncation: `DB_COMP_SPEED` blobs are chains of chunks (2026-09-23)
+
+A user reported a problem with a real file and supplied it for
+debugging, on the condition that nothing identifying it be recorded. It
+is therefore described here only as "the supplied file": several hundred
+MB, `DB_COMP_SPEED`, a handful of lines, a few dozen channels.
+
+**What was asked.** Work out what goes wrong reading it.
+
+**What was tried, in order.**
+
+1. Opened it: no exception, no warning. Read every populated channel on
+   every line: still no exception -- but every numeric channel had
+   exactly 2046 rows and the 255-wide string channels exactly 64, from a
+   file whose real-line blobs held hundreds of MB. That mismatch (a few
+   MB decoded out of several hundred) was the first sign the reader was
+   quietly under-reading rather than failing.
+2. Ruled out the container: `iter_blobs` walked the chain to exactly the
+   file size, so no blobs were being missed. The lines and populated
+   channels were real; the *contents* of each blob were short.
+3. Noticed 2046 x 8 = 16368 bytes, the ~16KB "largest real chunk" that
+   `rust/src/lib.rs`'s module docs already mentioned -- one chunk's
+   worth. Read `read_blob_values`: its DB_COMP_SPEED branch parsed
+   exactly one chunk (`parse_chunk_header(raw_span, 0)`) and stopped.
+4. Confirmed on raw bytes: a blob's span held one magic occurrence, but
+   the first chunk ended after ~2KB of a ~350-page blob. At
+   `16 + chunk_length` sat a *bare* 12-byte sub-header, not a magic --
+   the same `f0 3f 00 00` (16368) + plausible length + `0xF4E5D6C7`
+   marker -- and the int32 16368 recurred at exactly the offsets a chain
+   of such chunks predicts. (NOTES.md section 6.6e.)
+5. Read the 56-byte blob header for a way to know where the chain ends:
+   `+24` matched the sum of every chunk's `decompressed_length` on all of
+   the file's real-line blobs; `+28` matched `16 + sum(chunk_length)`;
+   `+48` matched the row count. Also found the bytes after the last
+   chunk are non-zero padding, so "stop at zeros" is not an option.
+6. **Checked whether this was specific to the supplied file: it is not.**
+   Ran the same header-vs-chain comparison over this project's own
+   corpus: 1,656 of 7,015 Speed blobs are multi-chunk (e.g. one in
+   `DB_EM_293.gdb` with `+24` = 16480, first chunk 16368), all of which
+   the reader had been silently truncating. `DB_COMP_SIZE` was checked
+   too and is unaffected (a single zlib stream, `+24`-exact on 3,414 of
+   3,414 blobs).
+7. Decoded every chunk in the supplied file after the fix: numeric
+   channels on a line now agree on row count (hundreds of thousands, up
+   from 2046), string channels match them, values are continuous across
+   the 2046-row seams. One channel on one line is genuinely shorter --
+   its own header `+48` row count says so -- which is what the file
+   declares, not a decode error.
+
+8. **Checked the fix against independent ground truth.** The user also
+   supplied companion spreadsheet exports of the same survey (one
+   workbook per lines' worth of data). Aligning spreadsheet rows to
+   decoded rows by the ID column: every spreadsheet row was found in a
+   decoded line (100% for two workbooks, all but 20 rows for the third),
+   and for the full-length lines 12-14 of the 15 numeric columns match a
+   decoded channel **exactly on every row** -- including all the rows
+   past the first 2046, at the chunk seams and at the tail, which the old
+   reader never returned. That is the first check in this project of the
+   chunk-chain decode against data that did not come from the file.
+9. **The columns that did not match turned out to be a second, separate
+   problem, not a decode error.** Three spreadsheet columns per workbook
+   (one in the third) had no exact counterpart -- but their values were
+   exactly the same *multiset* as a decoded channel's, in a different row
+   order (smooth in the spreadsheet, scrambled against the rest of the
+   line in the decoded data). Decoding the *first* blob for that
+   (line, channel) directly reproduced the spreadsheet row for row; the
+   reader (`GDB._ensure_blob_index`, "last blob wins") had returned a
+   *later* blob for the same (line, channel). The file holds 30 of 110
+   real (line, channel) pairs twice -- two blobs, same `blob_index`,
+   same values in two different row orders. Comparing both copies with
+   the spreadsheets showed **neither "first wins" nor "last wins" is
+   right**: the last copy is current for two pairs on one line, the first
+   for six pairs on the other lines. Nothing in the two copies' blob
+   headers distinguishes them (identical timestamp, totals and reserved
+   fields; only the compressed size differs), and the metadata region
+   before the first blob holds no directory of blob page numbers or
+   offsets (searched for every blob's page number and byte offset: only
+   chance hits). NOTES.md section 6.6f. Not fixed here -- how the format
+   marks the current copy is still unknown.
+10. **Not specific to the supplied file:** 2 of the 22 corpus files also
+    have duplicated (line, channel) blobs (345 of 116,683 pairs), so the
+    reader's "last wins" has been an untested assumption there too.
+
+**What it changed.** NOTES.md section 6.6e (new) and `docs/spec.md`
+sections 7.3-7.5: the chain-of-chunks framing, and `+24`/`+28`/`+48`
+promoted from [LIKELY] "first-chunk preview" to [CONFIRMED] with their
+real meaning. Reader: `decode_speed_blob` in `pygdb/lzrw1.py` and (kept
+in step) `rust/src/lib.rs`, used by `read_blob_values`.
+
+**Why it slipped through.** Every earlier ground-truth check compared
+leading values (which the first chunk gets right) and small blobs;
+nothing compared a decoded length with an independent row count. `+48`
+is exactly such a count, and is not yet used as a cross-check.

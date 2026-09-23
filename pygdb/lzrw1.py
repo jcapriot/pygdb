@@ -15,9 +15,10 @@ reference C wrapper:
   1. No 4-byte FLAG_BYTES prefix (the reference C code's own
      FLAG_COMPRESS/FLAG_COPY byte + 3 padding bytes) -- the control word
      starts immediately for a compressed chunk.
-  2. Each chunk (which may span several of the file's physical
-     1024-byte pages) is preceded by a 28-byte Geosoft-specific wrapper,
-     not part of LZRW1 itself:
+  2. The first chunk of a blob (which may span several of the file's
+     physical 1024-byte pages) is preceded by a 28-byte Geosoft-specific
+     wrapper, not part of LZRW1 itself (see point 4 for what follows
+     it):
        - 16 bytes: the magic sub-header shared with the `.grd` sibling
          format and with `.gdb`'s DB_COMP_SIZE (zlib) mode:
          `0f 0e ff fe  12 34 56 78  <subtype int32>  <reserved int32>`
@@ -49,6 +50,21 @@ reference C wrapper:
          values). Every real marker value found across all 10 real
          Speed files was one of these two constants -- zero exceptions,
          zero unrecognized third values.
+  4. **A blob is a chain of chunks, not one chunk** ([CONFIRMED] on
+     every Speed blob checked -- see docs/spec.md section 7.3/7.4). A
+     chunk decompresses to at most 16368 bytes (2046 float64 values);
+     a channel holding more data than that on one line is split across
+     several chunks stored back to back. Only the *first* chunk of a
+     blob carries the 16-byte magic; each later one is just its own
+     bare 12-byte `<decompressed_length> <chunk_length> <marker>`
+     sub-header immediately followed by its payload, starting
+     `chunk_length` bytes after the previous sub-header began. The
+     blob header (docs/spec.md section 7.4) records the total
+     decompressed size at `+24`, which is how a reader knows when to
+     stop -- the bytes after the last chunk are page padding, not
+     zeros, so they can't be relied on as a terminator. Every chunk
+     decoded independently (LZRW1 back-references never reach across
+     a chunk boundary).  See `decode_speed_blob`.
 
 Validated exactly (not just "plausibly") against **all 10 real**
 DB_COMP_SPEED files now in this project's sample set (the original 4
@@ -72,6 +88,7 @@ from __future__ import annotations
 import struct
 import warnings
 from dataclasses import dataclass
+from typing import List, Optional
 
 try:
     from . import _native as _native_ext
@@ -208,7 +225,8 @@ def _lzrw1_decompress_py(data: bytes, start: int, decompressed_length: int) -> b
 
 @dataclass
 class SpeedChunk:
-    magic_offset: int          # file offset of the 16-byte magic sub-header
+    magic_offset: Optional[int]  # offset of the 16-byte magic sub-header; None for a
+                                 # continuation chunk, which has no magic of its own
     subtype: int                # 1 = DB_COMP_SPEED, 2 = DB_COMP_SIZE
     decompressed_length: int
     chunk_length: int          # includes the 12-byte length sub-header
@@ -361,11 +379,135 @@ def decode_speed_chunk(data: bytes, chunk: SpeedChunk):
         ) from e
 
 
+def decode_speed_blob(data: bytes, total_decompressed_length: int = 0):
+    """
+    Decode every chunk of a DB_COMP_SPEED blob, in order.
+
+    Parameters
+    ----------
+    data : bytes or bytearray
+        The blob's compressed span, starting at the 16-byte magic of its
+        first chunk (i.e. everything after the blob header,
+        docs/spec.md section 7.4).
+    total_decompressed_length : int, optional
+        The blob's total decompressed size in bytes, from its header
+        (`+24`, docs/spec.md section 7.4). Decoding continues chunk by
+        chunk until this many bytes have been produced. If not positive
+        (a header that doesn't carry it, as in some hand-built
+        fixtures), only the first chunk is decoded.
+
+    Returns
+    -------
+    bytearray or bytes
+        The concatenated output of every chunk. A single-chunk blob
+        returns exactly what `decode_speed_chunk` does for it (no extra
+        copy); a multi-chunk one is a new, writable `bytearray`.
+
+    Raises
+    ------
+    LZRW1DecodeError
+        If any chunk fails to decode (see `decode_speed_chunk`), the
+        chain runs off the end of `data`, or the chunks don't add up
+        to exactly `total_decompressed_length`.
+
+    Notes
+    -----
+    A blob is a chain of chunks of at most 16368 decompressed bytes
+    each, not a single chunk (module docstring point 4): only the first
+    carries the 16-byte magic, and every later one is a bare 12-byte
+    sub-header plus payload starting `chunk_length` bytes after the
+    previous sub-header began. This reader used to decode only the first
+    chunk, silently truncating any channel longer than 2046 float64
+    values on a line to exactly that length.
+
+    Dispatches to the compiled `pygdb._native` extension when it's
+    available and `data` is `bytes` (same algorithm, ported to Rust --
+    see `rust/src/lib.rs`), falling back to the pure-Python
+    `_decode_speed_blob_py` below otherwise. The native version raises
+    `ValueError`/`IndexError` for the same conditions; both are turned
+    into `LZRW1DecodeError` here, so callers never see which backend
+    produced a failure.
+    """
+    if _native_ext is not None and isinstance(data, bytes):
+        try:
+            return _native_ext.decode_speed_blob(data, total_decompressed_length)
+        except (ValueError, IndexError) as e:
+            raise LZRW1DecodeError(str(e)) from e
+    return _decode_speed_blob_py(data, total_decompressed_length)
+
+
+def _decode_speed_blob_py(data: bytes, total_decompressed_length: int = 0):
+    """
+    Pure-Python reference implementation of `decode_speed_blob`.
+
+    Parameters
+    ----------
+    data : bytes or bytearray
+        See `decode_speed_blob`.
+    total_decompressed_length : int, optional
+        See `decode_speed_blob`.
+
+    Returns
+    -------
+    bytearray or bytes
+        See `decode_speed_blob`.
+
+    Raises
+    ------
+    LZRW1DecodeError
+        See `decode_speed_blob`.
+    """
+    first = parse_chunk_header(data, 0)
+    out = decode_speed_chunk(data, first)
+    if total_decompressed_length <= len(out):
+        return out
+
+    parts: List[bytes] = [out]
+    produced = len(out)
+    header_start = first.payload_offset - 12  # where this chunk's sub-header began
+    chunk_length = first.chunk_length
+    while produced < total_decompressed_length:
+        if chunk_length < 12:
+            raise LZRW1DecodeError(
+                f"implausible chunk_length={chunk_length} -- corrupt chunk chain"
+            )
+        header_start += chunk_length
+        try:
+            decompressed_length, chunk_length, marker = struct.unpack_from(
+                "<iii", data, header_start
+            )
+        except struct.error as e:
+            raise LZRW1DecodeError(
+                f"chunk chain runs off the end of the data after {produced} of "
+                f"{total_decompressed_length} byte(s) -- truncated data"
+            ) from e
+        chunk = SpeedChunk(
+            magic_offset=None,
+            subtype=DB_COMP_SPEED,
+            decompressed_length=decompressed_length,
+            chunk_length=chunk_length,
+            marker=marker,
+            payload_offset=header_start + 12,
+        )
+        parts.append(decode_speed_chunk(data, chunk))
+        produced += decompressed_length
+
+    if produced != total_decompressed_length:
+        raise LZRW1DecodeError(
+            f"chunks decode to {produced} byte(s) but the blob header declares "
+            f"{total_decompressed_length}"
+        )
+    return bytearray().join(parts)
+
+
 def find_speed_chunks(data: bytes):
     """
     Yield every DB_COMP_SPEED (subtype==1) chunk found in `data`.
 
-    Scans for the shared 16-byte magic byte-by-byte.
+    Scans for the shared 16-byte magic byte-by-byte. Since only the
+    *first* chunk of a blob carries that magic (see `decode_speed_blob`),
+    this finds one chunk per blob, not every chunk -- it's a scanning
+    helper for locating blobs, not a way to decode them.
 
     Parameters
     ----------

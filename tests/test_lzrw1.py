@@ -20,13 +20,19 @@ from pygdb.lzrw1 import (
     LZRW1DecodeError,
     MARKER_COMPRESSED,
     MARKER_STORED_RAW,
+    decode_speed_blob,
     decode_speed_chunk,
     find_speed_chunks,
     lzrw1_decompress,
     parse_chunk_header,
 )
 
-from helpers import encode_lzrw1_literal, encode_lzrw1_literal_then_copy, pack_speed_chunk_wrapper
+from helpers import (
+    encode_lzrw1_literal,
+    encode_lzrw1_literal_then_copy,
+    pack_speed_chunk_wrapper,
+    pack_speed_continuation_chunk,
+)
 
 
 @pytest.fixture(params=["python", "native"])
@@ -152,3 +158,81 @@ def test_find_speed_chunks_skips_size_mode_chunks():
     header = CHUNK_MAGIC + struct.pack("<ii", 2, 0)  # subtype=2 (Size), not Speed
     data = header + b"\x00" * 20
     assert list(find_speed_chunks(data)) == []
+
+
+
+# -- multi-chunk blobs (docs/spec.md section 7.3) -------------------------------
+
+def _three_chunk_blob():
+    """A first chunk (with magic) plus two bare continuation chunks, mixing
+    stored-raw and LZRW1-compressed payloads, and the expected output."""
+    raw1 = struct.pack("<4d", 1.0, 2.0, 3.0, 4.0)
+    raw3 = struct.pack("<2d", 9.0, 10.0)
+    # Middle chunk: LZRW1 with a back-reference, to show each chunk is
+    # decoded independently (its copy reaches only into its own output).
+    literal = struct.pack("<d", 5.0)[:6]
+    payload2 = encode_lzrw1_literal_then_copy(literal, copy_offset=6, copy_length=10)
+    raw2 = lzrw1_decompress(payload2, 0, 16)
+    data = (
+        pack_speed_chunk_wrapper(raw1, len(raw1), MARKER_STORED_RAW)
+        + pack_speed_continuation_chunk(payload2, 16, MARKER_COMPRESSED)
+        + pack_speed_continuation_chunk(raw3, len(raw3), MARKER_STORED_RAW)
+    )
+    return data, bytes(raw1) + bytes(raw2) + bytes(raw3)
+
+
+def test_decode_speed_blob_chains_every_chunk(backend):
+    """
+    Regression: only the first chunk of a blob carries the 16-byte magic;
+    later ones are a bare 12-byte sub-header plus payload. A reader that
+    decodes just the first chunk silently truncates any channel longer
+    than one chunk (2046 float64 values in real files).
+    """
+    data, expected = _three_chunk_blob()
+    out = decode_speed_blob(data, total_decompressed_length=len(expected))
+    assert bytes(out) == expected
+    assert isinstance(out, bytearray)  # writable, like a single chunk's result
+
+
+def test_decode_speed_blob_ignores_page_padding_after_the_last_chunk(backend):
+    """The padding after a blob's last chunk is not zeros in real files, so
+    the declared total -- not the padding -- has to end the chain."""
+    data, expected = _three_chunk_blob()
+    padded = data + bytes(range(1, 200))
+    assert bytes(decode_speed_blob(padded, len(expected))) == expected
+
+
+@pytest.mark.parametrize("total", [0, -1, 3])  # no usable total, or smaller than chunk 1
+def test_decode_speed_blob_without_a_larger_total_decodes_only_the_first_chunk(backend, total):
+    data, expected = _three_chunk_blob()
+    assert bytes(decode_speed_blob(data, total)) == expected[:32]
+
+
+def test_decode_speed_blob_single_chunk_matches_decode_speed_chunk(backend):
+    payload = struct.pack("<3d", 1.5, 2.5, 3.5)
+    data = pack_speed_chunk_wrapper(payload, len(payload), MARKER_STORED_RAW)
+    assert decode_speed_blob(data, len(payload)) == decode_speed_chunk(data, parse_chunk_header(data, 0))
+
+
+def test_decode_speed_blob_truncated_chain_raises(backend):
+    data, expected = _three_chunk_blob()
+    with pytest.raises(LZRW1DecodeError):
+        decode_speed_blob(data[:-20], len(expected))
+    with pytest.raises(LZRW1DecodeError):  # header promises far more than the data holds
+        decode_speed_blob(data, 10**9)
+
+
+def test_decode_speed_blob_chunks_overshooting_the_total_raises(backend):
+    data, expected = _three_chunk_blob()
+    with pytest.raises(LZRW1DecodeError):
+        decode_speed_blob(data, len(expected) - 8)  # lands mid-way through the last chunk
+
+
+def test_decode_speed_blob_bad_continuation_chunk_raises(backend):
+    first = pack_speed_chunk_wrapper(struct.pack("<d", 1.0), 8, MARKER_STORED_RAW)
+    bad_marker = pack_speed_continuation_chunk(struct.pack("<d", 2.0), 8, 0x1234)
+    with pytest.raises(LZRW1DecodeError):
+        decode_speed_blob(first + bad_marker, 16)
+    bad_length = struct.pack("<iii", 0, 12, MARKER_STORED_RAW)  # implausible decompressed_length
+    with pytest.raises(LZRW1DecodeError):
+        decode_speed_blob(first + bad_length, 16)

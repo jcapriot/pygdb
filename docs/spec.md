@@ -516,6 +516,33 @@ field above instead). Validated exhaustively (every chunk, not a
 sample) against all real Speed-mode files with the chunked scheme:
 6,995 chunks, zero failures.
 
+**A blob is a chain of chunks — [CONFIRMED].** The 16-byte magic plus
+12-byte sub-header above describe the *first* chunk only. A chunk
+decompresses to at most **16368 bytes** (2046 `float64` values); a
+channel holding more data than that on one line is split across
+several chunks stored back to back. Every chunk after the first has
+**no magic of its own** — just its bare 12-byte sub-header, immediately
+followed by its payload, starting `chunk_length` bytes after the
+previous chunk's sub-header began:
+
+```
+[16-byte magic][sub-header 1][payload 1][sub-header 2][payload 2] … [page padding]
+```
+
+Each chunk is decoded independently (an LZRW1 back-reference never
+reaches across a chunk boundary), and the outputs are concatenated. The
+bytes after the last chunk are ordinary page padding and are **not
+zeros** (non-zero on most real blobs checked), so they can't be used to
+find the end of the chain — the blob header's total decompressed size
+(§7.4, `+24`) is what tells a reader when to stop. Checked on every
+real Speed blob in this project's corpus (7,015 blobs, 1,656 of them
+multi-chunk) and on every real-line blob of a separately supplied, much
+larger file (all of them multi-chunk): the chain's decompressed
+lengths sum to exactly the header's `+24` total, with zero exceptions.
+A reader that decodes only the first chunk silently truncates every
+channel longer than 2046 `float64` values per line (2046 rows, or fewer
+for wider element types) — the bug behind this correction.
+
 **Why some chunks are stored raw instead of compressed — [CONFIRMED]
 to be a per-chunk data-compressibility outcome, not a size effect.**
 Tested and refuted a specific hypothesis (do smaller channels get
@@ -540,11 +567,11 @@ records, not exhaustively decoded:
 | Rel. offset | Field | Status |
 |---|---|---|
 | `+0..+15` | Same magic/`n_pages`/`n_pages_dup`/`blob_index` layout as the plain header | **[CONFIRMED]** |
-| `+24` | A preview of the first chunk's `decompressed_length` | **[LIKELY]** |
-| `+28` | `chunk_length + 16` — the first chunk's total on-disk span including its own magic | **[LIKELY]** |
+| `+24` | **Total decompressed size of the blob, in bytes, across every chunk** (§7.3). For a single-chunk blob this equals the chunk's own `decompressed_length`. `DB_COMP_SIZE` blobs too: their one zlib stream decompresses to exactly this many bytes | **[CONFIRMED]** — 7,015 Speed blobs and 3,414 Size blobs in the corpus, plus every real-line blob of a separately supplied file, zero exceptions |
+| `+28` | `16 + Σ chunk_length` over the whole chain — the chain's total on-disk span including the first chunk's magic | **[CONFIRMED]** — same 7,015 Speed blobs and the separately supplied file's, zero exceptions |
 | `+40` | float64 `1.0` (same scale-factor convention as elsewhere) | **[LIKELY]** |
-| `+48` | Real row count, for at least one single-chunk blob checked | **[LIKELY]** |
-| `+52` | `GS_*` type code, for the same case | **[LIKELY]** |
+| `+48` | **Real row count** of the whole blob (`+24` ÷ element width, for numeric types) | **[CONFIRMED]** for numeric channels — 7,015 of 7,015 corpus Speed blobs |
+| `+52` | `GS_*` type code | **[LIKELY]** |
 | `+56` | The 16-byte page-primitive magic (§7.1) begins here | **[CONFIRMED]** |
 
 **A real third on-disk blob variant — "bare" blobs.** Some individual
@@ -570,7 +597,10 @@ all of it to the decompressor in one call (`zlib.decompressobj()` for
 `DB_COMP_SIZE`, correctly finding the real end of stream and reporting
 the rest as harmless page padding; the LZRW1 chunk's own
 `decompressed_length`/`chunk_length` fields for `DB_COMP_SPEED`,
-already agnostic to page boundaries) decodes correctly. Verified on
+already agnostic to page boundaries) decodes correctly — but note that
+for `DB_COMP_SPEED` the span holds a *chain* of chunks, not one (§7.3),
+so "one call" means walking the chain up to the header's total, not
+decoding the first chunk and stopping. Verified on
 real blobs up to 47 pages, both compression modes, including a
 36-page array-channel blob whose decoded values matched independent
 ground truth exactly.
