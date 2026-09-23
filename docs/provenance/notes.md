@@ -1911,6 +1911,201 @@ numbers or byte offsets in the file's metadata region (searched for all
 padding is non-zero, consistent with re-used freed space, but ghost
 headers of freed blobs were not looked for.
 
+**A follow-up search for the marker (Session 5, all negative) -- and one
+useful positive finding.** Everything below was checked on the supplied
+file; the last two items also on the corpus.
+
+- *Blob header, raw bytes.* All 56 header bytes plus the 16-byte chunk
+  magic sub-header were diffed between the copies of 13 duplicated pairs
+  (8 verified against the spreadsheets, 5 labelled by the row-order test
+  below): they differ **only** in `n_pages`, `n_pages_dup` and `+28`
+  (the compressed size). `timestamp` is `INT_MIN` on **every** blob of the
+  file (unset, not a usable clock); `+20` is a kind code (100 for the
+  administrative blobs, 202 for compressed data), the same for both
+  copies; `+32`/`+36` are zero except on the short channel's blobs
+  (identical in both copies).
+- *No directory of blob locations anywhere.* The 141 pages before the
+  first blob are the header, then symbol-table records (channels, lines,
+  ...); the sparse pages are 8 empty 128-byte records each, with a default
+  category value at byte 108. Searching the **whole file** for each of 26
+  blobs' (start, size) pair in 9 encodings (absolute/relative page + page
+  count, in both orders; start + end page; byte offset + size as int32
+  and int64) found nothing; searching the pre-blob region for every
+  blob's page number and byte offset found only coincidences. The same
+  pair search on the metadata region of the two corpus files that have
+  duplicates found nothing either.
+- *The administrative blobs* (all 66 decoded): none holds blob positions.
+  The first (`blob_index` 10000, the base that appears in the file header
+  as word 48) is text-like metadata; the one-page ones are structured
+  per-channel-slot records (a constant type word at `+12`) and are
+  themselves sometimes duplicated, identically.
+- *Line and channel records* carry no per-channel or per-blob fields.
+- *Simple rules.* Every "pick the copy with the larger/smaller X" rule over
+  chain position, offset, `n_pages`, compressed size, allocation slack,
+  and neighbour size was scored on the 13 labelled pairs: the best gets
+  10 of 13 (smaller compressed size), and it misses two spreadsheet-
+  verified pairs outright -- and is really just the smoothness test in
+  disguise (smoother data compresses smaller). No rule fits all 13.
+
+**How the allocator seems to behave -- [LIKELY], from the supplied file's
+allocation slack** (`n_pages` minus the pages the blob's own data needs).
+A blob at the very end of the chain is exactly page-sized (slack 0); one
+sitting in the middle often has hundreds or thousands of pages of slack,
+up to about 13,000. That fits **whole-extent re-use of freed space with no
+splitting**: a rewritten channel goes into a previously freed extent (or
+is appended at the end), and the old blob is left in place until
+something re-uses its extent. So a newer copy can sit *before* the older
+one in the chain -- which is exactly why "last wins" is right for some
+pairs of that file and wrong for others.
+
+**The corpus's own duplicates are a different, milder kind -- looked at
+directly, with no independent ground truth for either file.**
+
+- `SAMAGEM_CDI.gdb` (uncompressed): **one** float channel (`CVG`) is
+  duplicated, on every line (206 pairs). The two copies' headers are
+  **byte-for-byte identical** (same `n_pages`), so nothing in the blob
+  distinguishes them. Their **values are revisions, not reorderings**:
+  same length, median correlation 0.96 (minimum 0.75), a typical maximum
+  difference of about 1.4 (largest 18), and the same *set* of values on
+  only 1 of 207 lines. The new copies are appended, mostly in an adjacent
+  batch (chain positions 5217-5514 of 6066), and the old ones stay where
+  they were -- so a **same-size rewrite is appended, not overwritten in
+  place**, and the old blob is simply left behind. The second copy is
+  marginally smoother on 132 of 206 lines (median roughness ratio 0.95),
+  which is weak evidence that it is the newer, refined version; that is
+  an inference, not a checked fact.
+- `DB_EM_293.gdb` (`DB_COMP_SPEED`): the two coordinate channels are
+  duplicated on 139 lines, with **identical decoded values**. In 128
+  pairs the headers are byte-identical; in the other 11 only `+28`
+  differs, i.e. the same values were re-encoded to a different compressed
+  size.
+
+So in this project's own Geosoft-produced files a duplicate is either
+harmless (identical values) or a revised copy, and "last wins" is a
+reasonable reading of the second; the row-reordered stale copies of the
+supplied file, and the wrong "last wins" choices they cause, appear
+nowhere in the corpus. Allocation slack was not examined in these two
+files, so whether either shows the extent re-use above is not known.
+
+**Corpus-wide checks (all 22 files) for anything that could settle it.**
+
+- *No pointer table anywhere.* For the 17 corpus files under 400 MB, the
+  fraction of live data blobs whose position -- byte offset, relative
+  offset, page number, page number relative to the first blob -- occurs
+  as a word in the metadata region or the administrative blobs is about
+  0% for byte offsets and 0-13% for page numbers (the level small
+  integers coincide at). No file has a directory of blob locations.
+- *Blob `timestamp` is set in only 2 of 22 files:* `Magnetic_Data.gdb`
+  (6,263 of 15,584 blobs) and `Radiometric_Data.gdb` (631 of 23,079).
+  Neither has a duplicated real-line data blob (`Magnetic_Data`'s 126
+  duplicated indices are administrative, with timestamps unset), so this
+  cannot say which of two data copies is newer. The supplied file, `SAMAGEM_CDI`
+  and `DB_EM_293` -- every file with duplicated data blobs -- are entirely
+  unset. Where a file does record it, timestamp is the obvious "newer"
+  field; there is currently no test case for using it.
+- *`n_pages` vs `n_pages_dup` differ on some blobs of 6 files* (`DB_EM_293`
+  20, `DB_Mag_293` 3, `DB_Mag_1212` 1, `SAMAGEM_CDI` 106, `MLGRAV` 1,
+  `MLMAG` 3), always `n_pages_dup < n_pages`. On `SAMAGEM_CDI`'s 61
+  real-line ones, `n_pages_dup` is **exactly the number of pages the data
+  needs** and `n_pages` is a larger extent: [LIKELY] extent length vs
+  pages in use, which corroborates the whole-extent re-use above with a
+  Geosoft-produced file. These 6 files and the 2 with timestamps set are
+  disjoint sets, and the supplied file is in neither: its two fields are
+  always equal even where the slack is thousands of pages, so its slack is
+  not recorded there.
+- *Header word at byte 116* is 0 in 21 of 23 files (including the supplied
+  file and `DB_EM_293`) and non-zero in exactly two: `SAMAGEM_CDI` (26966)
+  and `Magnetic_Data` (26). Meaning unknown; not the total of
+  `n_pages - n_pages_dup` (9,389 on `SAMAGEM_CDI`). It does not track
+  whether a file has duplicated blobs.
+- *Header word at byte 112* equals the pages after the first blob, i.e.
+  the sum of every blob's `n_pages`, in the three files checked (the
+  supplied file, `SAMAGEM_CDI`, `Magnetic_Data`).
+
+None of these gives ground truth for a reordered stale copy, so none can
+validate a resolution rule.
+
+**What the file's own processing history says (Session 5).** The
+per-channel registry blobs of spec section 9 sit at administrative line slot 200
+in the supplied file, with the *channel slot* as the channel part of the
+index: each records one channel's `CLASS`/`LABEL`/`UNITS` and, for a derived
+channel, a `FORMULA` and a `MAKER` (the tool that made it, then that tool's
+saved `TOOL.PARAM="value"` settings) -- the same structure `East_Isa_VTEM_Inversion`
+and `AG106386` show, where the `MAKER` is
+`geogxnet.dll(Geosoft.GX.MathExpressionBuilder.MathExpressionBuilder;RunChannel)`
+and the `FORMULA` is the human-readable expression. In the supplied file 24
+such blobs carry key/value text: 13 with a `MAKER`, 5 with a `FORMULA`, and
+the generic tool identifiers found are a 1-D FFT filter
+(`Geosoft.GX.FFT1D.FFT1DFiltering;Run`, 5 blobs), a non-linear filter
+(`nlfilt.gx`), a polygon mask (`polymask.gx`) and a grid sampler
+(`gridsamp.gx`). The tool-made ones are on channel slots 28-34, **beyond the
+28 channels the channel table lists**: the raw channel-table records for slots
+28 onward are empty apart from a default type code (byte 84), and no line has
+data blobs for those slots. So these are registry records for channel slots
+with no channel-table entry -- most simply channels that were later deleted,
+though not proven (see the next paragraph). The registry blobs are
+themselves often duplicated (2-4 copies per slot), some with different
+content. No dates were found in any of the supplied file's administrative
+blobs, so there is no wall-clock to lay along the chain.
+
+*Could those tool runs have generated data stored in the file? -- checked,
+[UNKNOWN].* Alongside the small per-channel records, the supplied file has 19
+large blobs (321 to 1,147 pages) at line slot 200 on channel slots 1, 5, 22 and
+27-34. They share the registry object's constant type word (`0x1EE100FF` at
+body offset 12, followed by a length), carry the non-numeric type code
+`4670802` and a header row count of 1, and several are the identical size
+(41,082 eight-byte words, 321 pages). They are **not** float64 arrays (97-99%
+of their 8-byte words are neither plausible values, zero, nor the Geosoft dummy
+value; none of the values checked match real line data), and **not**
+compressed (entropy from 1.5 to 5.6 bits/byte; no zlib or chunk magic). So
+whether they hold the tools' generated data or only their serialized state is
+not established; the layout is undecoded.
+
+*What the stale copies are, in that light -- the same rows, re-sorted.*
+Recovering the row mapping between the two copies of each duplicated numeric
+channel (by unique-value matching, so it only works where values are
+mostly distinct):
+
+- On a line, **every duplicated channel uses the identical mapping**: the
+  mapping agrees on 100% of the rows each pair of channels can both place.
+  On the two lines whose duplicated channels have mostly distinct values
+  (coordinates, latitude/longitude and similar; 45-88% of rows placeable)
+  that is 88,000 to 216,000 rows per pair; on the other two, where the
+  duplicated channels are mostly tied values, only 100-250 rows per pair
+  could be placed (all agreeing). One reordering operation, applied to a
+  *subset* of the line's channels, not independent edits.
+- On two of the lines the **stale order is exactly sorted by the X
+  coordinate channel** (slot 2; the file's own `DB_CHAN_X` registry entry
+  names it, non-decreasing fraction 1.0000), while the **current** order
+  is sorted by the ID, date and time channels (slots 0, 12, 13). On another
+  line the first copy of slot 25 is exactly sorted while its last copy is
+  not, i.e. the sort key differs between lines. The mapping is not a
+  reversal or block shuffle (longest contiguous runs of consecutive rows
+  ~100).
+- So the stale copies are **temporary spatially sorted working copies**,
+  and the current copies are in acquisition order -- consistent with the
+  file's own history, which includes profile/spatial tools (FFT filter,
+  non-linear filter, polygon mask, grid sampling) that plausibly need
+  spatially ordered input. **[GUESS]** that these tools' sort step is what
+  left the copies behind: a sort creates no channel, so it leaves no
+  `MAKER`, and nothing recorded names it.
+
+**Caveat on the oracle.** The row-order/smoothness test used elsewhere in this
+section labels the acquisition-order copy as current; here that is now
+explained rather than merely observed. It is still a heuristic, not a
+decoded field.
+
+**How the row order can be checked -- a validation oracle, not a rule.**
+A stale copy in the supplied file holds the same values as the current
+one in a different row order, so it is measurably rougher along the line
+(median row-to-row step over the 5-95% spread). This agreed with the
+spreadsheets on every pair it could decide (6 of 6; 2 undetermined) and
+never contradicted them, which is what makes the 5 extra labels usable.
+It needs the channel to be physically smooth, so it cannot be a general
+reader rule; it is offered only as the opt-in `GDB(..., duplicate_blobs="row_order")`
+(PR #5), which also refuses to judge a perfectly monotone copy (a channel
+re-sorted by its own value leaves a ramp that beats any smoothness test).
+
 **What would settle it:** finding whatever the real implementation uses
 to locate the current blob -- most likely an on-disk allocation/free
 structure not yet identified, or a flag in a place not yet examined.
