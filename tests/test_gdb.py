@@ -1320,3 +1320,119 @@ def test_gdb_does_not_warn_for_duplicates_in_administrative_slots(tmp_path):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         npt.assert_array_equal(db.read("L100", "Easting"), [100.0, 100.5, 101.0])
+
+
+# -- duplicate_blobs="row_order" (issue #2) ---------------------------------------
+
+_N_ROWS = 120
+_SMOOTH = np.sin(np.linspace(0.0, 3.0, _N_ROWS)) * 100.0 + np.linspace(0.0, 50.0, _N_ROWS)
+_ROUGH = _SMOOTH[np.random.default_rng(7).permutation(_N_ROWS)]  # same values, scrambled order
+
+
+def _reorder_fixture(tmp_path, first, last, fiducial=None, easting=None, name="reorder.gdb"):
+    """One line with an ID-like channel and a `Value` channel written twice:
+    `first` in the base file, `last` appended later in the blob chain."""
+    channels = [
+        ChannelSpec("Fiducial", dtype_code=3),
+        ChannelSpec("Easting", dtype_code=5),
+        ChannelSpec("Value", dtype_code=5),
+    ]
+    fid = list(range(1, _N_ROWS + 1)) if fiducial is None else fiducial
+    lines = [LineSpec("L100", data={
+        "Fiducial": fid,
+        "Easting": list(np.linspace(1000.0, 1100.0, _N_ROWS) if easting is None else easting),
+        "Value": list(first),
+    })]
+    data = build_gdb_bytes(channels, lines) + pack_plain_blob(2, list(last), dtype_code=5)
+    path = tmp_path / name
+    path.write_bytes(data)
+    return str(path)
+
+
+def test_row_order_policy_prefers_the_acquisition_order_copy(tmp_path):
+    """
+    The stale copy is the same values re-sorted (issue #2); when it is the
+    *later* blob, "last wins" returns scrambled data. With the opt-in
+    policy the smooth, earlier copy is used instead -- and it says so.
+    """
+    from pygdb import GDBParseWarning
+
+    path = _reorder_fixture(tmp_path, first=_SMOOTH, last=_ROUGH)
+
+    with pytest.warns(GDBParseWarning, match=r"more than one blob"):
+        default = GDB(path).read("L100", "Value")
+    npt.assert_array_equal(default, _ROUGH)  # unchanged default: last in chain order
+
+    with pytest.warns(GDBParseWarning, match=r"row_order.*switched 1 pair.*'L100'.*'Value'"):
+        chosen = GDB(path, duplicate_blobs="row_order").read("L100", "Value")
+    npt.assert_array_equal(chosen, _SMOOTH)
+
+
+def test_row_order_policy_keeps_the_last_copy_when_it_is_already_the_smooth_one(tmp_path):
+    from pygdb import GDBParseWarning
+
+    path = _reorder_fixture(tmp_path, first=_ROUGH, last=_SMOOTH)
+    with pytest.warns(GDBParseWarning, match=r"no pair needed switching"):
+        chosen = GDB(path, duplicate_blobs="row_order").read("L100", "Value")
+    npt.assert_array_equal(chosen, _SMOOTH)
+
+
+def test_row_order_policy_never_second_guesses_a_revised_copy(tmp_path):
+    """Different values (a genuine revision, like a recomputed channel) are
+    not a reordering, however much rougher the later copy is."""
+    from pygdb import GDBParseWarning
+
+    revised = _ROUGH + 0.5  # not the same multiset as _SMOOTH
+    path = _reorder_fixture(tmp_path, first=_SMOOTH, last=revised)
+    with pytest.warns(GDBParseWarning, match=r"no pair needed switching"):
+        chosen = GDB(path, duplicate_blobs="row_order").read("L100", "Value")
+    npt.assert_array_equal(chosen, revised)
+
+
+def test_row_order_policy_needs_an_order_defining_channel_on_the_line(tmp_path):
+    """Without an ID/time-like channel stored in monotone order there's no
+    evidence what acquisition order is, so the policy stays out of it."""
+    from pygdb import GDBParseWarning
+
+    rng = np.random.default_rng(3)
+    scrambled_ids = list(rng.permutation(_N_ROWS))
+    scrambled_easting = list(rng.permutation(np.linspace(1000.0, 1100.0, _N_ROWS)))
+    path = _reorder_fixture(
+        tmp_path, first=_SMOOTH, last=_ROUGH, fiducial=scrambled_ids, easting=scrambled_easting,
+    )
+    with pytest.warns(GDBParseWarning, match=r"no pair needed switching"):
+        chosen = GDB(path, duplicate_blobs="row_order").read("L100", "Value")
+    npt.assert_array_equal(chosen, _ROUGH)
+
+
+def test_default_policy_is_last_and_warning_points_at_the_option(tmp_path):
+    from pygdb import GDBParseWarning
+
+    path = _reorder_fixture(tmp_path, first=_SMOOTH, last=_ROUGH)
+    db = GDB(path)
+    assert db.duplicate_blobs == "last"
+    with pytest.warns(GDBParseWarning, match=r"duplicate_blobs='row_order'"):
+        db.read("L100", "Value")
+
+
+def test_invalid_duplicate_blobs_policy_raises_before_opening_the_file(tmp_path):
+    path = tmp_path / "never_opened.gdb"  # doesn't exist: a bad option must fail first
+    with pytest.raises(ValueError, match=r"duplicate_blobs"):
+        GDB(str(path), duplicate_blobs="first")
+
+
+def test_row_order_pick_unit_cases():
+    from pygdb.gdb import _row_order_pick
+
+    assert _row_order_pick(_SMOOTH, _ROUGH) == 0
+    assert _row_order_pick(_ROUGH, _SMOOTH) == 1
+    assert _row_order_pick(_SMOOTH, _SMOOTH[::-1]) is None      # reversal: equally smooth
+    assert _row_order_pick(_SMOOTH, _SMOOTH + 1.0) is None      # revised values
+    assert _row_order_pick(_SMOOTH, _SMOOTH[:-1]) is None       # different length
+    assert _row_order_pick(np.zeros(100), np.zeros(100)) is None  # constant: nothing to judge
+    ints = np.round(_SMOOTH * 10).astype(int)
+    assert _row_order_pick(ints, np.random.default_rng(1).permutation(ints)) == 0  # integer dtype
+    # a copy that is itself a perfect ramp is never judged, whichever side it is on
+    ramp = np.sort(_SMOOTH)
+    assert _row_order_pick(ramp, _SMOOTH) is None
+    assert _row_order_pick(_SMOOTH, ramp) is None
