@@ -461,6 +461,46 @@ def test_read_blob_values_compressed_lzrw1_stored_raw(tmp_path):
     npt.assert_array_equal(values, [7, 8])
 
 
+def test_read_blob_values_compressed_lzrw1_multi_chunk_regression(tmp_path):
+    """
+    Regression: a DB_COMP_SPEED blob is a *chain* of chunks of at most
+    16368 decompressed bytes (2046 float64 values) each, not one chunk --
+    only the first carries the 16-byte magic, later ones are a bare
+    12-byte sub-header plus payload (docs/spec.md section 7.3), and the
+    blob header's `+24` field is the total decompressed size across all
+    of them. `read_blob_values` used to decode only the first chunk, so
+    any channel holding more than 2046 float64 values on a line came
+    back silently truncated to exactly 2046 rows, with no warning.
+    """
+    from pygdb.gdb_reader import ChannelRecord
+
+    chunk_rows = 2046
+    rows = 2 * chunk_rows + 100  # two full chunks plus a short last one
+    expected = np.arange(rows, dtype="<f8")
+    raw = expected.tobytes()
+    sizes = [chunk_rows * 8, chunk_rows * 8, 100 * 8]
+    offsets = [0, sizes[0], sizes[0] + sizes[1]]
+    parts = [raw[o:o + n] for o, n in zip(offsets, sizes)]
+    chain = helpers.pack_speed_chunk_wrapper(parts[0], sizes[0], helpers.MARKER_STORED_RAW)
+    for part in parts[1:]:
+        chain += helpers.pack_speed_continuation_chunk(part, len(part), helpers.MARKER_STORED_RAW)
+    # Real blobs are padded out to whole pages with non-zero bytes.
+    chain += bytes([0xAB]) * 300
+    blob_bytes = helpers.pack_compressed_blob_header(len(raw)) + chain
+    path = _write(tmp_path, "multi_chunk.gdb", blob_bytes)
+
+    blob = BlobHeader(
+        offset=0, n_pages=1, n_pages_dup=1, blob_index=0,
+        timestamp=0, reserved_200=0, scale=1.0, row_count=0, gs_type_code=5,
+    )
+    channel = ChannelRecord(index=0, offset=0, name="x", dtype_code=5, format_code=0, raw=b"")
+
+    values = read_blob_values(path, blob, channel, comp_level=1, page_size=len(blob_bytes))
+    assert len(values) == rows
+    npt.assert_array_equal(values, expected)
+    assert values.flags.writeable
+
+
 def test_read_blob_values_bare_blob_inside_compressed_file(tmp_path):
     """
     docs/spec.md section 7.4: a real third on-disk variant -- a blob

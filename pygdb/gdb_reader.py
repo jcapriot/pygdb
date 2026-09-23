@@ -1682,11 +1682,16 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
     established ground truth exactly) and for both single- and
     multi-page DB_COMP_SPEED (a real 2-page `Northing_AMGz55` blob
     decodes to sane real coordinates with real `rDUMMY` sentinels).
-    See docs/provenance/notes.md section 6.6d: a multi-page blob is
-    simply one continuous compressed stream spanning the whole
-    `n_pages*page_size` span, not one independently-framed chunk per
-    page -- no special multi-page logic was actually needed once this
-    was verified, just reading the full span instead of one page.
+    See docs/provenance/notes.md section 6.6d: a multi-page blob has no
+    per-page re-framing -- just read the full `n_pages*page_size` span
+    instead of one page. **A DB_COMP_SPEED blob is, however, a chain of
+    chunks of at most 16368 decompressed bytes each, not one chunk**
+    (docs/provenance/notes.md section 6.6e): only the first carries the
+    16-byte magic, later ones are a bare 12-byte sub-header plus
+    payload, and the blob header's `+24` field is the total
+    decompressed size across the chain. Decoding only the first chunk
+    -- as this function once did -- silently truncated any channel
+    longer than 2046 float64 values on a line.
 
     **A real third on-disk variant, auto-detected here rather than
     assumed away (docs/provenance/notes.md section 6.6b):** even
@@ -1769,11 +1774,11 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
     # to be a SINGLE continuous compressed stream spanning the whole
     # n_pages*page_size span -- NOT one independently-framed chunk per
     # page. There is no per-page re-framing to handle: reading the full
-    # span and decompressing it as one stream (zlib.decompressobj()
-    # naturally stops at the real end of stream and reports the rest as
-    # padding; the LZRW1 chunk header's own decompressed_length/
-    # chunk_length fields already span the full compressed length
-    # regardless of how many pages it spilled into) is sufficient.
+    # span is sufficient for zlib (zlib.decompressobj() naturally stops
+    # at the real end of stream and reports the rest as padding, and its
+    # single stream always matches the blob header's `+24` total). LZRW1
+    # is different: the span holds a chain of chunks, not one -- see the
+    # DB_COMP_SPEED branch below.
     if page_size is None:
         with _file_handle(path, file) as f:
             header = f.read(128)
@@ -1838,9 +1843,19 @@ def read_blob_values(path: str, blob: BlobHeader, channel: ChannelRecord,
                 )
                 return np.array([])
     elif subtype == _lzrw1.DB_COMP_SPEED:
+        # A blob is a chain of chunks of at most 16368 decompressed bytes
+        # each (docs/spec.md section 7.3); the blob header's `+24` field
+        # is the total across all of them, and is what tells the decoder
+        # where the chain ends (the bytes after the last chunk are page
+        # padding, not a reliable terminator).
+        with _file_handle(path, file) as f:
+            f.seek(blob.offset + 24)
+            total_field = f.read(4)
+        total_decompressed = (
+            struct.unpack("<i", total_field)[0] if len(total_field) == 4 else 0
+        )
         try:
-            chunk = _lzrw1.parse_chunk_header(raw_span, 0)
-            decompressed = _lzrw1.decode_speed_chunk(raw_span, chunk)
+            decompressed = _lzrw1.decode_speed_blob(raw_span, total_decompressed)
         except _lzrw1.LZRW1DecodeError as e:
             _warn(
                 f"blob_index={blob.blob_index}: LZRW1 chunk decode failed ({e}) "

@@ -1775,6 +1775,149 @@ Working code: `reader/gdb_reader.py` (`read_blob_values()`'s
 negative-`row_count` administrative blobs in both the plain and
 "bare"-variant code paths).
 
+### 6.6e A `DB_COMP_SPEED` blob is a chain of chunks, not one -- [CONFIRMED]: a silent-truncation bug in section 6.6b/6.6d's reader, and what the blob header's `+24`/`+28`/`+48` fields really are
+
+*(Session 5. Prompted by a user-reported problem with a real file that
+the reader had accepted without complaint but whose contents looked
+wrong. That file was supplied on the condition that nothing identifying
+it be recorded, so it is described here only as "a separately supplied
+file"; every claim about it below is the kind that generalizes, and each
+is independently checked against this project's own corpus.)*
+
+**The symptom.** The reader opened the file without error or warning,
+but every numeric channel on every line came back with exactly **2046
+rows** and every 255-wide string channel with exactly **64** -- from a
+file several hundred MB in size whose blob chain nonetheless accounted
+for every byte up to end-of-file. 2046 float64 values is 16368 bytes,
+and 64 x 255 is 16320 <= 16368: both are the same "one chunk's worth"
+of decompressed data, a strong hint that only one chunk per blob was
+being decoded.
+
+**The cause -- checked directly against raw bytes.** Section
+6.6b/6.6d treated a `DB_COMP_SPEED` blob as one chunk (16-byte magic +
+12-byte `<decompressed_length> <chunk_length> <marker>` sub-header +
+payload), on the strength of the corpus files where most blobs really
+are one chunk. In the supplied file, a blob's first chunk was a small
+fraction of the blob's `n_pages*page_size` span, and only **one**
+occurrence of the 16-byte magic existed in the whole span. Dumping the
+bytes at `16 + chunk_length` (the end of the first chunk) showed the
+next thing was *not* a magic but a bare 12-byte sub-header --
+`f0 3f 00 00` (`decompressed_length` = 16368), a plausible
+`chunk_length`, then the same `0xF4E5D6C7` "compressed" marker -- and
+searching the span for the int32 16368 found it recurring at exactly
+the offsets `16 + sum(chunk_length)` predicts. So: **only the first
+chunk of a blob carries the magic; every later chunk is a bare
+sub-header + payload, starting `chunk_length` bytes after the previous
+sub-header began.** A chunk decompresses to at most 16368 bytes;
+anything larger is split.
+
+**The blob header fields that make this tractable -- [CONFIRMED].** The
+56-byte compressed-blob header (section 6.6b) had `+24`/`+28`/`+48`
+marked [LIKELY] as a "preview" of the first chunk. Walking the chain
+and comparing, on every real Speed blob:
+
+| Field | Actual meaning | Evidence |
+|---|---|---|
+| `+24` | **Total decompressed bytes across the whole chain** | sum of chunk `decompressed_length` == `+24` on 7,015 of 7,015 corpus Speed blobs and every real-line blob of the supplied file |
+| `+28` | `16 + sum(chunk_length)` (the chain's whole on-disk span) | same blobs, zero exceptions |
+| `+48` | **Real row count** of the whole blob (`+24` / element width) | 7,015 of 7,015 corpus numeric Speed blobs |
+
+This also explains section 6.6b's old observation that "`blob.row_count`
+isn't populated for compressed blobs": `BlobHeader` parses the 48-byte
+*plain* layout, so it reads the wrong bytes for a 56-byte compressed
+header; the real row count sits at `+48`. (`DB_COMP_SIZE` blobs: their
+one zlib stream decompresses to exactly `+24` bytes on 3,414 of 3,414
+corpus blobs, so zlib is unaffected.)
+
+**The end of the chain can't be found by looking at what follows it.**
+The bytes after a blob's last chunk are page padding and are **not
+zeros** (non-zero on most of the supplied file's real-line blobs), so a
+"stop at zeros" loop would misfire; the `+24` total is the terminator.
+Every chunk decodes independently -- a back-reference never reaches
+across a boundary -- and the concatenation is continuous across the
+2046-row seams (median absolute jump at a chunk boundary comparable to
+the median ordinary step, on coordinate channels).
+
+**This was not specific to the supplied file.** Checked against the
+existing corpus: **1,656 of 7,015 Speed blobs are multi-chunk** (e.g. a
+`DB_EM_293.gdb` blob with `+24` = 16480 but a first chunk of 16368: a
+second chunk of 112 bytes, 14 float64 values) -- so the reader had been
+silently dropping the tail of every such channel all along. It went
+unnoticed because ground-truth checks (sections 6.6/6.6d) compared
+leading values, which the first chunk gets right, and because nothing in
+the reader compared a decoded length against any independent count.
+
+**What changed in the reader.** `pygdb.lzrw1.decode_speed_blob` (and its
+Rust twin, `pygdb._native.decode_speed_blob`) walks the chain until the
+`+24` total is reached; `read_blob_values` reads `+24` and uses it. A
+header without a usable total (a hand-built fixture) still decodes just
+the first chunk. Regression tests: synthetic multi-chunk fixtures at the
+`lzrw1` and `read_blob_values` levels (the latter fails with
+`assert 2046 == 4192` on the old code), a cross-backend check, and a
+corpus test asserting every real Speed blob decodes to exactly its
+header's `+24` total.
+
+**Also found while validating this (section 6.6f):** the same file has duplicate
+blobs for one (line, channel), and "last wins" is not always the right copy.
+
+**Still open:** `read_blob_values` doesn't use `+48` as an independent
+row-count cross-check (it could, and would have caught this); whether a
+Speed chain ever mixes a stored-raw chunk with compressed ones in one
+blob was not specifically hunted for, though the decoder handles any
+mix.
+
+### 6.6f Duplicate blobs for one (line, channel) -- [CONFIRMED] they exist; which copy is current is [UNKNOWN], and neither "first" nor "last" is right
+
+*(Session 5, found while checking section 6.6e's fix against independent
+spreadsheet exports of the supplied file -- described only abstractly, as
+elsewhere.)*
+
+**Observation.** The blob chain can hold **two blobs with the same
+`blob_index`**, i.e. the same (line, channel), the append-only storage
+this format uses (compare the stale registry entries of section 6.8b)
+leaving an older copy behind when a channel is rewritten. In the
+supplied file 30 of 110 real (line, channel) pairs are duplicated; in
+this project's corpus, 2 of 22 files are (345 of 116,683 pairs).
+`GDB._ensure_blob_index` keeps the **last** blob in chain order, an
+assumption nothing had tested.
+
+**The two copies of a numeric pair hold the same values in a different
+row order** (same multiset -- sorted arrays equal -- on every numeric
+pair checked; row count equal; often a different compressed size).
+Presumably a re-sort of the line followed by a partial rewrite: a copy
+that is not in the row order of the line's other channels (its ID,
+coordinates) is stale, and reads as physically implausible data
+(a smooth quantity such as a modelled field value comes back scrambled
+against position).
+
+**Which copy is current, checked against the spreadsheets.** For the
+eight duplicated pairs that have a spreadsheet counterpart and where the
+copies differ:
+
+| (line, channel) pairs | Copy that matches the spreadsheet |
+|---|---|
+| 2 pairs on one line | the **last** copy in the chain |
+| 6 pairs on the other two lines | the **first** copy in the chain |
+
+so "last wins" -- the reader's rule -- returns scrambled data for the
+second group, and "first wins" would for the first. (Identical
+duplicate pairs -- 5 of the 30 -- are harmless either way.)
+
+**What does *not* tell the copies apart** (each checked): every field of
+the 56-byte blob header other than `n_pages`/`+28` (timestamp, `+20`,
+`+24` total size, row count, type code); and any directory of blob page
+numbers or byte offsets in the file's metadata region (searched for all
+206 blobs' page numbers and offsets: only coincidental hits). The blob
+padding is non-zero, consistent with re-used freed space, but ghost
+headers of freed blobs were not looked for.
+
+**What would settle it:** finding whatever the real implementation uses
+to locate the current blob -- most likely an on-disk allocation/free
+structure not yet identified, or a flag in a place not yet examined.
+A purely data-driven fallback (prefer the copy whose row order is
+consistent with the line's ID/coordinate channels) is possible but is a
+heuristic, not a decoded field, so it is deliberately **not** implemented.
+
 ### 6.7 REG/coordinate-system (IPJ) metadata — [CONFIRMED] located and partially decoded; full record layout [UNKNOWN]
 
 *(Session 3, continued. Prompted by a coordinator ask: REG/coordinate-

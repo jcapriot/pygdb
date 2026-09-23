@@ -238,6 +238,29 @@ def pack_speed_chunk_wrapper(payload: bytes, decompressed_length: int, marker: i
     return header + length_header + payload
 
 
+def pack_speed_continuation_chunk(payload: bytes, decompressed_length: int, marker: int) -> bytes:
+    """
+    A second-or-later chunk of a multi-chunk DB_COMP_SPEED blob
+    (docs/spec.md section 7.3): just the bare 12-byte sub-header --
+    *no* 16-byte magic, which only the blob's first chunk carries --
+    immediately followed by its payload. `chunk_length` includes the 12
+    header bytes, as for a first chunk.
+    """
+    return struct.pack("<iii", decompressed_length, 12 + len(payload), marker) + payload
+
+
+def pack_compressed_blob_header(total_decompressed_length: int) -> bytes:
+    """
+    The 56-byte header preceding a compressed blob's chunk chain
+    (docs/spec.md section 7.4), zero-filled except for the one field
+    the reader needs: `+24`, the blob's total decompressed size across
+    every chunk.
+    """
+    header = bytearray(56)
+    struct.pack_into("<i", header, 24, total_decompressed_length)
+    return bytes(header)
+
+
 def encode_lzrw1_literal(data: bytes) -> bytes:
     """
     Encode `data` (at most 16 bytes) as one canonical LZRW1 group: a

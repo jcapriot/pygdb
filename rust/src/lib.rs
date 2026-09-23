@@ -148,6 +148,175 @@ fn lzrw1_decompress_impl(data: &[u8], start: usize, out: &mut [u8]) -> PyResult<
     Ok(())
 }
 
+const DB_COMP_SPEED: i32 = 1;
+const MARKER_COMPRESSED: i32 = -186263865; // 0xF4E5D6C7 -- payload is real LZRW1
+const MARKER_STORED_RAW: i32 = -253635901; // 0xF0E1D2C3 -- payload is stored verbatim
+
+/// A chunk's 12-byte `<decompressed_length> <chunk_length> <marker>`
+/// sub-header, read from `data[header_start..]`.
+fn read_chunk_subheader(data: &[u8], header_start: usize) -> PyResult<(i32, i32, i32)> {
+    let bytes = header_start
+        .checked_add(12)
+        .and_then(|end| data.get(header_start..end))
+        .ok_or_else(|| {
+            PyIndexError::new_err(
+                "decode_speed_blob: chunk chain runs off the end of the data -- truncated",
+            )
+        })?;
+    let field = |i: usize| i32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+    Ok((field(0), field(4), field(8)))
+}
+
+/// Decode one chunk's payload into `out` (exactly its `decompressed_length`
+/// bytes) -- the Rust counterpart of `pygdb.lzrw1.decode_speed_chunk`,
+/// with the same checks in the same order.
+fn decode_speed_chunk_into(
+    data: &[u8],
+    header_start: usize,
+    chunk_length: i32,
+    marker: i32,
+    out: &mut [u8],
+) -> PyResult<()> {
+    let payload_offset = header_start + 12;
+    match marker {
+        MARKER_STORED_RAW => {
+            if chunk_length as i64 - 12 != out.len() as i64 {
+                return Err(PyValueError::new_err(format!(
+                    "decode_speed_blob: stored-raw chunk should have chunk_length-12 == \
+                     decompressed_length (got chunk_length-12={}, decompressed_length={})",
+                    chunk_length as i64 - 12,
+                    out.len(),
+                )));
+            }
+            let payload = data
+                .get(payload_offset..payload_offset + out.len())
+                .ok_or_else(|| {
+                    PyIndexError::new_err(
+                        "decode_speed_blob: truncated stored-raw payload -- file cut off mid-chunk?",
+                    )
+                })?;
+            out.copy_from_slice(payload);
+            Ok(())
+        }
+        MARKER_COMPRESSED => lzrw1_decompress_impl(data, payload_offset, out),
+        other => Err(PyValueError::new_err(format!(
+            "decode_speed_blob: unrecognized marker value: {other}"
+        ))),
+    }
+}
+
+/// Walk a whole `DB_COMP_SPEED` blob's chain of chunks into `out`.
+///
+/// `out.len()` is either the first chunk's `decompressed_length` (a
+/// single-chunk blob, or no usable total) or the blob's declared total; the
+/// loop stops as soon as `out` is full, and errors if a chunk would
+/// overshoot it -- matching `pygdb.lzrw1._decode_speed_blob_py`.
+fn decode_speed_chain_into(data: &[u8], out: &mut [u8]) -> PyResult<()> {
+    let mut written = 0usize;
+    let mut header_start = 16usize; // just past the first chunk's 16-byte magic
+    loop {
+        let (decompressed_length, chunk_length, marker) = read_chunk_subheader(data, header_start)?;
+        if !(0 < decompressed_length && decompressed_length < 200_000_000) {
+            return Err(PyValueError::new_err(format!(
+                "decode_speed_blob: implausible decompressed_length={decompressed_length} -- \
+                 likely a misaligned or corrupt chunk header"
+            )));
+        }
+        let end = written + decompressed_length as usize;
+        if end > out.len() {
+            return Err(PyValueError::new_err(
+                "decode_speed_blob: chunks decode to more bytes than the blob header declares",
+            ));
+        }
+        decode_speed_chunk_into(
+            data,
+            header_start,
+            chunk_length,
+            marker,
+            &mut out[written..end],
+        )?;
+        written = end;
+        if written == out.len() {
+            return Ok(());
+        }
+        if chunk_length < 12 {
+            return Err(PyValueError::new_err(format!(
+                "decode_speed_blob: implausible chunk_length={chunk_length} -- corrupt chunk chain"
+            )));
+        }
+        header_start += chunk_length as usize;
+    }
+}
+
+/// Decode every chunk of a `DB_COMP_SPEED` blob into one writable Python
+/// `bytearray`.
+///
+/// Rust port of `pygdb.lzrw1.decode_speed_blob` -- see that module's
+/// docstring (point 4) and docs/spec.md section 7.3/7.4 for the format:
+/// a blob is a chain of chunks of at most 16368 decompressed bytes each,
+/// only the first preceded by the 16-byte magic; `data` starts at that
+/// magic, and `total_decompressed_length` is the blob header's `+24`
+/// field (how the decoder knows the chain has ended -- the bytes after
+/// the last chunk are page padding, not zeros). A total that isn't
+/// larger than the first chunk (including 0 or negative, "no usable
+/// total") decodes just the first chunk.
+///
+/// Raises `ValueError` for a malformed chunk or chain (bad marker,
+/// implausible lengths, a total the chain doesn't add up to) and
+/// `IndexError` for truncated data -- `pygdb.lzrw1.decode_speed_blob`
+/// turns both into `LZRW1DecodeError`, so callers never see which
+/// backend produced the failure.
+///
+/// The output buffer is sized once, up front, from the first chunk's
+/// header and the declared total, then filled in place via
+/// `PyByteArray::new_with` under `Python::detach` -- the same single-
+/// allocation technique and the same GIL-release argument as
+/// `lzrw1_decompress` (`data` is `&[u8]`, so an immutable `bytes`; the
+/// target `bytearray` isn't Python-visible until this returns). A
+/// declared total larger than any real chain could produce from `data`
+/// (LZRW1 expands at most 8x, plus the 12-byte sub-headers) is rejected
+/// before allocating, so a corrupt header can't request a huge buffer.
+#[pyfunction]
+fn decode_speed_blob<'py>(
+    py: Python<'py>,
+    data: &[u8],
+    total_decompressed_length: i64,
+) -> PyResult<Bound<'py, PyByteArray>> {
+    let subtype = data
+        .get(8..12)
+        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .ok_or_else(|| PyIndexError::new_err("decode_speed_blob: truncated -- no chunk header"))?;
+    if subtype != DB_COMP_SPEED {
+        return Err(PyValueError::new_err(format!(
+            "decode_speed_blob: not a Speed chunk (subtype={subtype})"
+        )));
+    }
+    let (first_length, _, _) = read_chunk_subheader(data, 16)?;
+    if !(0 < first_length && first_length < 200_000_000) {
+        return Err(PyValueError::new_err(format!(
+            "decode_speed_blob: implausible decompressed_length={first_length} -- \
+             likely a misaligned or corrupt chunk header"
+        )));
+    }
+    let first_length = first_length as usize;
+    let out_len = if total_decompressed_length > first_length as i64 {
+        let total = total_decompressed_length as u64;
+        if total > (data.len() as u64).saturating_mul(9) {
+            return Err(PyValueError::new_err(format!(
+                "decode_speed_blob: blob header declares {total} decompressed byte(s), \
+                 more than {} byte(s) of chunk data could possibly produce",
+                data.len(),
+            )));
+        }
+        total as usize
+    } else {
+        first_length
+    };
+    PyByteArray::new_with(py, out_len, |buf| {
+        py.detach(|| decode_speed_chain_into(data, buf))
+    })
+}
+
 /// Decompress a `DB_COMP_SIZE` blob's raw zlib/DEFLATE stream into a
 /// writable Python `bytearray`.
 ///
@@ -483,6 +652,7 @@ fn decode_fixed_width_strings_ucs4<'py>(
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ping, m)?)?;
     m.add_function(wrap_pyfunction!(lzrw1_decompress, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_speed_blob, m)?)?;
     m.add_function(wrap_pyfunction!(zlib_decompress, m)?)?;
     m.add_function(wrap_pyfunction!(decompress_grd_blocks, m)?)?;
     m.add_function(wrap_pyfunction!(decode_fixed_width_strings_ucs4, m)?)?;
