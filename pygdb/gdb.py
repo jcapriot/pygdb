@@ -435,15 +435,71 @@ class GDB:
             anything beyond an occasional one-off lookup -- this class
             always wants line/channel listings and random-access
             reads, so it always builds the index.
+
+        Warns
+        -----
+        GDBParseWarning
+            If a real line's channel has more than one blob in the
+            blob chain. The **last** one in chain order is used, but
+            that is not always the current copy (issue #2): an older
+            copy with the same values in a different row order can sit
+            either before or after the current one, and nothing
+            decoded so far says which is which. Duplicates in the
+            administrative slots past the last real line (the REG/IPJ
+            registry, whose stale copies are expected and handled by
+            `pygdb.registry`) are not reported.
         """
         if self._blob_index is None:
             chans_max = self.chans_max
             index: Dict[Tuple[int, int], BlobHeader] = {}
+            duplicated: List[Tuple[int, int]] = []
             for blob in iter_blobs(self.path):
-                index[blob.line_channel(chans_max)] = blob
+                key = blob.line_channel(chans_max)
+                if key in index and key not in duplicated:
+                    duplicated.append(key)
+                index[key] = blob
             self._blob_index = index
             self._calibrate_line_indices()
+            if duplicated:
+                self._warn_duplicate_blobs(duplicated)
         return self._blob_index
+
+    def _warn_duplicate_blobs(self, duplicated: List[Tuple[int, int]]) -> None:
+        """
+        Warn about (line, channel) pairs that have more than one blob.
+
+        Parameters
+        ----------
+        duplicated : list of (int, int)
+            `(line_slot, channel_slot)` keys seen more than once in the
+            blob chain, in order of first repetition.
+
+        Warns
+        -----
+        GDBParseWarning
+            Once, naming how many real (line, channel) pairs are
+            affected and a few examples. Nothing is emitted if every
+            duplicate is in an administrative slot.
+        """
+        line_names = {line.index: line.name for line in self.lines}
+        channel_names = {c.index: c.name for c in self.channels}
+        real = [
+            (line_names[ls], channel_names.get(cs, f"#{cs}"))
+            for ls, cs in duplicated
+            if ls in line_names
+        ]
+        if not real:
+            return
+        examples = ", ".join(f"line {ln!r} channel {cn!r}" for ln, cn in real[:3])
+        more = f" and {len(real) - 3} more" if len(real) > 3 else ""
+        warnings.warn(
+            f"{self.path}: {len(real)} (line, channel) pair(s) have more than one "
+            f"blob in the blob chain ({examples}{more}) -- using the last one in "
+            f"chain order, which is not always the current copy. If a channel's "
+            f"rows look scrambled against the line's other channels, this is the "
+            f"likely cause (see issue #2)",
+            GDBParseWarning, stacklevel=4,
+        )
 
     def _calibrate_line_indices(self) -> None:
         """

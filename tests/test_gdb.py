@@ -1243,3 +1243,80 @@ def test_gdb_to_dataframe_raises_import_error_with_install_hint(db, monkeypatch)
     monkeypatch.setitem(__import__("sys").modules, "pandas", None)
     with pytest.raises(ImportError, match=r"pip install python-gdb\[pandas\]"):
         db.to_dataframe()
+
+
+# -- duplicate blobs for one (line, channel) (issue #2) --------------------------
+
+def _gdb_with_extra_blob(tmp_path, blob_index, values, name="dup.gdb"):
+    """`CHANNELS`/`LINES` plus one more float64 blob appended to the chain
+    under `blob_index` -- i.e. a second copy for whatever (line, channel)
+    that index maps to, later in the chain than the first."""
+    data = build_gdb_bytes(CHANNELS, LINES, comp_level=0)
+    data += pack_plain_blob(blob_index, values, dtype_code=5)
+    path = tmp_path / name
+    path.write_bytes(data)
+    return str(path)
+
+
+def test_gdb_warns_when_a_line_channel_has_more_than_one_blob(tmp_path):
+    """
+    The blob chain is append-only, so a (line, channel) can have a stale
+    copy as well as the current one, and "last in chain order" is not
+    always the current one (issue #2). Silently choosing between them hid
+    that; it has to be reported, naming the affected pair.
+    """
+    from pygdb import GDBParseWarning
+
+    easting_l100 = 0 * len(CHANNELS) + 1  # line slot 0, channel slot 1
+    path = _gdb_with_extra_blob(tmp_path, easting_l100, [7.0, 8.0, 9.0])
+    db = GDB(path)
+
+    with pytest.warns(GDBParseWarning, match=r"more than one blob.*'L100'.*'Easting'"):
+        values = db.read("L100", "Easting")
+
+    npt.assert_array_equal(values, [7.0, 8.0, 9.0])  # last in chain order, as documented
+
+
+def test_gdb_duplicate_blob_warning_is_emitted_once(tmp_path):
+    import warnings
+
+    from pygdb import GDBParseWarning
+
+    path = _gdb_with_extra_blob(tmp_path, 1, [7.0, 8.0, 9.0])
+    db = GDB(path)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        db.read("L100", "Easting")
+        db.read("L100", "Easting")
+        db.read("L200", "Easting")
+    assert sum(issubclass(w.category, GDBParseWarning) for w in caught) == 1
+
+
+def test_gdb_does_not_warn_for_a_file_without_duplicate_blobs(db):
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        npt.assert_array_equal(db.read("L100", "Easting"), [100.0, 100.5, 101.0])
+        assert db.channels_on_line("L200")
+
+
+def test_gdb_does_not_warn_for_duplicates_in_administrative_slots(tmp_path):
+    """
+    Blobs past the last real line hold the REG/IPJ registry, whose stale
+    copies are expected (and handled by `pygdb.registry`); reporting them
+    would make the warning noise on nearly every real file.
+    """
+    import warnings
+
+    admin_slot = len(LINES) * len(CHANNELS)  # first line slot past the real lines
+    data = build_gdb_bytes(CHANNELS, LINES, comp_level=0)
+    data += pack_plain_blob(admin_slot, [1.0], dtype_code=5)
+    data += pack_plain_blob(admin_slot, [2.0], dtype_code=5)
+    path = tmp_path / "admin_dup.gdb"
+    path.write_bytes(data)
+    db = GDB(str(path))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        npt.assert_array_equal(db.read("L100", "Easting"), [100.0, 100.5, 101.0])
