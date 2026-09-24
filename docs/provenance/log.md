@@ -3132,6 +3132,40 @@ MB, `DB_COMP_SPEED`, a handful of lines, a few dozen channels.
     have duplicated (line, channel) blobs (345 of 116,683 pairs), so the
     reader's "last wins" has been an untested assumption there too.
 
+11. **Tried to find how the format marks the current copy -- nothing
+    found.** Diffed every header byte and the chunk sub-header of 13
+    duplicated pairs' copies (only sizes differ; every timestamp is
+    `INT_MIN`); looked for a directory of blob locations in the metadata
+    region, in all 66 administrative blobs, in the line/channel records and
+    (a whole-file search) for 26 blobs' (start, size) pairs in 9 encodings
+    -- none; scored every simple size/position rule against 13 labelled
+    pairs -- none fits (best 10 of 13). What did come out: the allocation
+    slack pattern (whole-extent re-use of freed space, so a newer blob can
+    precede the older one), and that the corpus's own duplicates look like
+    the plain "append the rewrite, abandon the old blob" case (206 pairs of
+    one revised channel in one file, headers byte-identical, values
+    revised not reordered; 139 pairs with identical values in another)
+    -- no independent ground truth for either, so which copy is current is
+    still an inference there. NOTES.md section 6.6f. Still [UNKNOWN] how the current copy
+    is marked; possibly it is not persisted at all. Also checked all 22 corpus files: no pointer table
+    in any; blob timestamps set in only 2 files, neither with a duplicated
+    data blob; `n_pages` != `n_pages_dup` in 6 files (extent length vs pages
+    in use, [LIKELY]); header word 116 non-zero in two files, meaning
+    unknown. 12. **Looked for processing steps that might explain the reordered
+    copies, and whether the format records "channel math" at all.** It does
+    -- spec section 9's registry is per-channel, in the supplied file as in the
+    corpus (`FORMULA` = the expression, `MAKER` = tool + saved parameters,
+    including tool records for channel slots with no channel-table entry, and
+    large registry-format objects whose contents are undecoded). Tools recorded:
+    channel math, 1-D FFT filter, non-linear filter, polygon mask, grid
+    sampler. Recovering the row mapping between each duplicated channel's two
+    copies showed it is **one operation shared by every duplicated channel on
+    a line**, and that the stale order is exactly **sorted by the X coordinate**
+    (registry-confirmed slot 2) on two lines, with the current order sorted
+    by ID/date/time -- i.e. temporary spatially-sorted copies of a subset of
+    channels. Which tool left them is a [GUESS]; no dates exist in the
+    administrative blobs to order the steps. NOTES.md section 6.6f.
+
 **What it changed.** NOTES.md section 6.6e (new) and `docs/spec.md`
 sections 7.3-7.5: the chain-of-chunks framing, and `+24`/`+28`/`+48`
 promoted from [LIKELY] "first-chunk preview" to [CONFIRMED] with their
