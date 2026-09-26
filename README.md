@@ -152,6 +152,7 @@ zensical serve
   boundary on reverse engineering.
 - [`docs/provenance/`](docs/provenance/index.md) — the original
   research log and write-up this implementation was derived from.
+- [`CHANGELOG.md`](CHANGELOG.md) — what changed in each release.
 
 ## Testing
 
