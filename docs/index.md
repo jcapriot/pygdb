@@ -78,6 +78,30 @@ See [the format specification](spec.md) for the on-disk structure this
 library implements, with a confidence rating (confirmed / likely /
 guess / unknown) on every field.
 
+## Files with duplicate blobs
+
+The blob chain is append-only, so a `.gdb` can hold two blobs for the same
+(line, channel). `GDB` uses the last one and emits a `GDBParseWarning`
+naming the affected pairs, but that isn't always the current copy: in one
+real file the older copy was a re-sorted version of the same values (a
+temporary spatial sort left behind), sometimes *after* the current one
+in the chain, which reads as a channel scrambled against the rest of its
+line. No on-disk marker for the current copy has been found (see
+[the provenance notes](provenance/notes.md), issue #2), so there is an
+opt-in heuristic:
+
+```python
+db = GDB("survey.gdb", duplicate_blobs="row_order")
+```
+
+For a duplicated numeric channel whose two copies hold exactly the same
+values in a different order, on a line with an ID/time-like channel
+stored in monotone order, this prefers the copy that varies smoothly
+along the rows (acquisition order) when the other is at least 3x rougher.
+Revised copies (different values), perfectly sorted copies and anything
+ambiguous keep the last copy, and a warning always says what it changed.
+It is a heuristic, not a decoded field, which is why it is off by default.
+
 ## Exporting to xarray
 
 ```sh
