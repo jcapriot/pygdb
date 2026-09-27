@@ -30,9 +30,13 @@ from .gdb_reader import (
     check_magic,
     header_fields,
     iter_blobs,
+    read_blob_directory,
     read_blob_values,
     read_channels,
-    read_lines,
+    _read_lines,
+    DIRECTORY_ABSENT,
+    DIRECTORY_INVALID,
+    DIRECTORY_LIVE,
 )
 from .registry import find_channel_roles, find_coordinate_systems
 
@@ -58,87 +62,6 @@ _DB_COMP_CODECS = {
 # that's ambiguous). Accepted anywhere a plain name is.
 LineRef = Union[str, Tuple[str, int], "LineRecord"]
 ChannelRef = Union[str, Tuple[str, int], "ChannelRecord"]
-
-
-def _finite_values(values: np.ndarray) -> np.ndarray:
-    v = np.asarray(values, dtype=float).ravel()
-    return v[np.isfinite(v) & (np.abs(v) < 1e30)]
-
-
-def _roughness(values: np.ndarray) -> Optional[float]:
-    """
-    Median row-to-row step divided by the 5-95% spread of the values.
-
-    Returns
-    -------
-    float or None
-        Small for data that varies smoothly along its rows, large for
-        the same values in a scrambled order. None if there are too few
-        finite values or they are constant.
-    """
-    v = _finite_values(values)
-    if len(v) < 50:
-        return None
-    spread = float(np.percentile(v, 95) - np.percentile(v, 5))
-    if spread == 0.0:
-        return None
-    return float(np.median(np.abs(np.diff(v))) / spread)
-
-
-def _row_order_pick(first: np.ndarray, last: np.ndarray, factor: float = 3.0) -> Optional[int]:
-    """
-    Decide which of two copies of one channel is in acquisition order.
-
-    Parameters
-    ----------
-    first, last : numpy.ndarray
-        The earlier and later copy in the blob chain.
-    factor : float, optional
-        How many times rougher one copy must be than the other.
-
-    Returns
-    -------
-    int or None
-        0 if the *first* copy is the smooth one and the last is a
-        markedly rougher reordering of it; 1 if the last is the smooth
-        one; None if the copies are not a pure reordering of each other
-        (different values or length) or neither is clearly smoother.
-
-    Notes
-    -----
-    A copy that is *itself* perfectly monotone is never judged: a sorted
-    ramp is smoother than any real signal, and a re-sort by a channel's
-    own value (a coordinate re-sorted by itself) leaves exactly that. It
-    could equally be a genuine ID or time channel, and nothing here can
-    tell the two apart, so such a pair is undecided.
-    """
-    if len(first) != len(last):
-        return None
-    a, b = np.asarray(first).ravel(), np.asarray(last).ravel()
-    try:
-        if not np.array_equal(np.sort(a), np.sort(b), equal_nan=True):
-            return None
-    except TypeError:  # dtype without a NaN notion (integers)
-        if not np.array_equal(np.sort(a), np.sort(b)):
-            return None
-    if _is_monotone_reference(a) or _is_monotone_reference(b):
-        return None
-    ra, rb = _roughness(a), _roughness(b)
-    if ra is None or rb is None:
-        return None
-    if rb > 0 and rb >= factor * ra:
-        return 0
-    if ra > 0 and ra >= factor * rb:
-        return 1
-    return None
-
-
-def _is_monotone_reference(values: np.ndarray) -> bool:
-    """A non-constant channel stored in non-decreasing order (an ID, date or time)."""
-    v = _finite_values(values)
-    if len(v) < 50 or v[0] == v[-1]:
-        return False
-    return bool(np.mean(np.diff(v) >= 0) >= 0.999)
 
 
 @dataclass
@@ -181,20 +104,15 @@ class GDB:
     ----------
     path : str
         Path to the `.gdb` file.
-    duplicate_blobs : {"last", "row_order"}, optional
-        What to do when a (line, channel) has more than one blob in the
-        blob chain (issue #2). `"last"` (the default) uses the last one
-        in chain order. `"row_order"` is an opt-in **heuristic**, not a
-        decoded field: for a duplicated numeric channel whose two
-        copies hold exactly the same values in a different row order
-        (a stale re-sorted copy), on a line that has an order-defining
-        channel (see Notes), it prefers the copy whose values vary
-        smoothly along the rows -- acquisition order, the order the
-        line's ID/time channels are stored in -- and keeps the last
-        copy in every other case. Either way one `GDBParseWarning`
-        names the affected pairs and, for `"row_order"`, which ones it
-        overrode. Choosing needs both copies decoded, so it is done
-        once, when the blob index is first built.
+    include_unlisted_blobs : bool, optional
+        A file that carries a blob directory (see Notes) lists exactly
+        one live blob per (line, channel). By default a blob the
+        directory does not list -- an all-zero slot -- is **skipped**, as
+        if it were absent, and one `GDBParseWarning` says how many
+        (line, channel) blobs in which channels were skipped. Pass
+        `True` to read them anyway (the last copy in chain order). A
+        file with no directory, or an all-zero one, is unaffected: every
+        blob in the chain is served.
 
     Raises
     ------
@@ -203,8 +121,7 @@ class GDB:
         expected `.gdb` magic -- unlike the module-level functions in
         `gdb_reader`/`registry` (which warn and return empty results),
         since a `GDB` object that isn't backed by a real `.gdb` file
-        can't usefully do anything at all. Also if `duplicate_blobs` is
-        not one of the values above.
+        can't usefully do anything at all.
 
     Examples
     --------
@@ -234,31 +151,22 @@ class GDB:
     context manager) when done with it, or just let it get
     garbage-collected -- `__del__` closes it too, as a safety net.
 
-    `duplicate_blobs="row_order"` only ever chooses between two copies
-    of one channel that are a pure reordering of each other, and only on
-    a line with an *order-defining channel*: a single-copy numeric
-    channel of the same length stored in monotone order (typically an
-    ID, date or time). A revised copy (different values) is never
-    second-guessed, and neither is a pair with a copy that is itself
-    perfectly monotone (a re-sort by a channel's own value leaves a
-    smooth ramp that looks like the best copy but is the stale one).
-    Among a qualifying pair, the copy at least 3x
-    rougher along the rows -- median row-to-row step over the 5-95%
-    spread of the values -- is treated as the stale one, since data in
-    acquisition order varies smoothly and a re-sort scrambles that. This
-    was validated against independent spreadsheet exports of the one
-    real file known to have such copies (it never contradicted them),
-    but it cannot decide a channel that is smooth in both orders, and no
-    on-disk marker has been found that would make it unnecessary.
+    **Which copy of a blob is read.** The blob chain is append-only, so
+    a (line, channel) can have several blobs, an older stale one and
+    the current one, in either order (issue #2). The file's persisted
+    *blob directory* (docs/spec.md section 2.2) says which is current,
+    and it is the only thing consulted. A directory entry is used only
+    if its start page lands on a walked blob header whose `blob_index`
+    equals the slot and whose page count matches; if a non-zero entry
+    fails that check, the last copy in chain order is used and a
+    `GDBParseWarning` says so. Without a usable directory the last copy
+    in chain order is used, with a warning if a pair is duplicated: that
+    is a guess, and not always the current copy.
     """
 
-    def __init__(self, path: str, duplicate_blobs: str = "last"):
-        if duplicate_blobs not in ("last", "row_order"):
-            raise ValueError(
-                f"duplicate_blobs must be 'last' or 'row_order', got {duplicate_blobs!r}"
-            )
+    def __init__(self, path: str, include_unlisted_blobs: bool = False):
         self.path = path
-        self.duplicate_blobs = duplicate_blobs
+        self.include_unlisted_blobs = include_unlisted_blobs
         self._file = open(path, "rb")
         header = self._file.read(4096)
         if not check_magic(header):
@@ -270,6 +178,7 @@ class GDB:
         self._fields = header_fields(header)
         self._channels: Optional[List[ChannelRecord]] = None
         self._lines: Optional[List[LineRecord]] = None
+        self._lines_exact = False
         self._channels_by_name: Optional[Dict[str, List[ChannelRecord]]] = None
         self._lines_by_name: Optional[Dict[str, List[LineRecord]]] = None
         self._blob_index: Optional[Dict[Tuple[int, int], BlobHeader]] = None
@@ -385,7 +294,7 @@ class GDB:
     def lines(self) -> List[LineRecord]:
         """list of LineRecord: This file's line table, read once and cached."""
         if self._lines is None:
-            self._lines = read_lines(self.path)
+            self._lines, self._lines_exact = _read_lines(self.path)
             self._lines_by_name = {}
             for l in self._lines:
                 self._lines_by_name.setdefault(l.name, []).append(l)
@@ -547,219 +456,144 @@ class GDB:
         Returns
         -------
         dict of {(int, int) : BlobHeader}
-            Maps `(line_slot, channel_slot)` to `BlobHeader`, built
-            with one blob-chain walk and cached from then on.
-            `iter_blobs`/`find_blob` themselves recommend this for
-            anything beyond an occasional one-off lookup -- this class
-            always wants line/channel listings and random-access
+            Maps `(line_slot, channel_slot)` to the `BlobHeader` of its
+            live blob, built with one blob-chain walk and cached from
+            then on. `iter_blobs`/`find_blob` themselves recommend this
+            for anything beyond an occasional one-off lookup -- this
+            class always wants line/channel listings and random-access
             reads, so it always builds the index.
 
         Warns
         -----
         GDBParseWarning
-            If a real line's channel has more than one blob in the
-            blob chain. By default the **last** one in chain order is
-            used, but that is not always the current copy (issue #2):
-            an older copy with the same values in a different row order
-            can sit either before or after the current one, and nothing
-            decoded so far says which is which. With
-            `duplicate_blobs="row_order"` the warning also says which
-            pairs were switched to an earlier copy. Duplicates in the
-            administrative slots past the last real line (the REG/IPJ
-            registry, whose stale copies are expected and handled by
-            `pygdb.registry`) are not reported.
+            See `_select_live_blobs`: when blobs are skipped because the
+            file's blob directory does not list them, when a directory
+            entry fails validation, or when a pair is duplicated and
+            the file has no directory to say which copy is current.
         """
         if self._blob_index is None:
             chans_max = self.chans_max
             copies: Dict[Tuple[int, int], List[BlobHeader]] = {}
+            by_offset: Dict[int, BlobHeader] = {}
             for blob in iter_blobs(self.path):
                 copies.setdefault(blob.line_channel(chans_max), []).append(blob)
-            index: Dict[Tuple[int, int], BlobHeader] = {k: v[-1] for k, v in copies.items()}
-            duplicated = [k for k, v in copies.items() if len(v) > 1]
-            self._blob_index = index
-            self._calibrate_line_indices()
-            if duplicated:
-                overridden: List[Tuple[int, int]] = []
-                if self.duplicate_blobs == "row_order":
-                    overridden = self._prefer_row_order_copies(duplicated, copies, index)
-                self._warn_duplicate_blobs(duplicated, overridden)
+                by_offset[blob.offset] = blob
+            self._blob_index = {k: v[-1] for k, v in copies.items()}
+            if not self.lines:
+                return self._blob_index
+            if not self._lines_exact:
+                self._calibrate_line_indices()
+            self._select_live_blobs(copies, by_offset)
         return self._blob_index
 
-    def _read_copy(self, blob: BlobHeader, channel: ChannelRecord) -> np.ndarray:
-        return read_blob_values(
-            self.path, blob, channel,
-            comp_level=self.comp_level or 0, page_size=self.page_size, file=self._file,
-        )
-
-    def _prefer_row_order_copies(
+    def _select_live_blobs(
         self,
-        duplicated: List[Tuple[int, int]],
         copies: Dict[Tuple[int, int], List[BlobHeader]],
-        index: Dict[Tuple[int, int], BlobHeader],
-    ) -> List[Tuple[int, int]]:
-        """
-        Apply `duplicate_blobs="row_order"` to the duplicated pairs.
-
-        Parameters
-        ----------
-        duplicated : list of (int, int)
-            `(line_slot, channel_slot)` keys with more than one blob.
-        copies : dict of {(int, int) : list of BlobHeader}
-            Every blob for each key, in chain order.
-        index : dict of {(int, int) : BlobHeader}
-            The blob index being built; updated in place with the
-            earlier copy wherever one is preferred.
-
-        Returns
-        -------
-        list of (int, int)
-            The keys switched from the last copy to an earlier one.
-
-        Notes
-        -----
-        See the class docstring for exactly when a pair qualifies. A pair
-        that doesn't (a string or array channel, more than two copies,
-        different values, no order-defining channel on the line, or no
-        clear winner) simply keeps the last copy.
-        """
-        real_lines = {line.index for line in self.lines}
-        channels = {c.index: c for c in self.channels}
-        duplicated_keys = set(duplicated)
-        reference_cache: Dict[Tuple[int, int], bool] = {}
-        overridden: List[Tuple[int, int]] = []
-        for key in duplicated:
-            line_slot, channel_slot = key
-            channel = channels.get(channel_slot)
-            blobs = copies[key]
-            if (
-                line_slot not in real_lines or channel is None or len(blobs) != 2
-                or channel.is_string or channel.is_array
-            ):
-                continue
-            first, last = self._read_copy(blobs[0], channel), self._read_copy(blobs[1], channel)
-            if len(first) != len(last):
-                continue
-            ref_key = (line_slot, len(first))
-            if ref_key not in reference_cache:
-                reference_cache[ref_key] = self._line_has_order_reference(
-                    line_slot, len(first), duplicated_keys, channels
-                )
-            if reference_cache[ref_key] and _row_order_pick(first, last) == 0:
-                index[key] = blobs[0]
-                overridden.append(key)
-        return overridden
-
-    def _line_has_order_reference(
-        self,
-        line_slot: int,
-        n_rows: int,
-        duplicated_keys: set,
-        channels: Dict[int, ChannelRecord],
-    ) -> bool:
-        """
-        Whether a line has a channel proving its rows are in some fixed order.
-
-        Parameters
-        ----------
-        line_slot : int
-            The line's slot.
-        n_rows : int
-            The row count of the duplicated copies being judged.
-        duplicated_keys : set of (int, int)
-            Keys with more than one blob -- excluded, since their own
-            order is what is in question.
-        channels : dict of {int : ChannelRecord}
-            Channel records by slot.
-
-        Returns
-        -------
-        bool
-            True if some single-copy, numeric, non-array channel of
-            `n_rows` values on this line is stored in monotone
-            (non-decreasing) order and isn't constant -- typically an
-            ID, date or time channel.
-        """
-        for (ls, cs), blob in sorted(self._ensure_blob_index().items()):
-            channel = channels.get(cs)
-            if (
-                ls != line_slot or (ls, cs) in duplicated_keys or channel is None
-                or channel.is_string or channel.is_array
-            ):
-                continue
-            values = self._read_copy(blob, channel)
-            if len(values) == n_rows and _is_monotone_reference(values):
-                return True
-        return False
-
-    def _warn_duplicate_blobs(
-        self,
-        duplicated: List[Tuple[int, int]],
-        overridden: Sequence[Tuple[int, int]] = (),
+        by_offset: Dict[int, BlobHeader],
     ) -> None:
         """
-        Warn about (line, channel) pairs that have more than one blob.
+        Choose each real (line, channel)'s live blob using the blob directory.
 
         Parameters
         ----------
-        duplicated : list of (int, int)
-            `(line_slot, channel_slot)` keys seen more than once in the
-            blob chain.
-        overridden : sequence of (int, int), optional
-            The keys `duplicate_blobs="row_order"` switched to an
-            earlier copy.
+        copies : dict of {(int, int) : list of BlobHeader}
+            Every blob for each key, in chain order.
+        by_offset : dict of {int : BlobHeader}
+            Every blob of the chain, keyed by absolute offset.
 
         Warns
         -----
         GDBParseWarning
-            Once, naming how many real (line, channel) pairs are
-            affected and a few examples (and, for `"row_order"`, which
-            ones were switched). Nothing is emitted if every duplicate
-            is in an administrative slot.
+            Once per situation, naming counts and examples: (1) pairs
+            skipped because the directory has no live entry for them;
+            (2) pairs whose non-zero directory entry failed validation
+            (the last copy in chain order is used); (3) with no usable
+            directory at all, pairs that have more than one blob.
+            Administrative slots past the last real line (the REG/IPJ
+            registry, whose stale copies `pygdb.registry` handles
+            itself) are never judged or reported.
+
+        Notes
+        -----
+        Updates `self._blob_index` in place. See the class docstring for
+        the rules.
         """
+        index = self._blob_index
+        real_lines = {line.index for line in self.lines}
+        directory = read_blob_directory(self.path)
+        if directory is None:
+            duplicated = [k for k, v in copies.items() if len(v) > 1 and k[0] in real_lines]
+            if duplicated:
+                self._warn_pairs(
+                    f"{len(duplicated)} (line, channel) pair(s) have more than one blob in the "
+                    f"blob chain ({self._describe_pairs(duplicated)}) and the file has no blob "
+                    f"directory to say which is current -- using the last one in chain order, "
+                    f"which is not always the current copy. If a channel's rows look scrambled "
+                    f"against the line's other channels, this is the likely cause (see issue #2)"
+                )
+            return
+        first_offset = min(by_offset)
+        skipped: List[Tuple[int, int]] = []
+        invalid: List[Tuple[int, int]] = []
+        for key in copies:
+            line_slot, channel_slot = key
+            if line_slot not in real_lines:
+                continue
+            status, blob = directory.resolve(
+                line_slot * self.chans_max + channel_slot, by_offset, first_offset, self.page_size,
+            )
+            if status == DIRECTORY_LIVE:
+                index[key] = blob
+            elif status == DIRECTORY_ABSENT:
+                skipped.append(key)
+            elif status == DIRECTORY_INVALID:
+                invalid.append(key)
+        if skipped and not self.include_unlisted_blobs:
+            for key in skipped:
+                del index[key]
+            channel_names = {c.index: c.name for c in self.channels}
+            by_channel: Dict[int, int] = {}
+            for _, channel_slot in skipped:
+                by_channel[channel_slot] = by_channel.get(channel_slot, 0) + 1
+            listing = ", ".join(
+                f"{channel_names.get(cs, f'#{cs}')!r} ({n})" for cs, n in sorted(by_channel.items())[:5]
+            )
+            more = f" and {len(by_channel) - 5} more channel(s)" if len(by_channel) > 5 else ""
+            self._warn_pairs(
+                f"skipped {len(skipped)} (line, channel) blob(s) in {len(by_channel)} channel(s) "
+                f"[{listing}{more}] that the file's blob directory does not list as live. Pass "
+                f"include_unlisted_blobs=True to read them anyway"
+            )
+        if invalid:
+            self._warn_pairs(
+                f"{len(invalid)} (line, channel) pair(s) have a blob-directory entry that does not "
+                f"point at a blob with the right index and size ({self._describe_pairs(invalid)}) "
+                f"-- using the last copy in chain order for them"
+            )
+
+    def _describe_pairs(self, keys: Sequence[Tuple[int, int]], limit: int = 3) -> str:
         line_names = {line.index: line.name for line in self.lines}
         channel_names = {c.index: c.name for c in self.channels}
+        named = [
+            f"line {line_names[ls]!r} channel {channel_names.get(cs, f'#{cs}')!r}"
+            for ls, cs in keys if ls in line_names
+        ]
+        more = f" and {len(named) - limit} more" if len(named) > limit else ""
+        return ", ".join(named[:limit]) + more
 
-        def describe(keys, limit=3):
-            named = [
-                f"line {line_names[ls]!r} channel {channel_names.get(cs, f'#{cs}')!r}"
-                for ls, cs in keys if ls in line_names
-            ]
-            more = f" and {len(named) - limit} more" if len(named) > limit else ""
-            return ", ".join(named[:limit]) + more
-
-        n_real = sum(1 for ls, _ in duplicated if ls in line_names)
-        if not n_real:
-            return
-        head = (
-            f"{self.path}: {n_real} (line, channel) pair(s) have more than one "
-            f"blob in the blob chain ({describe(duplicated)})"
-        )
-        if self.duplicate_blobs == "row_order":
-            tail = (
-                f" -- duplicate_blobs='row_order': switched {len(overridden)} pair(s) to "
-                f"an earlier copy because the last copy was the same values in a "
-                f"markedly rougher row order ({describe(overridden)}); kept the last "
-                f"copy in chain order for the other {n_real - len(overridden)}. This "
-                f"is a heuristic, not a decoded field (see issue #2)"
-                if overridden else
-                f" -- duplicate_blobs='row_order': no pair needed switching, so the "
-                f"last copy in chain order was kept for all of them (see issue #2)"
-            )
-        else:
-            tail = (
-                " -- using the last one in chain order, which is not always the "
-                "current copy. If a channel's rows look scrambled against the line's "
-                "other channels, this is the likely cause; duplicate_blobs='row_order' "
-                "can pick the acquisition-order copy (see issue #2)"
-            )
-        warnings.warn(head + tail, GDBParseWarning, stacklevel=4)
+    def _warn_pairs(self, message: str) -> None:
+        # stacklevel: here -> _select_live_blobs -> _ensure_blob_index -> public method -> caller
+        warnings.warn(f"{self.path}: {message}", GDBParseWarning, stacklevel=5)
 
     def _calibrate_line_indices(self) -> None:
         """
         Correct a possible small, fixed off-by-N in every line's index.
 
-        See `find_line_table`'s and `read_lines`'s docstrings in
-        `gdb_reader.py`. Checks, for a handful of small integer shifts,
+        Only used when `read_lines` had to fall back to the
+        `find_line_table` heuristic (`self._lines_exact` is False): a
+        file whose line table is located exactly already has true
+        indices. See `find_line_table`'s and `read_lines`'s docstrings
+        in `gdb_reader.py`. Checks, for a handful of small integer shifts,
         which one makes the most already-found lines actually have at
         least one real data blob on disk for *some* channel -- then
         applies the winning shift to every `LineRecord.index` in

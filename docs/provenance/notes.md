@@ -385,6 +385,203 @@ USGS files plus one contrasting GSQ file to illustrate scaling:
 | 104 | 580000 | (not re-checked) | 3,408,620 | **[UNKNOWN]**, but a live lead | possibly an index/table-size or data-start-offset field — in the compressed file, this value sits reasonably (if not exactly) close to where the real compressed data was found to start (~3,473,480, §6.5); not precise enough to call confirmed |
 | 28, 32, 36, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 108, 112 | various (see `LOG.md` §1.16) | various | scales up roughly proportionally with `chans_max` | **[UNKNOWN]** | plausible capacity/size/count fields (`lines_max`, `blobs_max`, usage counts); values are believably-shaped (round numbers, or numbers that scale sensibly with `chans_max` between files) but not independently confirmed |
 
+### 6.1b The header words and the pre-blob layout, decoded from the vendor's `DB_INFO_*`/`DB_SYMB_*` constants -- [CONFIRMED] by exact arithmetic on all 23 files
+
+*(Session 6. Prompted by a fair challenge to this project's own §6.6f work:
+"there's still a lot left to determine about the pre-blob region -- did you
+look through there, and are there any constants in the open-source repo that
+might help?" The honest answer was: only partly -- that earlier search looked
+for a directory of blob locations and stopped there, leaving almost every
+header word `[UNKNOWN]`. §2's vendor constants, read again, held the key.)*
+
+**The constants.** §2 already recorded the vendor's `DB_INFO_*` enumeration of
+the statistics a database reports about itself, in this order: `BLOBS_MAX,
+LINES_MAX, CHANS_MAX, USERS_MAX, BLOBS_USED, LINES_USED, CHANS_USED,
+USERS_USED, PAGE_SIZE, DATA_SIZE, LOST_SIZE, FREE_SIZE, ... COMP_LEVEL,
+FILE_SIZE, INDEX_SIZE, BLOB_SIZE, MAX_BLOCK_SIZE, CHANGESLOST`, and the
+`DB_SYMB_BLOB=0, LINE=1, CHAN=2, USER=3` symbol kinds. Reading the header
+words against those, four values are already pinned (`chans_max`@24,
+`users_max`@40, `page_size`@100, `comp_level`@120); the rest fall into place
+by **exact arithmetic relations that hold in 23 of 23 files** (22 corpus files
+plus the privately supplied one -- nothing about that file is identified
+here):
+
+| Word(s) | Meaning | Relation, checked on 23 of 23 files |
+|---|---|---|
+| 84, 88, 92, 96 | capacity of the blob, line, channel and user symbol tables, in the vendor's `DB_SYMB_*` order | 92 == `chans_max`@24 and 96 == `users_max`@40; 88 == word 36; 84 == word 28 |
+| 28, 36 | `blobs_max`, `lines_max` | equal 84 and 88 |
+| 72, 76, 80, 64 | running totals of those capacities (blobs, +lines, +channels, +users = **total symbol slots**) | exact cumulative sums |
+| 48 | first `blob_index` past the (line, channel) data blobs | == `lines_max` x `chans_max` |
+| 52, 56, 60 | 48 + `blobs_max`; that + `users_max`; equal to 56 | exact |
+| 44 | end of the blob-index space | == word 60 + word 32 |
+| 32 | **cache size** | see below |
+| 104 | **size of the symbol-table region** (vendor `DB_INFO_INDEX_SIZE`) | == channel-table start + (`chans_max` + `users_max`) x 128 + 8 |
+| 108 | blob region start page (already confirmed) | == ceil(word 104 / `page_size`) |
+| 112 | number of pages in the blob region | == file pages - word 108 |
+
+This makes the "cumulative" and "index-space" words, formerly listed as
+plausible-but-unexplained, fully explained, and it explains why
+`blob_index` 10000+ (`lines_max` x `chans_max` + slot) addresses the
+administrative/registry blobs: they are indexed by **blob-symbol slot**, one
+slot per registry object, past the data blobs.
+
+**Layout of everything before the first blob** (verified in each file against
+`find_channel_table`, which was already exact):
+
+```
+0                      256-byte header
+256                    24 bytes, zero in all 23 files
+280                    blob directory: word-44 slots x 6 bytes (section 6.1c)
+b0 = l0 - blobs_max*128    blob-symbol table:  blobs_max  x 128 bytes   [position LIKELY;
+                           its first 32 bytes coincide with the last five directory slots]
+l0 = c0 - 24 - lines_max*128   line table:     lines_max  x 128 bytes   [position CONFIRMED]
+l0 + lines_max*128     24 bytes (unexplained gap)
+c0                     channel table: chans_max x 128        (found by find_channel_table)
+c0 + chans_max*128     user table:    users_max x 128
+... + users_max*128    8 bytes; end == word 104
+                       zero padding to a page boundary, then the first blob (word 108)
+```
+
+**The line table has an exact location.** `c0 - 24 - lines_max x 128` gives,
+in **all 23 files, the same lines in the same order** as the reader's heuristic
+`find_line_table` search after its blob-chain calibration; in 19 the slot
+numbers are identical too, and in the other four (`DB_Mag_1027`, `DB_Rad_1027`,
+`DB_Mag_1141`, `DB_Rad_1141`) they differ by a constant -1 -- the documented
+line-table indexing quirk (spec §3.2). The heuristic search and its
+calibration are therefore no longer needed to *find* the table (only, as
+before, to translate a physical slot into a blob-chain `line_slot`).
+
+**The blob-symbol table** sits before it by the same arithmetic. On the
+supplied file it has 350 x 128-byte records, 313 of them empty apart from a
+default `65536` at byte 108 and 37 named; a named record carries a text name
+and a size-like number at word 29 (3476, 80, ...). The position is consistent
+in the files where the table is sparsely used and is [LIKELY]; the populated-
+record layout is [UNKNOWN], and **no record holds a blob location** (searched:
+no word equals a blob's start page, plain or flag-masked).
+
+**The "front block" is the blob directory -- see section 6.1c.** Session 6's
+first reading of this region got the stride wrong and drew a wrong conclusion,
+recorded here so it is not repeated. Word 32 was the odd one out: 100 in most
+files (matching `GXDB`'s documented default `cache=100`, section 2), but 500 in
+the supplied file and 1000 / 2500 / 3750 / 5000 / 10000 in others. Between the
+two files with identical table capacities (350/200/50/10) the region differs by
+**exactly 6 bytes per unit of word 32** (62,752 bytes at 100, 65,152 at 500).
+That "6 bytes" is the slot size of the directory (6.1c), not a 12-byte entry:
+the earlier description of repeated 12-byte empty entries `(0, 0x4000,
+0x40000000)` was two consecutive 6-byte empty slots read at the wrong stride,
+and its "12 used entries `(0xC0000000 | P, 0xE0000000 | A << 16 | N, size)`" in
+the supplied file was the same mistake (there are 67 used cache slots in that
+file, and that reading combined neighbouring slots; its `A` and `size` values were
+not verified against this layout). The parts of
+that reading that stand are: `P` is a real blob's start page relative to the
+first blob and `N` its `n_pages`, on every used entry.
+
+Word 116 is non-zero (26,966 and 26) in exactly two files, `SAMAGEM_CDI` and
+`Magnetic_Data`. The first reading called them "the files with no cache
+entries"; the truth is the opposite: their cache slots are **full** (99 used of
+100 with 1 empty, and 100 of 100). Word 116 may therefore count something that
+overflowed or was evicted; still `[UNKNOWN]`/`[GUESS]`.
+
+**What this settled and did not settle for section 6.6f at the time.** It
+correctly answered "does anything in the pre-blob region record blob
+locations?" for the cache slots, but wrongly concluded that nothing lists *all*
+blobs: the same array holds the directory of every live blob (6.1c), which is
+what resolves 6.6f.
+
+### 6.1c The blob directory: which blob is current -- [CONFIRMED] layout, [LIKELY] meaning of a zero entry
+
+*(Session 6, continued. Prompted by: "account for every non-zero byte before the
+first block, label it by what it is and its range, then list what is left
+unexplained." Accounting for the region whose size grows 6 bytes per cache unit exposed
+that its slots and the array before them are one structure.)*
+
+**Layout.** An array of `word 44` slots of 6 bytes at file offset **280**
+(`uint32 word`, `uint16 n_pages`), indexed by `blob_index`:
+
+| Slots | Holds | Form |
+|---|---|---|
+| `[0, word 48)` | the (line, channel) data blobs, slot = `line_slot * chans_max + channel_slot` | `(0x80000000 | S, n_pages)`, `S` = (blob offset - first blob offset) / `page_size` |
+| `[word 48, word 52)` | registry blob-symbol slots (one per administrative blob, sections 6.4 / 9) | same, flag `0x8` or `0xC` |
+| `[word 52, word 60)` | users, and an empty gap | all-zero in every file |
+| `[word 60, word 44)` | `cache` slots (`word 32` of them) | empty = `(0x40000000, 0)`, used = same form as above, flag `0x8` or `0xC` |
+
+`word 44 = word 60 + word 32`, so the array is exactly as long as the header
+says. It starts at 280 because the 256-byte header is followed by 24 zero bytes.
+
+**Evidence (23 of 23 files: 22 corpus + the supplied file).**
+- 116,287 non-zero data-slot entries: **every one** has flag `0x8`, and its
+  `S`/`n_pages` land exactly on a blob header (`CC CC 00 FF`) whose `blob_index`
+  is the slot and whose `n_pages` equals the entry's. Zero failures.
+- The 1,302 non-zero registry-symbol slots do too (flag `0x8` in 853, `0xC` in 449).
+- The 873 used cache slots all land on real chain blobs (page and count).
+- Coverage of real (line, channel) blobs: 21 of 22 corpus files 100%. In
+  `SAMAGEM_CDI` 5,168 of 5,750 (89.9%); **the 582 unlisted are two whole
+  channels, `CVG_GSCLevel` and `mag_gsclevel`, 291 blobs each, none duplicated**;
+  both channels still have channel-table records. In the supplied file 104 of 110
+  are listed; the six unlisted are in two channels.
+- **Which copy is current (issue #2).** 345 corpus pairs have more than one blob
+  (139 in `DB_EM_293`, 206 in `SAMAGEM_CDI`); the directory lists the **last**
+  copy for every one. In the supplied file 27 duplicated pairs are listed: 19 at
+  the first copy, 8 at the last. All 13 that had an independent label (8
+  spreadsheet-verified, 5 oracle-labelled, section 6.6f) agree with the directory.
+  This is why "last in chain" was right in the corpus and wrong there.
+
+**Interpretation.** The directory is the file's own record of the live blob for
+each index; an append-only chain plus a directory of current handles is the
+ordinary shape of such a store, and a stale copy is exactly a chain blob the
+directory no longer points at. A zero entry means "not listed as live" -- which is
+what all the unlisted blobs share -- but *why* (deleted, never committed, dropped)
+is not established, so the reader's default of skipping them is a decision, not a
+decoded fact, and is switchable (`GDB(include_unlisted_blobs=True)`).
+
+**Reader wiring** (`pygdb.read_blob_directory`, `pygdb.GDB`): valid entry =
+flag `0x8`, start page is a walked blob header, its `blob_index` equals the slot,
+its `n_pages` equals the entry's. Validated against the old reader on every corpus
+file: identical blob selection in 21 of 22 (the same 21 whose blobs are all
+listed) and, in `SAMAGEM_CDI`, exactly the 582 unlisted blobs dropped. In the
+supplied file the 13 labelled pairs are all read from the labelled copy.
+
+**The exact line table** (section 6.1b) is used by `read_lines` too; on all 22
+corpus files it gives the same line names and indices as the old heuristic plus
+blob-chain calibration.
+
+**What remains unexplained** (census over the 22 corpus files, non-zero bytes
+that fit no decoded field; every non-zero byte of the supplied file is accounted
+for: decoded 1,703, likely 1,056, structure-only 284, unlabelled 0):
+
+| Where | Bytes | Files | Observation |
+|---|---:|---:|---|
+| blob-symbol record +96..+103 | 95,699 | 16 | |
+| blob-symbol record +104..+111 | 52,156 | 16 | |
+| line record +96..+103 | 93,895 | 16 | |
+| line record +0..+7 | 93,266 | 20 | |
+| line record +120..+127 | 52,455 | 22 | |
+| line record +104..+111 | 51,577 | 16 | |
+| line record +24..+31 | 42,334 | 16 | |
+| channel record +72..+79 | 4,860 | | |
+| channel record +80..+87 | 2,652 | | |
+| channel record +104..+111 | 2,550 | | |
+| channel record +96..+103 | 2,064 | | |
+| channel record +0..+7 / +112..+119 | 90 / 1 | | |
+| padding after the tables | 481 | 1 | |
+| 24-byte gap before the channel table | about 272 | 12 | |
+
+Two patterns cut across these. **In several files the most common non-zero value
+in the blob-symbol and line fields is a float dummy: float32 `-1e32` (bytes
+`ae c5 9d f4`; six in a row fill the gap in `DB_EM_293`, `DB_Mag_1213`,
+`DB_Mag_Elaine_1003` and `DB_Rad_1141`) and float64 `-1e32` (`17 6e 05 b5 b5 b8
+93 c6`, the top value of line +0..+7 in `DB_Rad_1141`)** -- i.e. these look like
+"not set" numbers, e.g. statistics initialised to the dummy. **[GUESS]**: nothing
+ties any field to a name or a use. In the other gap files the 24 bytes read as six plausible float32s
+(`DB_Mag_MountGordon_1003`: 77.6, 76.1, 75.3, 74.5, 73.8, 72.9; `MLGRAV`: -79.74,
+-79.76, ...) or as denormals (uninitialised memory?); the gap's purpose is
+unknown. The directory's last five slots also overlap the start of the region
+computed as the blob-symbol table (section 6.1c layout note).
+
+Still open: word 116; the `0x4` flag bit (`0xC` vs `0x8`, seen on cache slots and
+registry slots, never on a data slot); why some blobs have no directory entry;
+the meaning of every field in the table above.
+
 ### 6.2 Symbol table — [CONFIRMED], the strongest result on `.gdb` itself
 
 All 10 real files contain a region — found by searching for real
@@ -1924,7 +2121,11 @@ file; the last two items also on the corpus.
   administrative blobs, 202 for compressed data), the same for both
   copies; `+32`/`+36` are zero except on the short channel's blobs
   (identical in both copies).
-- *No directory of blob locations anywhere.* The 141 pages before the
+- *(Superseded: there is a directory of blob locations -- section 6.1c. This
+  search missed it because it looked for a bare page number or `(page, count)`
+  pair, not a 32-bit word with a `0x80000000` flag followed by a 16-bit count at
+  a 6-byte stride starting at offset 280.)* *No directory of blob locations
+  anywhere.* The 141 pages before the
   first blob are the header, then symbol-table records (channels, lines,
   ...); the sparse pages are 8 empty 128-byte records each, with a default
   category value at byte 108. Searching the **whole file** for each of 26
@@ -1994,7 +2195,8 @@ files, so whether either shows the extent re-use above is not known.
   offset, page number, page number relative to the first blob -- occurs
   as a word in the metadata region or the administrative blobs is about
   0% for byte offsets and 0-13% for page numbers (the level small
-  integers coincide at). No file has a directory of blob locations.
+  integers coincide at). No file has a directory of blob locations
+  *(superseded by section 6.1c)*.
 - *Blob `timestamp` is set in only 2 of 22 files:* `Magnetic_Data.gdb`
   (6,263 of 15,584 blobs) and `Radiometric_Data.gdb` (631 of 23,079).
   Neither has a duplicated real-line data blob (`Magnetic_Data`'s 126
@@ -2101,17 +2303,19 @@ one in a different row order, so it is measurably rougher along the line
 (median row-to-row step over the 5-95% spread). This agreed with the
 spreadsheets on every pair it could decide (6 of 6; 2 undetermined) and
 never contradicted them, which is what makes the 5 extra labels usable.
-It needs the channel to be physically smooth, so it cannot be a general
-reader rule; it is offered only as the opt-in `GDB(..., duplicate_blobs="row_order")`
-(PR #5), which also refuses to judge a perfectly monotone copy (a channel
-re-sorted by its own value leaves a ramp that beats any smoothness test).
+It needs the channel to be physically smooth, so it could not be a general
+reader rule; it shipped only as the opt-in `GDB(..., duplicate_blobs="row_order")`
+in 0.2.1 (PR #5), which also refused to judge a perfectly monotone copy (a channel
+re-sorted by its own value leaves a ramp that beats any smoothness test). **It has
+since been removed: the blob directory (section 6.1c) decides which copy is
+current, and agrees with every one of these labels.**
 
-**What would settle it:** finding whatever the real implementation uses
-to locate the current blob -- most likely an on-disk allocation/free
-structure not yet identified, or a flag in a place not yet examined.
-A purely data-driven fallback (prefer the copy whose row order is
-consistent with the line's ID/coordinate channels) is possible but is a
-heuristic, not a decoded field, so it is deliberately **not** implemented.
+**Settled in Session 6 (section 6.1c):** the pre-blob region holds a directory of
+the current blob for every blob index, at file offset 280. The "what would settle
+it" guess written here first -- "an on-disk allocation/free structure not yet
+identified, or a flag in a place not yet examined" -- was right in kind. The
+data-driven fallback this paragraph declined to implement was later implemented
+as `row_order`, then removed.
 
 ### 6.7 REG/coordinate-system (IPJ) metadata — [CONFIRMED] located and partially decoded; full record layout [UNKNOWN]
 

@@ -216,6 +216,138 @@ def build_gdb_bytes(
     return bytes(buf)
 
 
+def build_real_layout_gdb_bytes(
+    channels: List[ChannelSpec],
+    lines: List[LineSpec],
+    page_size: int = 64,
+    users_max: int = 2,
+    comp_level: int = 0,
+    line_table_prefix: bytes = b"",
+    spare_line_slots: int = 1,
+    directory: bool = True,
+    stale_copies: Sequence[tuple] = (),
+    unlisted: Sequence[tuple] = (),
+    corrupt_entries: Optional[dict] = None,
+) -> bytes:
+    """
+    Like `build_gdb_bytes`, but laid out the way real files are
+    (docs/spec.md section 2.1/2.2): header, 24 bytes, blob directory at
+    offset 280, blob-symbol table, line table (`lines_max` slots),
+    24-byte gap, channel table, user table, page padding, blob chain --
+    with the header words (`lines_max`, `blobs_max`, the directory slot
+    counts, ...) the reader now relies on.
+
+    Parameters
+    ----------
+    line_table_prefix, spare_line_slots
+        Raw records placed before `lines`' own, and empty capacity slots
+        after them (`lines_max` covers all three).
+    directory : bool
+        Write a live directory entry for every listed blob. `False`
+        leaves the directory all-zero (a file with no directory).
+    stale_copies : sequence of (line_name, channel_name, values, "before" | "after")
+        An extra, non-live copy of that (line, channel)'s blob placed
+        before or after the live one in the chain.
+    unlisted : sequence of (line_name, channel_name)
+        Blobs kept in the chain but given a zero directory slot.
+    corrupt_entries : dict of {(line_name, channel_name): kind}
+        Give that pair a non-zero but invalid directory entry. `kind` is
+        one of `"bad_page"` (start page is not a blob header),
+        `"wrong_index"` (points at another pair's blob),
+        `"wrong_pages"` (right start, wrong page count) or
+        `"bad_flag"` (top nibble is not 0x8).
+    """
+    corrupt_entries = corrupt_entries or {}
+    chans_max = len(channels)
+    phantom = len(line_table_prefix) // SYMBOL_RECORD_SIZE
+    lines_max = phantom + len(lines) + spare_line_slots
+    blobs_max, cache = 4, 4
+    data_slots = lines_max * chans_max
+    index_slots = data_slots + blobs_max + users_max + cache
+
+    dir_start = 280
+    blob_symbol_start = dir_start + 6 * index_slots
+    line_table_start = blob_symbol_start + blobs_max * SYMBOL_RECORD_SIZE
+    channel_table_start = line_table_start + lines_max * SYMBOL_RECORD_SIZE + 24
+    user_table_start = channel_table_start + chans_max * SYMBOL_RECORD_SIZE
+    index_size = user_table_start + users_max * SYMBOL_RECORD_SIZE + 8
+    blob_start = ((index_size + page_size - 1) // page_size) * page_size
+
+    chan_index = {c.name: i for i, c in enumerate(channels)}
+    line_index = {l.name: i + phantom for i, l in enumerate(lines)}
+    spec = {c.name: c for c in channels}
+
+    def blob_for(line_name, channel_name, values):
+        c = spec[channel_name]
+        return pack_plain_blob(
+            line_index[line_name] * chans_max + chan_index[channel_name], values, c.dtype_code,
+            string_width=c.string_width, page_size=page_size,
+        )
+
+    chain = []  # (key, is_live, bytes)
+    for l in lines:
+        for c in channels:
+            if c.name not in l.data:
+                continue
+            key = (l.name, c.name)
+            before = [v for (ln, cn, v, where) in stale_copies if (ln, cn) == key and where == "before"]
+            after = [v for (ln, cn, v, where) in stale_copies if (ln, cn) == key and where == "after"]
+            chain += [(key, False, blob_for(*key, v)) for v in before]
+            chain.append((key, True, blob_for(*key, l.data[c.name])))
+            chain += [(key, False, blob_for(*key, v)) for v in after]
+
+    offsets, position = [], 0
+    for _key, _live, raw in chain:
+        offsets.append(position)
+        position += len(raw)
+    live_at = {key: (offsets[i], len(raw) // page_size) for i, (key, live, raw) in enumerate(chain) if live}
+
+    buf = bytearray(blob_start + position)
+    buf[0:4] = b"!CBD"
+    buf[4:16] = bytes.fromhex("000000000000021008010000")
+    for offset, value in (
+        (24, chans_max), (28, blobs_max), (32, cache), (36, lines_max), (40, users_max),
+        (44, index_slots), (48, data_slots), (52, data_slots + blobs_max),
+        (56, data_slots + blobs_max + users_max), (60, data_slots + blobs_max + users_max),
+        (64, index_slots), (100, page_size), (104, index_size), (108, blob_start // page_size),
+        (120, comp_level),
+    ):
+        struct.pack_into("<i", buf, offset, value)
+
+    if directory:
+        other_pages = {k: v for k, v in live_at.items()}
+        for (line_name, channel_name), (offset, n_pages) in live_at.items():
+            key = (line_name, channel_name)
+            if key in unlisted:
+                continue
+            slot = line_index[line_name] * chans_max + chan_index[channel_name]
+            word, count = 0x80000000 | (offset // page_size), n_pages
+            kind = corrupt_entries.get(key)
+            if kind == "bad_page":
+                word += 1
+            elif kind == "wrong_index":
+                other = next(v for k, v in other_pages.items() if k != key)
+                word = 0x80000000 | (other[0] // page_size)
+            elif kind == "wrong_pages":
+                count += 1
+            elif kind == "bad_flag":
+                word = 0x40000000 | (offset // page_size)
+            struct.pack_into("<IH", buf, dir_start + 6 * slot, word, count)
+
+    line_table = line_table_prefix + b"".join(pack_line_record(l.name) for l in lines)
+    buf[line_table_start:line_table_start + len(line_table)] = line_table
+    channel_table = b"".join(
+        pack_channel_record(c.name, c.dtype_code, format_code=c.format_code, array_width=c.array_width)
+        for c in channels
+    )
+    buf[channel_table_start:channel_table_start + len(channel_table)] = channel_table
+    user_table = pack_user_record("SUPER") + empty_record() * (users_max - 1)
+    buf[user_table_start:user_table_start + len(user_table)] = user_table
+    for (_key, _live, raw), offset in zip(chain, offsets):
+        buf[blob_start + offset:blob_start + offset + len(raw)] = raw
+    return bytes(buf)
+
+
 # -- standalone compressed-blob fragments (no symbol table needed) ---------
 
 def pack_size_chunk_wrapper(payload: bytes) -> bytes:

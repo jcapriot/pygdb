@@ -3127,7 +3127,9 @@ MB, `DB_COMP_SPEED`, a handful of lines, a few dozen channels.
    before the first blob holds no directory of blob page numbers or
    offsets (searched for every blob's page number and byte offset: only
    chance hits). NOTES.md section 6.6f. Not fixed here -- how the format
-   marks the current copy is still unknown.
+   marks the current copy is still unknown. *(Superseded: Session 6 found it --
+   a 6-byte-stride directory at offset 280 that this search's encodings missed;
+   NOTES.md section 6.1c.)*
 10. **Not specific to the supplied file:** 2 of the 22 corpus files also
     have duplicated (line, channel) blobs (345 of 116,683 pairs), so the
     reader's "last wins" has been an untested assumption there too.
@@ -3176,3 +3178,85 @@ in step) `rust/src/lib.rs`, used by `read_blob_values`.
 leading values (which the first chunk gets right) and small blobs;
 nothing compared a decoded length with an independent row count. `+48`
 is exactly such a count, and is not yet used as a cross-check.
+
+
+## Session 6 -- reading the pre-blob region against the vendor's constants (2026-09-26)
+
+Prompted by: "there's still a lot left to determine about the pre-blob region --
+did you look through there, and are there any constants in the open-source repo
+that might help identify anything?"
+
+**Honest starting point.** Session 5's search of the pre-blob region only looked
+for a directory of blob locations (none) and noted the empty and symbol-table
+pages; nearly every header word was still `[UNKNOWN]` in the spec. The
+vendor-constants block already recorded in NOTES.md section 2 had never been used as a
+key for the header.
+
+1. Read the header words against the vendor's `DB_INFO_*` order and `DB_SYMB_*`
+   kinds. Words 84/88/92/96 turned out to be the four symbol-table capacities in
+   `DB_SYMB_*` order (92 and 96 equal the known `chans_max`/`users_max`); 72/76/80/64
+   are their running totals; 48/52/56/60/44 partition the `blob_index` space;
+   104 is the end of the symbol-table region and 108/112 follow from it. **Every
+   relation holds on 23 of 23 files** (NOTES.md section 6.1b).
+2. Laid out the region with that arithmetic: header, front block, blob-symbol
+   table, **line table at `chan_table - 24 - lines_max x 128`** (exact; identical
+   lines in identical order in 23 of 23 files, four with the documented index
+   shift of -1), channel table, user table, 8 bytes, padding. The heuristic line-
+   table search is no longer needed to find the table.
+3. Followed the odd header word (32: 100 in most files = the documented `GXDB`
+   default `cache=100`, much larger in others). Between the two files with identical
+   capacities the region after the header differs by exactly 6 bytes per unit.
+   **First reading (wrong stride, corrected in step 8):** repeated 12-byte empty
+   entries about half that many, and 12 used entries in the supplied file; the two
+   files with no entries at all were the only two with header word 116 non-zero.
+4. Decoded the non-empty entries in the supplied file: a blob's relative start page
+   and `n_pages` on every one -- including one that is the older copy of a duplicated
+   pair. **First conclusion (wrong, corrected in step 8):** "a blob cache table, not
+   a directory of all blobs".
+5. **Dead ends recorded:** no page handle or blob position in any of the 350
+   blob-symbol records; a naive "line table is sparse symbol records" check for
+   the blob-symbol table classified only 12 of 23 files cleanly (the populated
+   ones use a layout not decoded), so that table's position is stated as [LIKELY].
+6. Asked, for the next request ("account for every non-zero byte before the first
+   block, label it by what it is and its range, then list what is left"), for a
+   byte-accurate accounting tool: it labels every non-zero byte of the pre-blob
+   region as decoded / likely / structure-only / unlabelled and reports the rest.
+   Its first version could not place 6-byte-stride slots under the 12-byte reading,
+   which is what exposed the stride error.
+7. Re-read the front block at a 6-byte stride starting at offset **280**, indexed by
+   `blob_index`: an entry `(uint32 word, uint16 n_pages)` with flag `0x8` and a
+   relative start page landed exactly on a blob header whose `blob_index` was the
+   slot, for all 104 listed (line, channel) entries of the supplied file; in the corpus 116,287 of
+   116,287 across 23 files, zero failures (NOTES.md section 6.1c).
+8. **Corrected step 3/4.** The "cache" is the tail of the same array (`word 60 ..
+   word 44`), and the array is the directory of live blobs, not a cache alone. For
+   issue #2: in the corpus all 345 duplicated pairs are listed at the last copy; in
+   the supplied file 19 of 27 listed duplicated pairs are listed at the *first*
+   copy, and all 13 independently labelled pairs agree with the directory. Word 116
+   is non-zero in the two files whose cache slots are *full* (99/100 and 100/100), not
+   "empty" as first written.
+9. A zero directory slot marks a blob the file does not list as live. In the corpus
+   that is 582 blobs in `SAMAGEM_CDI`, all of them two whole channels of 291 lines
+   each, no duplicates, both still in the channel table (`CVG_GSCLevel`,
+   `mag_gsclevel`); the supplied file has six such blobs in two channels. Why is
+   unknown -- an earlier remark that they are "probably deleted channels" is not
+   established and is not written into the spec.
+10. Census of what is still unlabelled after all of the above (NOTES.md section
+    6.1c): about 496 KB of non-zero bytes across the 22 corpus files, in fixed
+    record fields of the blob-symbol, line and channel tables plus a 24-byte gap,
+    all `[UNKNOWN]`. Many are float dummy values (float32/float64 `-1e32`). The
+    directory's last five slots overlap the nominal start of the blob-symbol table
+    by 32 bytes in every file, so that table's start is `[LIKELY]` only.
+11. Wired into the reader (behaviour and validation in section 6.1c and spec 2.2):
+    `read_blob_directory`, strict per-entry validation, directory-selected live
+    copy, skip-unlisted with an opt-in, exact line-table position with the heuristic
+    as fallback; the `duplicate_blobs` policies were removed. Checked against the old
+    reader on the corpus: identical line names/indices in 22 of 22 and identical blob
+    selection in 21 of 22 (the 22nd drops exactly the 582 unlisted).
+
+**What it changes.** `docs/spec.md` section 2 (header table), new sections 2.1
+(layout) and 2.2 (the blob directory), 6.2 (there *is* an index of live blobs), and
+the reader. For issue #2 it settles which copy is current wherever a file has a
+directory (all 23 here); the earlier `row_order` heuristic is no longer needed and
+was removed. Open: word 116, the `0x4` flag bit, why blobs are unlisted, and every
+field in the section 6.1c census.

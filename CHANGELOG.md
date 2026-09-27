@@ -8,6 +8,45 @@ minor releases may change behavior, patch releases fix bugs).
 The version number lives in `rust/Cargo.toml`; `pyproject.toml` reads it
 from there.
 
+## [Unreleased]
+
+### Changed
+
+- **The current copy of a blob is now decoded, not guessed.** A `.gdb` keeps a
+  directory of its live blobs (6-byte slots at file offset 280, indexed by
+  blob index); `GDB` uses it to choose between several blobs for one
+  (line, channel), wherever they sit in the chain (issue #2). Across the test
+  corpus it lists every real blob in 21 of 22 files and agrees with every
+  independently labelled duplicate. An entry is used only if its start page
+  is a blob header with the right index and page count; otherwise, and for a
+  file with no directory, the last blob in chain order is used, with a warning.
+- **Breaking:** blobs the directory does not list are skipped by default, with
+  a warning naming the channels (in the test corpus: two whole channels of one
+  file). `GDB(path, include_unlisted_blobs=True)` reads them anyway.
+- The line table is located exactly (`channel table - 24 - lines_max * 128`)
+  instead of by a heuristic scan; the heuristic and the blob-chain calibration
+  of line numbers remain only as a fallback. Line names and numbers are
+  identical to before on every corpus file.
+
+### Removed
+
+- **Breaking:** `GDB(..., duplicate_blobs=...)` and its `"last"`/`"row_order"`
+  values, and the `duplicate_blobs` attribute. The directory makes the
+  `row_order` heuristic unnecessary.
+
+### Added
+
+- `pygdb.read_blob_directory`, `pygdb.BlobDirectory`, and
+  `pygdb.exact_line_table_start`; `header_fields` also returns `blobs_max`,
+  `lines_max`, `index_slots` and `data_slots`.
+
+### Documentation
+
+- The specification now documents the header words, the layout of everything
+  before the first blob (section 2.1) and the blob directory (section 2.2),
+  with a byte-level accounting of what is still unexplained (provenance notes
+  section 6.1c).
+
 ## [0.2.1] - 2026-09-26
 
 ### Fixed
