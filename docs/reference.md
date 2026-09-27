@@ -20,6 +20,8 @@ them.
 
 ::: pygdb.BlobHeader
 
+::: pygdb.BlobDirectory
+
 ## `.gdb` reader functions
 
 ::: pygdb.check_magic
@@ -30,6 +32,8 @@ them.
 
 ::: pygdb.read_channels
 
+::: pygdb.exact_line_table_start
+
 ::: pygdb.find_line_table
 
 ::: pygdb.read_lines
@@ -37,6 +41,8 @@ them.
 ::: pygdb.iter_blobs
 
 ::: pygdb.find_blob
+
+::: pygdb.read_blob_directory
 
 ::: pygdb.read_blob_values
 

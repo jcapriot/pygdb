@@ -20,18 +20,20 @@ from pygdb.gdb_reader import (
     GDBParseWarning,
     _decode_numeric_or_string,
     check_magic,
+    exact_line_table_start,
     find_blob,
     find_line_table,
     header_fields,
     iter_blobs,
     magic_signature_matches_common_case,
+    read_blob_directory,
     read_blob_values,
     read_channels,
     read_lines,
 )
 
 import helpers
-from helpers import ChannelSpec, LineSpec, build_gdb_bytes
+from helpers import ChannelSpec, LineSpec, build_gdb_bytes, build_real_layout_gdb_bytes
 
 
 @pytest.fixture(params=["python", "native"])
@@ -70,12 +72,13 @@ def test_magic_signature_common_case():
 def test_header_fields_basic():
     header = bytearray(128)
     header[0:4] = b"!CBD"
-    struct.pack_into("<i", header, 24, 50)
-    struct.pack_into("<i", header, 40, 10)
-    struct.pack_into("<i", header, 100, 1024)
-    struct.pack_into("<i", header, 120, 2)
+    for offset, value in ((24, 50), (28, 7), (36, 9), (40, 10), (44, 600), (48, 450), (100, 1024), (120, 2)):
+        struct.pack_into("<i", header, offset, value)
     fields = header_fields(bytes(header))
-    assert fields == {"chans_max": 50, "users_max": 10, "page_size": 1024, "comp_level": 2}
+    assert fields == {
+        "chans_max": 50, "blobs_max": 7, "lines_max": 9, "users_max": 10,
+        "index_slots": 600, "data_slots": 450, "page_size": 1024, "comp_level": 2,
+    }
 
 
 def test_header_fields_truncated_warns_and_returns_none():
@@ -542,3 +545,84 @@ def test_read_blob_values_administrative_blob_negative_row_count_warns(tmp_path)
     with pytest.warns(GDBParseWarning):
         values = read_blob_values(path, blob, channel, comp_level=0)
     npt.assert_array_equal(values, [])
+
+
+# -- blob directory and exact line table ------------------------------------------
+
+def _real_layout_file(tmp_path, **kwargs):
+    path = tmp_path / "real.gdb"
+    path.write_bytes(build_real_layout_gdb_bytes(SIMPLE_CHANNELS, SIMPLE_LINES, **kwargs))
+    return str(path)
+
+
+def test_read_blob_directory_maps_live_slots_to_start_page_and_page_count(tmp_path):
+    path = _real_layout_file(tmp_path)
+    directory = read_blob_directory(path)
+    blobs = {b.blob_index: b for b in iter_blobs(path)}
+    first = min(b.offset for b in blobs.values())
+
+    assert directory.data_slots == (len(SIMPLE_LINES) + 1) * len(SIMPLE_CHANNELS)  # +1 spare line slot
+    assert set(directory.entries) == set(blobs)
+    for index, (word, n_pages) in directory.entries.items():
+        assert word == 0x80000000 | ((blobs[index].offset - first) // 64)
+        assert n_pages == blobs[index].n_pages
+
+
+def test_read_blob_directory_is_none_when_the_directory_is_all_zero(tmp_path):
+    assert read_blob_directory(_real_layout_file(tmp_path, directory=False)) is None
+
+
+def test_read_blob_directory_is_none_when_header_words_are_inconsistent(tmp_path):
+    path = _real_layout_file(tmp_path)
+    data = bytearray(open(path, "rb").read())
+    struct.pack_into("<i", data, 48, struct.unpack_from("<i", data, 48)[0] + 1)  # data_slots != lines_max*chans_max
+    open(path, "wb").write(data)
+    assert read_blob_directory(path) is None
+
+
+def test_read_blob_directory_is_none_for_the_legacy_layout_and_bad_magic(tmp_path):
+    legacy = tmp_path / "legacy.gdb"
+    legacy.write_bytes(build_gdb_bytes(SIMPLE_CHANNELS, SIMPLE_LINES))
+    assert read_blob_directory(str(legacy)) is None
+    bad = tmp_path / "bad.gdb"
+    bad.write_bytes(b"NOPE" + b"\x00" * 400)
+    assert read_blob_directory(str(bad)) is None
+
+
+def test_directory_resolve_reports_each_status(tmp_path):
+    from pygdb.gdb_reader import (
+        DIRECTORY_ABSENT, DIRECTORY_INVALID, DIRECTORY_LIVE, DIRECTORY_OUTSIDE,
+    )
+
+    path = _real_layout_file(tmp_path, unlisted=[(SIMPLE_LINES[0].name, "Easting")])
+    directory = read_blob_directory(path)
+    by_offset = {b.offset: b for b in iter_blobs(path)}
+    first = min(by_offset)
+    live_index = next(i for i in directory.entries)
+    assert directory.resolve(live_index, by_offset, first, 64)[0] == DIRECTORY_LIVE
+    assert directory.resolve(1, by_offset, first, 64)[0] == DIRECTORY_ABSENT      # L-first/Easting, unlisted
+    assert directory.resolve(directory.data_slots, by_offset, first, 64)[0] == DIRECTORY_OUTSIDE
+    assert directory.resolve(live_index, {}, first, 64)[0] == DIRECTORY_INVALID    # start page is no known blob
+
+
+def test_exact_line_table_start_matches_the_layout(tmp_path):
+    path = _real_layout_file(tmp_path)
+    data = open(path, "rb").read()
+    fields = header_fields(data[:256])
+    start = exact_line_table_start(data, fields["lines_max"])
+    lines = read_lines(path)
+    assert [l.offset for l in lines] == [start + i * 128 for i in range(len(SIMPLE_LINES))]
+    assert [l.index for l in lines] == list(range(len(SIMPLE_LINES)))
+
+
+def test_exact_line_table_start_declines_when_it_cannot_be_validated(tmp_path):
+    legacy = build_gdb_bytes(SIMPLE_CHANNELS, SIMPLE_LINES)   # no lines_max in the header
+    assert exact_line_table_start(legacy, None) is None
+    assert exact_line_table_start(legacy, 0) is None
+    # a lines_max whose arithmetic lands before the header ends, or on no line record
+    assert exact_line_table_start(legacy, 10_000) is None
+    assert exact_line_table_start(legacy, 1) is None
+    # the fallback still reads that file
+    path = tmp_path / "legacy.gdb"
+    path.write_bytes(legacy)
+    assert [l.name for l in read_lines(str(path))] == [l.name for l in SIMPLE_LINES]

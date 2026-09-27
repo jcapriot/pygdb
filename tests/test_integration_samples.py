@@ -448,3 +448,46 @@ def test_grd_compressed_matches_uncompressed_twin(samples_dir):
     assert header_c.is_compressed and not header_u.is_compressed
     assert (header_c.shape_e, header_c.shape_v) == (header_u.shape_e, header_u.shape_v)
     assert list(values_c) == list(values_u)
+
+
+def test_exact_line_table_matches_the_heuristic_plus_calibration_on_every_real_file(all_gdb_sample_paths):
+    """
+    The exact position (`channel table - 24 - lines_max * 128`) must agree
+    with what the older heuristic + blob-chain calibration produced: every
+    real file's lines (name and index), including the 1991 file whose slot 0
+    made the heuristic start one slot late.
+    """
+    from pygdb.gdb_reader import _read_lines
+
+    for path in all_gdb_sample_paths:
+        lines, exact = _read_lines(path)
+        assert exact, f"{_basename(path)}: exact line-table position was not used"
+        db = GDB(path)
+        assert [(l.name, l.index) for l in db.lines] == [(l.name, l.index) for l in lines]
+
+
+def test_blob_directory_lists_every_real_blob_except_known_unlisted_channels(all_gdb_sample_paths):
+    """
+    Where a file has a blob directory, it lists a live blob for every real
+    (line, channel) except whole channels the file does not list -- in the
+    corpus, the two 'GSC level' channels of one Ontario file. Every entry
+    that exists passes the strict check, and no duplicated pair is left
+    unresolved.
+    """
+    import warnings
+
+    from pygdb import GDBParseWarning
+
+    for path in all_gdb_sample_paths:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            db = GDB(path)
+            db._ensure_blob_index()
+        messages = [str(w.message) for w in caught if issubclass(w.category, GDBParseWarning)]
+        assert not any("does not point at a blob" in m for m in messages), f"{_basename(path)}: {messages}"
+        assert not any("no blob directory" in m for m in messages), f"{_basename(path)}: {messages}"
+        skipped = [m for m in messages if "skipped" in m]
+        if _basename(path) == "SAMAGEM_CDI.gdb":
+            assert len(skipped) == 1 and "'CVG_GSCLevel' (291)" in skipped[0] and "'mag_gsclevel' (291)" in skipped[0]
+        else:
+            assert not skipped, f"{_basename(path)}: {skipped}"

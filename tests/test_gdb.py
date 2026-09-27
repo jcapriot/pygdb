@@ -10,7 +10,10 @@ import pytest
 
 from pygdb import GDB
 
-from helpers import ChannelSpec, LineSpec, build_gdb_bytes, pack_line_record, pack_plain_blob
+from helpers import (
+    ChannelSpec, LineSpec, build_gdb_bytes, build_real_layout_gdb_bytes, pack_line_record,
+    pack_plain_blob,
+)
 
 CHANNELS = [
     ChannelSpec("Fiducial", dtype_code=3),
@@ -1245,7 +1248,7 @@ def test_gdb_to_dataframe_raises_import_error_with_install_hint(db, monkeypatch)
         db.to_dataframe()
 
 
-# -- duplicate blobs for one (line, channel) (issue #2) --------------------------
+# -- duplicate blobs for one (line, channel), file without a directory (issue #2) -------------------------
 
 def _gdb_with_extra_blob(tmp_path, blob_index, values, name="dup.gdb"):
     """`CHANNELS`/`LINES` plus one more float64 blob appended to the chain
@@ -1322,117 +1325,116 @@ def test_gdb_does_not_warn_for_duplicates_in_administrative_slots(tmp_path):
         npt.assert_array_equal(db.read("L100", "Easting"), [100.0, 100.5, 101.0])
 
 
-# -- duplicate_blobs="row_order" (issue #2) ---------------------------------------
+# -- blob directory: which copy is live (issue #2) --------------------------------
 
-_N_ROWS = 120
-_SMOOTH = np.sin(np.linspace(0.0, 3.0, _N_ROWS)) * 100.0 + np.linspace(0.0, 50.0, _N_ROWS)
-_ROUGH = _SMOOTH[np.random.default_rng(7).permutation(_N_ROWS)]  # same values, scrambled order
+_DIR_CHANNELS = [ChannelSpec("Fiducial", dtype_code=3), ChannelSpec("Value", dtype_code=5)]
 
 
-def _reorder_fixture(tmp_path, first, last, fiducial=None, easting=None, name="reorder.gdb"):
-    """One line with an ID-like channel and a `Value` channel written twice:
-    `first` in the base file, `last` appended later in the blob chain."""
-    channels = [
-        ChannelSpec("Fiducial", dtype_code=3),
-        ChannelSpec("Easting", dtype_code=5),
-        ChannelSpec("Value", dtype_code=5),
+def _dir_lines(value=(1.0, 2.0, 3.0)):
+    return [
+        LineSpec("L100", data={"Fiducial": [1, 2, 3], "Value": list(value)}),
+        LineSpec("L200", data={"Fiducial": [1, 2, 3]}),
     ]
-    fid = list(range(1, _N_ROWS + 1)) if fiducial is None else fiducial
-    lines = [LineSpec("L100", data={
-        "Fiducial": fid,
-        "Easting": list(np.linspace(1000.0, 1100.0, _N_ROWS) if easting is None else easting),
-        "Value": list(first),
-    })]
-    data = build_gdb_bytes(channels, lines) + pack_plain_blob(2, list(last), dtype_code=5)
-    path = tmp_path / name
-    path.write_bytes(data)
+
+
+def _write(tmp_path, **kwargs):
+    path = tmp_path / "real_layout.gdb"
+    path.write_bytes(build_real_layout_gdb_bytes(_DIR_CHANNELS, kwargs.pop("lines", None) or _dir_lines(), **kwargs))
     return str(path)
 
 
-def test_row_order_policy_prefers_the_acquisition_order_copy(tmp_path):
+@pytest.mark.parametrize("where", ["before", "after"])
+def test_directory_picks_the_live_copy_wherever_the_stale_one_sits(tmp_path, where):
     """
-    The stale copy is the same values re-sorted (issue #2); when it is the
-    *later* blob, "last wins" returns scrambled data. With the opt-in
-    policy the smooth, earlier copy is used instead -- and it says so.
+    The stale copy can sit on either side of the live one in the chain
+    (issue #2), so last-in-chain is wrong half the time. The directory says
+    which is live, and a cleanly resolved duplicate is not worth a warning.
     """
+    import warnings
+
+    path = _write(tmp_path, stale_copies=[("L100", "Value", [9.0, 8.0, 7.0], where)])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        npt.assert_array_equal(GDB(path).read("L100", "Value"), [1.0, 2.0, 3.0])
+
+
+def test_no_directory_falls_back_to_last_in_chain_and_warns(tmp_path):
     from pygdb import GDBParseWarning
 
-    path = _reorder_fixture(tmp_path, first=_SMOOTH, last=_ROUGH)
-
-    with pytest.warns(GDBParseWarning, match=r"more than one blob"):
-        default = GDB(path).read("L100", "Value")
-    npt.assert_array_equal(default, _ROUGH)  # unchanged default: last in chain order
-
-    with pytest.warns(GDBParseWarning, match=r"row_order.*switched 1 pair.*'L100'.*'Value'"):
-        chosen = GDB(path, duplicate_blobs="row_order").read("L100", "Value")
-    npt.assert_array_equal(chosen, _SMOOTH)
+    path = _write(tmp_path, directory=False, stale_copies=[("L100", "Value", [9.0, 8.0, 7.0], "after")])
+    with pytest.warns(GDBParseWarning, match=r"no blob directory.*'L100'|'L100'.*no blob directory"):
+        values = GDB(path).read("L100", "Value")
+    npt.assert_array_equal(values, [9.0, 8.0, 7.0])
 
 
-def test_row_order_policy_keeps_the_last_copy_when_it_is_already_the_smooth_one(tmp_path):
+def test_no_directory_serves_every_blob_without_warning_when_nothing_is_duplicated(tmp_path):
+    import warnings
+
+    path = _write(tmp_path, directory=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        db = GDB(path)
+        assert db.channels_on_line("L100") == ["Fiducial", "Value"]
+
+
+@pytest.mark.parametrize("kind", ["bad_page", "wrong_index", "wrong_pages", "bad_flag"])
+def test_a_directory_entry_that_fails_validation_falls_back_to_last_and_warns(tmp_path, kind):
     from pygdb import GDBParseWarning
 
-    path = _reorder_fixture(tmp_path, first=_ROUGH, last=_SMOOTH)
-    with pytest.warns(GDBParseWarning, match=r"no pair needed switching"):
-        chosen = GDB(path, duplicate_blobs="row_order").read("L100", "Value")
-    npt.assert_array_equal(chosen, _SMOOTH)
-
-
-def test_row_order_policy_never_second_guesses_a_revised_copy(tmp_path):
-    """Different values (a genuine revision, like a recomputed channel) are
-    not a reordering, however much rougher the later copy is."""
-    from pygdb import GDBParseWarning
-
-    revised = _ROUGH + 0.5  # not the same multiset as _SMOOTH
-    path = _reorder_fixture(tmp_path, first=_SMOOTH, last=revised)
-    with pytest.warns(GDBParseWarning, match=r"no pair needed switching"):
-        chosen = GDB(path, duplicate_blobs="row_order").read("L100", "Value")
-    npt.assert_array_equal(chosen, revised)
-
-
-def test_row_order_policy_needs_an_order_defining_channel_on_the_line(tmp_path):
-    """Without an ID/time-like channel stored in monotone order there's no
-    evidence what acquisition order is, so the policy stays out of it."""
-    from pygdb import GDBParseWarning
-
-    rng = np.random.default_rng(3)
-    scrambled_ids = list(rng.permutation(_N_ROWS))
-    scrambled_easting = list(rng.permutation(np.linspace(1000.0, 1100.0, _N_ROWS)))
-    path = _reorder_fixture(
-        tmp_path, first=_SMOOTH, last=_ROUGH, fiducial=scrambled_ids, easting=scrambled_easting,
+    path = _write(
+        tmp_path, stale_copies=[("L100", "Value", [9.0, 8.0, 7.0], "before")],
+        corrupt_entries={("L100", "Value"): kind},
     )
-    with pytest.warns(GDBParseWarning, match=r"no pair needed switching"):
-        chosen = GDB(path, duplicate_blobs="row_order").read("L100", "Value")
-    npt.assert_array_equal(chosen, _ROUGH)
+    with pytest.warns(GDBParseWarning, match=r"blob-directory entry.*'L100'.*'Value'"):
+        values = GDB(path).read("L100", "Value")
+    npt.assert_array_equal(values, [1.0, 2.0, 3.0])  # last in chain order is the live one here
 
 
-def test_default_policy_is_last_and_warning_points_at_the_option(tmp_path):
+def test_blobs_the_directory_does_not_list_are_skipped_with_a_warning(tmp_path):
     from pygdb import GDBParseWarning
 
-    path = _reorder_fixture(tmp_path, first=_SMOOTH, last=_ROUGH)
+    path = _write(tmp_path, unlisted=[("L100", "Value")])
+    with pytest.warns(GDBParseWarning, match=r"skipped 1 .*'Value' \(1\).*include_unlisted_blobs=True"):
+        db = GDB(path)
+        assert db.channels_on_line("L100") == ["Fiducial"]
+    with pytest.warns(GDBParseWarning, match=r"no data blob for line 'L100', channel 'Value'"):
+        assert len(db.read("L100", "Value")) == 0
+
+
+def test_include_unlisted_blobs_reads_them_anyway(tmp_path):
+    import warnings
+
+    path = _write(tmp_path, unlisted=[("L100", "Value")])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        db = GDB(path, include_unlisted_blobs=True)
+        npt.assert_array_equal(db.read("L100", "Value"), [1.0, 2.0, 3.0])
+
+
+def test_an_all_zero_directory_is_not_trusted_to_hide_blobs(tmp_path):
+    """No directory (all-zero) is 'not present', never 'nothing is live'."""
+    path = _write(tmp_path, directory=False)
+    assert GDB(path).channels_on_line("L100") == ["Fiducial", "Value"]
+
+
+def test_exact_line_table_gives_true_indices_without_calibration(tmp_path):
+    """
+    A populated first slot with a category the reader doesn't accept (the
+    real 65636 case) used to shift the heuristic's start one slot late;
+    the exact position is unaffected, so no calibration is needed.
+    """
+    phantom = pack_line_record("L0", category_code=65636)
+    path = _write(tmp_path, line_table_prefix=phantom)
     db = GDB(path)
-    assert db.duplicate_blobs == "last"
-    with pytest.warns(GDBParseWarning, match=r"duplicate_blobs='row_order'"):
-        db.read("L100", "Value")
+    assert db.line_names == ["L100", "L200"]
+    assert [l.index for l in db.lines] == [1, 2]
+    assert db._lines_exact
+    npt.assert_array_equal(db.read("L100", "Value"), [1.0, 2.0, 3.0])
 
 
-def test_invalid_duplicate_blobs_policy_raises_before_opening_the_file(tmp_path):
-    path = tmp_path / "never_opened.gdb"  # doesn't exist: a bad option must fail first
-    with pytest.raises(ValueError, match=r"duplicate_blobs"):
-        GDB(str(path), duplicate_blobs="first")
-
-
-def test_row_order_pick_unit_cases():
-    from pygdb.gdb import _row_order_pick
-
-    assert _row_order_pick(_SMOOTH, _ROUGH) == 0
-    assert _row_order_pick(_ROUGH, _SMOOTH) == 1
-    assert _row_order_pick(_SMOOTH, _SMOOTH[::-1]) is None      # reversal: equally smooth
-    assert _row_order_pick(_SMOOTH, _SMOOTH + 1.0) is None      # revised values
-    assert _row_order_pick(_SMOOTH, _SMOOTH[:-1]) is None       # different length
-    assert _row_order_pick(np.zeros(100), np.zeros(100)) is None  # constant: nothing to judge
-    ints = np.round(_SMOOTH * 10).astype(int)
-    assert _row_order_pick(ints, np.random.default_rng(1).permutation(ints)) == 0  # integer dtype
-    # a copy that is itself a perfect ramp is never judged, whichever side it is on
-    ramp = np.sort(_SMOOTH)
-    assert _row_order_pick(ramp, _SMOOTH) is None
-    assert _row_order_pick(_SMOOTH, ramp) is None
+def test_legacy_layout_still_uses_the_heuristic_and_calibration(tmp_path):
+    path = tmp_path / "legacy.gdb"
+    path.write_bytes(build_gdb_bytes(CHANNELS, LINES, line_table_prefix=pack_line_record("L0", category_code=65636)))
+    db = GDB(str(path))
+    assert not db._lines_exact
+    npt.assert_array_equal(db.read("L100", "Easting"), [100.0, 100.5, 101.0])

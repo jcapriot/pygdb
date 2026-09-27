@@ -443,11 +443,15 @@ def header_fields(data: bytes) -> dict:
     Returns
     -------
     dict
-        Maps each of `"chans_max"`, `"users_max"`, `"page_size"`, and
-        `"comp_level"` to its decoded int32 value. See
-        docs/provenance/notes.md section 6.1 for the full table
-        including the still-unknown offsets, and for why each
-        confidence label was assigned.
+        Maps each of `"chans_max"` (word 24), `"blobs_max"` (28),
+        `"lines_max"` (36), `"users_max"` (40), `"index_slots"` (44,
+        the total number of blob-directory slots), `"data_slots"` (48,
+        the number of those that address (line, channel) data blobs),
+        `"page_size"` (100), and `"comp_level"` (120) to its decoded
+        int32 value. See docs/spec.md section 2 for the full table
+        with a confidence rating per word, and
+        docs/provenance/notes.md section 6.1/6.1b for the derivations
+        and the still-unknown offsets.
 
     Warns
     -----
@@ -466,7 +470,8 @@ def header_fields(data: bytes) -> dict:
     (`DB_COMP_SIZE`) IS confirmed real zlib.
     """
     result = {}
-    for name, offset in (("chans_max", 24), ("users_max", 40),
+    for name, offset in (("chans_max", 24), ("blobs_max", 28), ("lines_max", 36),
+                          ("users_max", 40), ("index_slots", 44), ("data_slots", 48),
                           ("page_size", 100), ("comp_level", 120)):
         try:
             result[name] = struct.unpack_from("<i", data, offset)[0]
@@ -713,10 +718,10 @@ class LineRecord:
     -----
     **[LIKELY]/[UNKNOWN]** -- much less firmly established than
     `ChannelRecord`: only the name (relative +32) and category code
-    (relative +108) fields are decoded, and locating the table itself
-    (`find_line_table` below) is a heuristic scan rather than the
-    structurally-proven SUPER-anchor technique used for the channel
-    table. See docs/spec.md section 3.2 and docs/provenance/notes.md
+    (relative +108) fields are decoded. The table is located exactly
+    (`exact_line_table_start`, **[CONFIRMED]** on the corpus) and only
+    falls back to the `find_line_table` heuristic scan when that
+    cannot be validated. See docs/spec.md section 3.2 and docs/provenance/notes.md
     section 6.3.
 
     `eq=False` keeps the default identity-based `__eq__`/`__hash__`
@@ -785,23 +790,25 @@ def find_line_table(data: bytes, search_window: Tuple[int, Optional[int]] = (128
 
     Notes
     -----
+    **Prefer `exact_line_table_start`** (via `read_lines`): the line
+    table's start follows exactly from `lines_max` and the channel
+    table's position (docs/spec.md section 2.1), which this heuristic
+    predates. This scan is now only the fallback for a file where that
+    arithmetic cannot be validated.
+
     Unlike `find_channel_table`, there's no known default-name anchor
     (the line table has nothing analogous to the channel table's
-    "SUPER" user record immediately after it) and no confirmed header
-    field gives its start offset directly -- reconciling one with the
-    header's capacity fields was tried and didn't cleanly round-trip
-    (docs/provenance/log.md Session 1 section 1.16,
-    docs/provenance/notes.md section 6.3). This is therefore a
-    heuristic **[LIKELY]** scan, not the structurally-proven technique
-    used for the channel table: it looks for a run of 128-byte records
+    "SUPER" user record immediately after it), so this is a
+    heuristic **[LIKELY]** scan, not a structurally-proven technique:
+    it looks for a run of 128-byte records
     whose relative +32 field looks like a clean, NUL-terminated,
     printable line name and whose relative +108 category field
     matches one of the two confirmed real values (100=NORMAL/FLIGHT,
     200=GROUP), then returns the earliest such record in the run with
     the most hits at a consistent 128-byte phase.
 
-    **Known limitation, found by real-file testing, not yet fixed
-    here:** if a table's true first slot(s) don't carry a category
+    **Known limitation, found by real-file testing (fixed by using
+    `exact_line_table_start` instead, not here):** if a table's true first slot(s) don't carry a category
     code in {100, 200}, this returns a start that's one or more slots
     too late -- every subsequent `LineRecord.index` is then off by
     that same fixed amount, which breaks blob_index lookups by line
@@ -847,6 +854,60 @@ def find_line_table(data: bytes, search_window: Tuple[int, Optional[int]] = (128
     return min(phase_hits[best_phase])
 
 
+_LINE_TABLE_GAP = 24  # [CONFIRMED] bytes between the end of the line table and the
+                      # channel table -- docs/spec.md section 2.1
+
+
+def exact_line_table_start(data: bytes, lines_max: Optional[int]) -> Optional[int]:
+    """
+    Compute the line table's start from the header and the channel table.
+
+    Parameters
+    ----------
+    data : bytes
+        The file's bytes up to at least the end of the channel table
+        (`read_lines` passes everything before the blob region).
+    lines_max : int or None
+        The line-table capacity (header word 36); `None` or non-positive
+        means unknown.
+
+    Returns
+    -------
+    int or None
+        Byte offset of the line table's first record, or `None` if the
+        arithmetic cannot be validated (unknown `lines_max`, no
+        locatable channel table, a start before the header ends, or no
+        line-shaped record anywhere in the computed table) -- the
+        caller then falls back to `find_line_table`.
+
+    Notes
+    -----
+    The line table is `lines_max` 128-byte slots followed by a 24-byte
+    gap and then the channel table, so its start is
+    `find_channel_table(data) - 24 - lines_max * 128`. **[CONFIRMED]**
+    on all 23 real files examined (docs/spec.md section 2.1;
+    docs/provenance/notes.md section 6.1b): the computed start is
+    always a slot boundary that matches the heuristic's start, or is an
+    earlier slot the heuristic missed. The at-least-one-line-record
+    check only guards a file whose layout does not follow this
+    arithmetic; it is not needed for any real file seen.
+    """
+    if not lines_max or lines_max <= 0:
+        return None
+    try:
+        channel_start = find_channel_table(data)
+    except ValueError:
+        return None
+    start = channel_start - _LINE_TABLE_GAP - lines_max * SYMBOL_RECORD_SIZE
+    if start < 256:
+        return None
+    for i in range(lines_max):
+        rec = _parse_line_record(data, start + i * SYMBOL_RECORD_SIZE, i)
+        if rec.name and rec.name_is_clean and rec.category_code in DB_CATEGORY_LINE_NAMES:
+            return start
+    return None
+
+
 def read_lines(path: str) -> List[LineRecord]:
     """
     Decode the line symbol table.
@@ -869,30 +930,59 @@ def read_lines(path: str) -> List[LineRecord]:
 
     Notes
     -----
-    Heuristic (see `find_line_table`) -- less firmly established than
-    `read_channels`. Since no confirmed header field gives the line
-    table's slot capacity (the way `chans_max` does for the channel
-    table), this reads forward from the located start until 8
-    consecutive records fail to look like either a populated line
-    record or clean unused capacity -- a tolerance against one-off
-    corruption/false-positive records, not a precisely-known table
-    boundary.
+    The table is located **exactly** whenever possible (see
+    `exact_line_table_start`): it holds `lines_max` (header word 36)
+    128-byte slots and ends 24 bytes before the channel table, so its
+    start is `channel_table_start - 24 - lines_max * 128`
+    (**[CONFIRMED]** on every real file in the corpus, docs/spec.md
+    section 2.1). Every one of the `lines_max` slots is then examined,
+    and `LineRecord.index` is the true slot number, so
+    `LineRecord.index` is exact and blob_index lookups keyed on it
+    are right.
 
-    **`LineRecord.index` can be off by a small, fixed amount** on a
-    file where `find_line_table`'s heuristic starts one or more slots
-    late -- see that function's docstring. This makes `.name` still
-    correct but `.index` (and therefore any blob_index lookup keyed on
-    it) wrong. `GDB` (in `gdb.py`) corrects this against the actual
-    blob chain before exposing lines by name; call it instead of this
-    function directly when you need working (line, channel) data
-    access, not just a list of names.
+    Only when that arithmetic cannot be validated (a header without
+    `lines_max`, or no line-shaped record at the computed position) does
+    this fall back to the older heuristic (see `find_line_table`):
+    **[LIKELY]**, less firmly established, reading forward until 8
+    consecutive records fail to look like either a populated line
+    record or clean unused capacity. In that fallback
+    **`LineRecord.index` can be off by a small, fixed amount** when the
+    scan starts one or more slots late -- `.name` is still correct but
+    `.index` is wrong. `GDB` (in `gdb.py`) corrects this against the
+    actual blob chain only in that case.
+
+    A populated slot whose category is neither `100` nor `200` (for
+    example the `65636` slot 0 of one 1991 file) is not returned, as
+    before -- but, unlike the fallback, it no longer shifts the
+    indices of the lines after it.
+    """
+    return _read_lines(path)[0]
+
+
+def _read_lines(path: str) -> Tuple[List[LineRecord], bool]:
+    """
+    Decode the line symbol table, also reporting how it was located.
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file.
+
+    Returns
+    -------
+    lines : list of LineRecord
+        As `read_lines`.
+    exact : bool
+        True if the table was located by `exact_line_table_start`
+        (indices are exact); False if the heuristic fallback was used
+        (indices may need `GDB`'s blob-chain calibration).
     """
     with open(path, "rb") as f:
         header = f.read(4096)
         if not check_magic(header):
             _warn(f"{path}: does not start with the expected '!CBD' magic -- "
                   f"not a recognized .gdb file, returning no lines")
-            return []
+            return [], False
         blob_start = blob_region_start(header)
         f.seek(0, 2)
         size = f.tell()
@@ -900,14 +990,24 @@ def read_lines(path: str) -> List[LineRecord]:
         read_size = blob_start if (blob_start is not None and 0 < blob_start <= size) else min(size, 20_000_000)
         data = f.read(read_size)
 
+    lines_max = header_fields(header).get("lines_max")
+    exact_start = exact_line_table_start(data, lines_max)
+    if exact_start is not None:
+        lines = []
+        for i in range(lines_max):
+            rec = _parse_line_record(data, exact_start + i * SYMBOL_RECORD_SIZE, i)
+            if rec.name and rec.name_is_clean and rec.category_code in DB_CATEGORY_LINE_NAMES:
+                lines.append(rec)
+        return lines, True
+
     try:
         table_start = find_line_table(data, search_window=(128, len(data)))
     except ValueError as e:
         _warn(f"{path}: could not locate the line symbol table ({e}) -- "
               f"returning no lines")
-        return []
+        return [], False
 
-    lines: List[LineRecord] = []
+    lines = []
     consecutive_bad = 0
     i = 0
     while True:
@@ -929,7 +1029,7 @@ def read_lines(path: str) -> List[LineRecord]:
             consecutive_bad += 1
             if consecutive_bad >= 8:
                 break
-    return lines
+    return lines, False
 
 
 BLOB_MAGIC = b"\xcc\xcc\x00\xff"
@@ -1299,6 +1399,145 @@ def find_blob(path: str, line_slot: int, channel_slot: int, chans_max: Optional[
         if blob.blob_index == target:
             return blob
     return None
+
+
+DIRECTORY_OFFSET = 280  # [CONFIRMED] first blob-directory slot -- docs/spec.md section 2.2
+_DIRECTORY_SLOT_DTYPE = np.dtype([("word", "<u4"), ("n_pages", "<u2")])  # 6 bytes, unaligned
+_DIRECTORY_LIVE_FLAG = 0x8  # top nibble of a live (line, channel) entry's 32-bit word
+
+DIRECTORY_LIVE = "live"
+DIRECTORY_ABSENT = "absent"
+DIRECTORY_INVALID = "invalid"
+DIRECTORY_OUTSIDE = "outside"
+
+
+@dataclass(eq=False)
+class BlobDirectory:
+    """
+    The persisted blob directory: which blob is the live one for each slot.
+
+    Attributes
+    ----------
+    data_slots : int
+        Number of directory slots that address (line, channel) data
+        blobs (header word 48, `lines_max * chans_max`); slot `i` is
+        the blob whose `blob_index` is `i`.
+    entries : dict of {int : (int, int)}
+        Every **non-zero** data slot as `(32-bit word, n_pages)`, keyed
+        by slot. A zero slot is simply absent from this dict.
+
+    Notes
+    -----
+    **[CONFIRMED]** layout, **[LIKELY]** interpretation
+    (docs/spec.md section 2.2; docs/provenance/notes.md section 6.1c).
+    The directory is an array of 6-byte slots starting at file offset
+    280. A live entry is `(0x80000000 | start page, n_pages)` where
+    the start page is relative to the first blob (`(offset - blob
+    region start) / page_size`). Across the real corpus it addressed
+    100% of the real (line, channel) blobs of 20 of 22 files, and for
+    every duplicated pair with an independent oracle (13 of 13) it
+    pointed at the correct copy. A slot that is all-zero belongs to a
+    blob the file does not list as live.
+    """
+
+    data_slots: int
+    entries: dict
+
+    def resolve(self, blob_index: int, blobs_by_offset: dict, first_offset: int, page_size: int):
+        """
+        Look up the live blob for `blob_index`.
+
+        Parameters
+        ----------
+        blob_index : int
+            The slot, `line_slot * chans_max + channel_slot`.
+        blobs_by_offset : dict of {int : BlobHeader}
+            Every blob of the chain walk, keyed by absolute `offset`.
+        first_offset : int
+            Absolute offset of the first blob (`blob_region_start`).
+        page_size : int
+            The file's page size.
+
+        Returns
+        -------
+        status : str
+            `"live"`: the entry's start page lands on a walked blob
+            header whose `blob_index` equals `blob_index` and whose
+            `n_pages` equals the entry's page count (the strict
+            check). `"absent"`: the slot is all-zero. `"invalid"`: the
+            slot is non-zero but fails the strict check. `"outside"`:
+            `blob_index` is not a data slot at all (an administrative
+            slot), so the directory says nothing about it.
+        blob : BlobHeader or None
+            The live blob for `"live"`, otherwise `None`.
+        """
+        if not 0 <= blob_index < self.data_slots:
+            return DIRECTORY_OUTSIDE, None
+        entry = self.entries.get(blob_index)
+        if entry is None:
+            return DIRECTORY_ABSENT, None
+        word, n_pages = entry
+        if word >> 28 != _DIRECTORY_LIVE_FLAG:
+            return DIRECTORY_INVALID, None
+        blob = blobs_by_offset.get(first_offset + (word & 0x7FFFFFFF) * page_size)
+        if blob is None or blob.blob_index != blob_index or blob.n_pages != n_pages:
+            return DIRECTORY_INVALID, None
+        return DIRECTORY_LIVE, blob
+
+
+def read_blob_directory(path: str) -> Optional[BlobDirectory]:
+    """
+    Read the persisted blob directory.
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file.
+
+    Returns
+    -------
+    BlobDirectory or None
+        The directory, or `None` when the file has none to trust: a bad
+        magic or truncated header, header words that are inconsistent
+        with the layout (`data_slots != lines_max * chans_max`, or the
+        data slots would run past the blob region), or a directory
+        whose every data slot is zero. Absence is not an anomaly, so
+        nothing is warned.
+
+    Notes
+    -----
+    See `BlobDirectory`. Only the data slots (`0 <= slot <
+    data_slots`) are read; the registry blob-symbol slots and the
+    cache slots after them are not used by the reader.
+    """
+    with open(path, "rb") as f:
+        header = f.read(4096)
+        if not check_magic(header):
+            return None
+        fields = header_fields(header)
+        chans_max, lines_max, data_slots, page_size = (
+            fields["chans_max"], fields["lines_max"], fields["data_slots"], fields["page_size"],
+        )
+        if None in (chans_max, lines_max, data_slots, page_size):
+            return None
+        blob_start = blob_region_start(header)
+        if (
+            blob_start is None or data_slots <= 0 or data_slots != lines_max * chans_max
+            or DIRECTORY_OFFSET + data_slots * _DIRECTORY_SLOT_DTYPE.itemsize > blob_start
+        ):
+            return None
+        f.seek(DIRECTORY_OFFSET)
+        raw = f.read(data_slots * _DIRECTORY_SLOT_DTYPE.itemsize)
+    if len(raw) != data_slots * _DIRECTORY_SLOT_DTYPE.itemsize:
+        return None
+    slots = np.frombuffer(raw, dtype=_DIRECTORY_SLOT_DTYPE)
+    nonzero = np.nonzero((slots["word"] != 0) | (slots["n_pages"] != 0))[0]
+    if len(nonzero) == 0:
+        return None
+    entries = {
+        int(i): (int(slots["word"][i]), int(slots["n_pages"][i])) for i in nonzero
+    }
+    return BlobDirectory(data_slots=data_slots, entries=entries)
 
 
 def _element_width(channel: ChannelRecord) -> Optional[int]:
