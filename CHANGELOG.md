@@ -8,7 +8,7 @@ minor releases may change behavior, patch releases fix bugs).
 The version number lives in `rust/Cargo.toml`; `pyproject.toml` reads it
 from there.
 
-## [Unreleased]
+## [0.3.0] - 2026-09-26
 
 ### Changed
 
@@ -125,6 +125,7 @@ from there.
   released during native decoding where that is safe.
 - The package version is now read from `rust/Cargo.toml`.
 
+[0.3.0]: https://github.com/jcapriot/pygdb/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/jcapriot/pygdb/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jcapriot/pygdb/compare/v0.0.1...v0.2.0
 [#1]: https://github.com/jcapriot/pygdb/issues/1
