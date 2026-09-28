@@ -3260,3 +3260,177 @@ the reader. For issue #2 it settles which copy is current wherever a file has a
 directory (all 23 here); the earlier `row_order` heuristic is no longer needed and
 was removed. Open: word 116, the `0x4` flag bit, why blobs are unlisted, and every
 field in the section 6.1c census.
+
+
+## Session 7 -- decoding the "REG "/"VV" administrative-blob framing (2026-09-28)
+
+Prompted by: "are there any parts of our spec that have not landed into the
+python package?" (identified section 9's registry content as description-only,
+no decoder), then "are the registry contents you've decoded structured in any
+way?", then "can you decode it?"
+
+1. Dumped a real `REG`-tagged administrative blob byte-for-byte
+   (`Magnetic_Data.gdb`, blob_index 50123, offset 115064832) and read it word
+   by word. **The long-standing `[UNKNOWN]` constant `4670802`** (spec section
+   6.4, "a specific non-`GS_*` constant... instead of a valid type code") **is
+   exactly the ASCII bytes `52 45 47 00` ("REG\0") read as a little-endian
+   int32.** It was never an opaque sentinel -- the blob-header field a real
+   data blob uses for its `GS_*` type code (relative +44) is, on an
+   administrative blob, the first 4 bytes of the object's own 3-letter name.
+   The same holds for `IPJ` blobs (`49 50 4a 00`).
+2. Confirmed a **fixed 128-byte preamble** on every `REG` blob: the ordinary
+   48-byte blob header (name in place of the type code, as above; timestamp
+   always the `0x80000000` unset sentinel; a "kind" field at +20 always `100`,
+   distinct from the `200`/`202` seen on real data blobs), then 48 more bytes
+   ending in a repeating constant `ff 00 e1 1e`, then a 16-byte block
+   (separator `00 1a cc ff` + FourCC tag `"REG "` + two int32 counts `2`,
+   `1`), then another 16-byte block for a nested `"VV  "` tag (Geosoft's own
+   vector-value object, matching the framing sketch already in section 6.8).
+   **Exact on 1,033 of 1,033 real REG blobs** checked across 5 files, all 3
+   agencies (`Magnetic_Data.gdb` 466/466, `Radiometric_Data.gdb` 356/356,
+   `MLMAG.gdb` 65/65, `MLGRAV.gdb` 63/63, `AG106386...Conductivity.gdb`
+   83/83).
+3. Decoded the VV object's content past that 128-byte mark, and found it is
+   not one thing:
+   - **A flat cached numeric array.** One VV (blob 50123 above) is a
+     contiguous run of 112 real float64 values, smoothly varying (279.3 down
+     to 178.0), filling the rest of the page. Real, decodable data -- but
+     what it is remains open: it isn't a copy of the real per-line data for
+     the same channel_slot (checked directly, channel 23 is
+     `diurnaly_cor_mag`, whose real per-line values are ~47,651, a different
+     range entirely).
+   - **A short flat `KEY\0value\0` pair per ~256-byte slot.** Another VV
+     (blob at 229258240) holds `FORMULA\0time(hh,mm,ss)\0`, then
+     `LABEL\0` (empty value), then `UNITS\0` (empty value), each starting
+     at `(offset - 128) mod 256 == 0` relative to the blob. This period holds
+     for the majority (70-90%) of every `FORMULA`/`UNITS`/`LABEL`/`CLASS`
+     occurrence checked across 4 files -- but not all of them (see next).
+   - **A second level of the same recursive framing.** A third VV (blob at
+     229257216, one page before #2 above) recurses: at +384 a miniature copy
+     of the same shape (`1`, the constant `0x0ff000ff`, a length, `0`) then
+     `1`, `"MAKER\0"`, the `ff 00 e1 1e` constant, a length, `0`, `1`, then
+     `00 1a cc ff` + `"MAKE"` + count `1` + length `80`, then 80 bytes of the
+     literal tool identifier string
+     (`"geogxnet.dll(Geosoft.GX.MathExpressionBuilder...)"`) -- the same
+     name-header -> marker -> separator+tag shape as the outer `REG`/`VV`
+     pair, one level deeper. This is genuinely `[UNKNOWN]` which of the two
+     content kinds (flat slots vs. recursive object) a given VV holds, or
+     what decides it.
+4. **The GX-tool parameter block itself is plain text, not further
+   TLV-tagged.** Right after the `"Channel Math Expression Builder"` display
+   name in the blob above: a UTF-8 BOM (`ef bb bf`), then CRLF-separated
+   `KEY.SUBKEY="value"` lines --
+   `MATHEXPRESSIONBUILDER.CHANNELINPUTBOX="ch_9=comp_mag - ch_8;ch_9=ch_9 +
+   48066.0;"` among them, the same real formula already known from section
+   6.8 -- ending with a `0x1A` (DOS/ASCII SUB, a classic text-file EOF marker)
+   byte. **[CONFIRMED]** on this one instance; not yet checked elsewhere.
+5. Not chased further this round (recorded honestly, not guessed at): what
+   selects flat-slot vs. recursive-object content for a VV; the meaning of
+   the `0x0ff000ff`/`ff 00 e1 1e`/`00 1a cc ff` constants; why some 256-byte
+   slots hold a real key and others are empty placeholders (open since
+   section 6.8); the complete list of top-level tags beyond `REG`/`IPJ`/
+   `VV`/`MAKER`/`MAKE`/`CLASS`.
+6. Asked whether the "kind" field (+20, always `100` in every example dumped
+   so far) correlates with the three content forms. It does not -- it is
+   `100` on **1,942 of 1,942** administrative blobs across the whole real
+   corpus, every real tag seen (`REG\0` 1,758, `IPJ\0` 63, `EXT\0` 36,
+   `META\0` 4). It marks "administrative blob" as a class, not which
+   registry object a blob holds.
+7. The length-like fields at +24/+32/+64 (step 2) **do** correlate with
+   content kind, cross-tabulated against a content classifier (empty /
+   numeric array / flat key-value slots / nested sub-object) on 4 files:
+   empty, numeric-array and other/short all sit at a fixed `104` baseline;
+   nested sits in a tight per-file cluster above it (`283`-`285` USGS,
+   `391`-`395` GSQ); flat key/value is wide and tracks actual string length.
+   `+24` is therefore a real length field -- "declared payload before any
+   undeclared tail" -- not a discriminator on its own, and a numeric array's
+   real length isn't in it at all.
+8. Chasing step 6's tag census turned up two more real variants, one a
+   false positive of the census method itself. **`"LINE"` is not a real
+   object tag** -- all 4 hits (1991 Melinda Downs GSQ files) are a blob with
+   no `REG`/`VV` wrapper at all: after the ordinary 24-byte prefix and a
+   length field at +24 that exactly matches the text length in every
+   instance (916/691/1317/461 bytes), raw CRLF text begins immediately at
+   +32 -- a literal Oasis montaj "OASIS VIEW" saved session/settings block
+   (`[OASIS VIEW]\r\n\r\nLINE L570300\r\nCHANNEL EASTING\r\n...`, a
+   per-channel display-profile list). The word "LINE" in that text simply
+   landed on the same +44 offset a real object's name occupies, in these 4
+   instances, which is how the tag census in step 6 miscounted it. **`"META
+   \0"`, unlike "LINE", is real** -- 4 of 4 instances the same shape,
+   3 files, all 1991 GSQ TEM/EM surveys. Same 128-byte preamble as `REG`, but
+   the first nested tag at +96 is `"ATEM"` (plausibly Airborne TEM), and a
+   short distance further in, the 16-byte page-primitive magic
+   (section 6.5/7.1) with `subtype=2` -- a genuine embedded zlib stream,
+   confirmed on 4/4. Not decompressed or examined further.
+9. Tried the same cross-tabulation against the two VV fields not yet
+   checked, +116/+120 (never vary, no signal) and +124. **+124 is the count
+   of distinct keys in a flat key/value VV** -- 243 of 245 clean instances
+   (first 256-byte slot itself empty or a real key) match exactly across 5
+   files; the 2 exceptions (`MLGRAV.gdb`) are the same real object with
+   `UNITS\0` duplicated across two slots and `+124=1`, i.e. it counts
+   distinct names, and a duplicate collapses to one -- the same append-only
+   stale-copy phenomenon already known for data blobs (section 6.6f). A real
+   subset (57/102 in `Magnetic_Data.gdb`) doesn't fit this model at all: a
+   non-key value (a bare int32, `83` seen) sits in the first slot, and +124
+   is 0 regardless of how many real keyed slots follow -- left open.
+10. Looked closer at that leading value: it's a single byte at blob-relative
+    +132 (the preceding 4 bytes are always 0), not an int32. Across all 80
+    such blobs in `Magnetic_Data.gdb`: `83` (ASCII `'S'`) on 50, but 21
+    further distinct values seen otherwise, each mostly once -- a dominant
+    common value with real per-instance variation, so genuine per-blob data,
+    not a fixed marker, but nothing decoded so far says what it holds.
+11. Decompressed the `"META"`/`"ATEM"` zlib stream found in step 8 (had a
+    trivial bug first -- compared a 4-byte tag slice to a 5-byte literal,
+    silently matching nothing; fixed and reran). All 4 instances decompress
+    cleanly with plain `zlib` (11,094-12,211 bytes), each distinct (4
+    different SHA-1 hashes, including the two within one file -- presumably
+    a stale/current pair). **It is not survey data.** Its readable strings
+    are Geosoft's own internal class/type vocabulary -- `"IPJ Class"`,
+    `"ITR Class"`, `"DOCU Class"`, `"META Class"` (explaining the outer tag),
+    `"PLY Class"`, `"PIC Class"`, `"TPAT Class"`, primitive types (`Bytes`,
+    `String`, `Object`, `Enum`, `Bool`, `Angle`, `Time`, `Date`, `Data`,
+    `Picture`), attribute names (`FixedSize`, `MaxSize`, `ByteOrder`,
+    `MinValue`, `MaxValue`, `EnumValue`, `Visible`, `Editable`, `FlatName`),
+    headed by `"Geosoft"`, `"Core"`, `"Types"`, `"Objects"` -- the same
+    category of thing as the already-documented bundled projection
+    dictionary (section 6.7), a generic reference catalog the software
+    embeds, not something specific to this survey. The record framing inside
+    it (repeating `0x02` + a one-letter kind code + several int32 fields +
+    an optional name) looks real and regular but wasn't decoded further --
+    low priority, since it describes the software, not the data.
+12. Asked directly what selects flat-slot vs. nested `VV` content.
+    Cross-tabulated every fixed field `+0`..`+124` against content kind on 3
+    files: nothing but `+24`/`+32`/`+64` (already known to correlate) differs
+    at all between kinds -- there is no separate flag. But `+24` alone works
+    as a practical discriminator: on every file with `nested` instances, its
+    value sits in a narrow band (one value or a tight cluster per file --
+    `283`, `285`, `391`-`395`) that **zero** `flat_kv` instances ever land
+    inside, across all 5 files checked -- `flat_kv`'s own values are either
+    the `104` baseline or jump straight past the nested band. Recorded as an
+    empirical gap that holds everywhere checked, not a proven encoding rule.
+13. Pushed on the bare-placeholder question (open since section 6.8), broken
+    down by key name instead of treated as one phenomenon: **`CLASS` is
+    always empty (0 of 216 real instances, all 5 files) and `FORMULA` is
+    always populated (0 of 69 empty, all 5 files)** -- both fully
+    deterministic, not "sometimes". Only `LABEL`/`UNITS` genuinely vary.
+    Tested four hypotheses for what decides it on all 5 files: whether the
+    channel has real per-line data anywhere, its dtype (string/numeric),
+    whether it's an array channel, its display format code -- every
+    combination has real counts in both directions on every file, none
+    ruled in. Still open, four real candidates ruled out.
+14. Tried the remaining constants. Census over the *whole* corpus (not just
+    the handful of files checked before) confirmed `+28`/`+60` are fixed on
+    1,861 of 1,861 real administrative blobs -- never a third value. Both
+    turned out to be **two complementary byte pairs**: `(0xFF, 0x00)` then
+    `(X, ~X)`, `X = 0xF0` at `+28` and `0xE1` at `+60` -- verified by XOR
+    (`byte0^byte1 = byte2^byte3 = 0xFF` on both). Checked the separator
+    (`00 1a cc ff`) against the same shape: it doesn't fit (XORs `0x1a`/
+    `0x33`, not `0xFF`) -- a distinct, unrelated constant. The bit structure
+    is real and complete; what `0xF0`/`0xE1` themselves mean is not.
+
+**What it changes.** `docs/spec.md` sections 6.4, 9 and 11 (the `4670802`
+constant is no longer `[UNKNOWN]`; the framing has a real, if partial,
+decoded structure now, superseding "no decoded byte-exact structure, just
+plain string search"). No code changed -- this is investigation only, kept
+out of `pygdb/registry.py` pending a decision on whether a real decoder is
+worth building on top of a structure this partially understood.

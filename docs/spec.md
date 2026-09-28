@@ -556,16 +556,21 @@ Real row data occupies `row_count × element_width` bytes starting at
 
 ### 6.4 The reserved/administrative blob variant
 
-A real, recurring, but still **[UNKNOWN]** class of blob: `blob_index`
-decomposes to an implausibly large "line number" (values in the
-hundreds to low thousands seen, well past any real survey's line
-count), and offset `+44` (or the equivalent compressed-header field,
-§7.3) reads a specific non-`GS_*` constant, `4670802`, instead of a
-valid type code. These are cleanly distinguishable and safely skipped
-by a reader (negative or implausible `row_count`, or the tell-tale
-`4670802` constant) but their actual purpose — plausibly some kind of
-reserved/"current value" cache, possibly related to the vendor's
-`DB_CATEGORY_LINE_GROUP=200` constant — has not been determined.
+A real, recurring class of blob: `blob_index` decomposes to an
+implausibly large "line number" (values in the hundreds to low
+thousands seen, well past any real survey's line count), and offset
+`+44` (or the equivalent compressed-header field, §7.3) reads a
+specific non-`GS_*` constant, `4670802`, instead of a valid type code.
+These are cleanly distinguishable and safely skipped by a reader
+(negative or implausible `row_count`, or the tell-tale `4670802`
+constant).
+
+**The `4670802` constant is explained — [CONFIRMED].** It is not a
+sentinel value: read as bytes rather than an int32, it is exactly the
+ASCII string `"REG\0"`. An administrative blob's own type-code field
+holds the first 4 bytes of its own 3-letter object name instead of a
+`GS_*` type code (an `IPJ`-tagged blob reads `49 50 4a 00` = `"IPJ\0"`
+the same way) — see §9 for what that name introduces.
 
 ---
 
@@ -802,7 +807,51 @@ northing at consecutive small byte deltas).
 ## 9. The `"REG "` registry: settings and processing-history log
 
 **[CONFIRMED]** rich real content, on all 3 agencies this project has
-files from; **[UNKNOWN]** exact binary framing. `provenance/notes.md` §6.8.
+files from. The binary framing is **partially decoded**: a fixed
+128-byte preamble common to every `REG` blob is **[CONFIRMED]** (1,033
+of 1,033 real instances checked); what follows it is **[CONFIRMED]** to
+take at least three different real forms, but which a given blob uses
+is **[UNKNOWN]**. `provenance/notes.md` §6.8, §6.8c.
+
+**The fixed preamble** (§6.4 has the `4670802`/`REG\0` identity this
+starts from): the ordinary 48-byte blob header, its `+44` type-code
+field holding the object's own name instead; 32 more zero bytes; a
+repeating 4-byte constant; a length-like field; then two 16-byte
+tag blocks — a separator constant, the FourCC tag `"REG "`, and two
+int32 counts, then the same separator, the tag `"VV  "`, and two more
+fields. Every `REG` blob's first 128 bytes matches this exactly.
+`provenance/notes.md` §6.8c has the full byte-offset table.
+
+**What follows the preamble (from byte 128 on)** is one of, so far:
+1. a flat, contiguous array of real cached float64 values (not a copy
+   of any real channel's per-line data seen so far);
+2. a short flat `KEY\0value\0` pair per file-observed ~256-byte slot
+   (`FORMULA`, `UNITS`, `LABEL`, `CLASS` keys seen this way);
+3. a second level of the *same* recursive tagged-object framing
+   (`MAKER` → `MAKE` seen this way), whose own payload can in turn be
+   a length-prefixed string — in one confirmed instance, plain UTF-8
+   text (BOM, CRLF-separated `KEY.SUBKEY="value"` lines, a trailing
+   `0x1A` DOS EOF byte) holding exactly the kind of tool-run parameter
+   content described below.
+
+No field explicitly flags which of these three a given `VV` object holds —
+but the length field two paragraphs up correlates with content in a way
+that, empirically, cleanly separates a nested object from a flat-slot one:
+on every file checked with both present, the nested case's length sits in a
+narrow band no flat-slot instance ever lands in (`provenance/notes.md`
+§6.8c). Not proven as a deliberate rule, only observed to hold.
+
+**A rarer sibling object, tagged `"META\0"` instead of `"REG\0"`, wraps a
+real compressed stream — and it is Geosoft's own internal type library, not
+survey data.** Same 128-byte preamble, but the first nested tag is `"ATEM"`,
+followed by the 16-byte page-primitive magic (§7.1) and a genuine zlib
+(`DB_COMP_SIZE`) stream. Found on 3 real files (all 1991 GSQ TEM/EM
+surveys), 4 instances, each decompressing cleanly to 11-12KB of a real,
+regularly-framed object graph whose readable strings are Geosoft's own
+class/type vocabulary (`"IPJ Class"`, `"META Class"`, primitive types,
+attribute names) headed by `"Geosoft"`/`"Core"`/`"Types"`/`"Objects"` — the
+same category of thing as the bundled projection dictionary already
+mentioned in §8, not per-survey content. Not decoded field-by-field.
 
 The majority of "reserved/administrative" blobs (§6.4, §8) are *not*
 `IPJ` records — they start with a different 4-byte FourCC-style tag,
@@ -908,8 +957,17 @@ opened in Oasis montaj), remains open — only that this specific
 finding.
 
 **What's still open:** the exact binary field boundaries of the `REG`/
-`VV`-tagged sub-objects; why some registry slots are populated and
-others are bare placeholders; the precise mapping from a blob's
+`VV`-tagged sub-objects beyond the fixed 128-byte preamble now decoded
+(the two remaining preamble constants are now fully characterized at the
+bit level — `(0xFF, 0x00, X, ~X)` with `X` fixed per field, `0xF0`/`0xE1` —
+but not semantically explained, and a "dirty slot 0" content shape that
+doesn't fit the flat/nested split); why a `LABEL`/`UNITS` slot specifically
+is populated or a bare
+placeholder — two sibling keys, `CLASS` and `FORMULA`, turned out to be
+fully deterministic instead (always empty / always populated), but four
+real hypotheses for `LABEL`/`UNITS` (channel data presence, dtype,
+array-ness, display format) were tested and ruled out, `provenance/notes.md`
+§6.8c; the precise mapping from a blob's
 `channel_slot` to which real channel or tool-run instance it concerns;
 whether any real file has genuinely no REG/IPJ content at all; and a
 small, genuinely unidentified third administrative-blob tag variant
@@ -943,10 +1001,11 @@ but their actual meaning is genuinely **[UNKNOWN]**:
 - A UTF-16LE-looking embedded Windows file path inside a real user
   record (§3.3) — observed once.
 - Reserved/administrative blobs with out-of-range line numbers and a
-  constant `4670802` in place of a valid type code (§6.4) — partially
-  explained for the minority that carry `IPJ` projection data (§8),
-  but most don't, and carry a different, unexplored `"REG "` tag
-  instead.
+  constant `4670802` in place of a valid type code (§6.4) — the
+  constant itself is now explained (it is the object's own `"REG\0"`/
+  `"IPJ\0"` name, misread as a type code), and §9 now has a partially
+  decoded binary framing for the REG case, but most of a REG blob's
+  content is still recovered by string search, not full decoding.
 - The full `+16`-onward trailer of both the plain (§6.3) and
   compressed (§7.4) blob headers, for older (pre-2020) file vintages —
   the fields that decode sensibly on 2020-era files often don't at the
