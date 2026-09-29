@@ -32,8 +32,10 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from .gdb_reader import (
+    DIRECTORY_OFFSET,
     ChannelRecord,
     GDBParseWarning,
+    blob_region_start,
     check_magic,
     header_fields,
     iter_blobs,
@@ -772,3 +774,331 @@ def find_projection_parameters(
             )
         result[name] = params_list[-1]
     return result
+
+
+# -- Channel creation records (MAKER) and display lists ------------------------
+#
+# docs/spec.md section 9: a registry object's nested object is a `MAKER`
+# record -- the tool that made the channel and the parameters it ran with --
+# and the `Display List` administrative object is a VV of fixed-width
+# `name\0handle\0` records.
+_OBJECT_FRAME = b"\xff\x00\xf0\x0f"
+_MEMBER_FRAME = b"\xff\x00\xe1\x1e"
+_TAG_BLOCK = b"\x00\x1a\xcc\xff"
+_VV_TAG_BLOCK = _TAG_BLOCK + b"VV  "
+_MAKER_PARAM_RE = re.compile(r'([^=\r\n]+)="(.*)"')
+_DISPLAY_LIST_NAME = "Display List"
+
+
+@dataclass(eq=True)
+class ChannelMaker:
+    """
+    How a channel was made: one `MAKER` record from the file's registry.
+
+    Attributes
+    ----------
+    tool : str
+        The tool that created the channel, as the file records it -- a GX
+        name (`"newchan.gx"`, `"gx\\\\copy.gx"`) or a .NET entry point
+        (`"geogxnet.dll(Geosoft.GX.MathExpressionBuilder...;RunChannel)"`).
+    label : str
+        The tool's human-readable name (`"New channel"`, `"Copy channel"`).
+    parameters : dict of {str : str}
+        The tool's parameters, `{"TOOL.KEY": "value"}` in file order --
+        e.g. `{"NEWCHAN.DISPWIDTH": "10", ...}` or the formula of a math
+        expression. Empty when the tool recorded none.
+
+    Notes
+    -----
+    **[CONFIRMED]** layout on all 305 corpus records (docs/spec.md section 9,
+    docs/provenance/notes.md section 6.8c). Values are returned as the text
+    the file stores; their meaning is the tool's, not decoded here.
+    """
+
+    tool: str
+    label: str
+    parameters: Dict[str, str]
+
+
+@dataclass(eq=True)
+class DisplayListEntry:
+    """
+    One entry of a `Display List` object.
+
+    Attributes
+    ----------
+    label : str
+        The channel name stored in the list. A cached label: a channel
+        renamed after it was added keeps its old name here.
+    handle : int
+        The channel's global symbol handle, which identifies it.
+    channel : str or None
+        The channel's current name, resolved from `handle` through the
+        channel table; `None` if no current channel has that handle.
+    """
+
+    label: str
+    handle: int
+    channel: Optional[str]
+
+
+def _live_admin_objects(path: str) -> Dict[int, bytes]:
+    """
+    `{blob-symbol slot: object bytes}` for every live administrative object.
+
+    The live copy is the one the blob directory lists at slot `data_slots +
+    k` (docs/spec.md section 2.2); a slot with no usable entry falls back to
+    the last copy in chain order. Each value is cut to the object's declared
+    payload (blob `+24`), so leftover bytes after it are never returned.
+    """
+    with open(path, "rb") as f:
+        header = f.read(4096)
+    fields = header_fields(header)
+    data_slots, page_size, blobs_max = fields["data_slots"], fields["page_size"], fields["blobs_max"]
+    first = blob_region_start(header)
+    if None in (data_slots, page_size, blobs_max, first) or not page_size:
+        return {}
+    by_offset = {}
+    last_by_slot = {}
+    for blob in iter_blobs(path):
+        if blob.blob_index >= data_slots:
+            by_offset[blob.offset] = blob
+            last_by_slot[blob.blob_index - data_slots] = blob
+    chosen = dict(last_by_slot)
+    with open(path, "rb") as f:
+        f.seek(DIRECTORY_OFFSET + 6 * data_slots)
+        raw = f.read(6 * blobs_max)
+        for slot in range(len(raw) // 6):
+            word, n_pages = struct.unpack_from("<IH", raw, 6 * slot)
+            if not word & 0x80000000:
+                continue
+            blob = by_offset.get(first + (word & 0x3FFFFFFF) * page_size)
+            if blob is not None and blob.blob_index == data_slots + slot and blob.n_pages == n_pages:
+                chosen[slot] = blob
+        objects = {}
+        for slot, blob in chosen.items():
+            f.seek(blob.offset)
+            data = f.read(min(blob.n_pages * page_size, 50_000_000))
+            if len(data) < 28:
+                continue
+            end = 28 + struct.unpack_from("<i", data, 24)[0]
+            objects[slot] = data[:max(28, min(end, len(data)))]
+    return objects
+
+
+def _decode_maker(nested: bytes) -> Optional[ChannelMaker]:
+    """A `MAKER` nested object (docs/spec.md section 9), or `None` if
+    `nested` does not have that shape."""
+    if (
+        len(nested) < 84 or nested[:4] != _OBJECT_FRAME or nested[16:21] != b"MAKER"
+        or nested[32:36] != _MEMBER_FRAME or nested[64:72] != _TAG_BLOCK + b"MAKE"
+    ):
+        return None
+    try:
+        pos = 76  # after the tag block and its int32 (1)
+        tool_len = struct.unpack_from("<i", nested, pos)[0]
+        tool = nested[pos + 4:pos + 4 + tool_len].split(b"\x00")[0].decode("latin-1")
+        pos += 4 + tool_len + 2  # the tool string is followed by a 2-byte field
+        label_len = struct.unpack_from("<i", nested, pos)[0]
+        label = nested[pos + 4:pos + 4 + label_len].split(b"\x00")[0].decode("latin-1")
+        pos += 4 + label_len
+    except struct.error:
+        return None
+    text = nested[pos:]
+    if text.startswith(b"\xef\xbb\xbf"):
+        text = text[3:]
+    body = text.split(b"\x1a")[0].decode("utf-8", errors="replace")
+    parameters = {}
+    for line in body.split("\r\n"):
+        m = _MAKER_PARAM_RE.fullmatch(line)
+        if m:
+            parameters[m.group(1)] = m.group(2)
+    return ChannelMaker(tool=tool, label=label, parameters=parameters)
+
+
+def _decode_reg_maker(blob_bytes: bytes) -> Optional[ChannelMaker]:
+    """The `MAKER` record of one registry object, if it has one: after the
+    object's `+124` entries comes an int32 count of nested objects, and a
+    count of 1 is followed by the record (docs/spec.md section 9)."""
+    if blob_bytes[44:48] != _REG_OBJECT_NAME or len(blob_bytes) < _REG_PREAMBLE_SIZE + 4:
+        return None
+    n_entries = max(struct.unpack_from("<i", blob_bytes, _REG_ENTRY_COUNT_OFFSET)[0], 0)
+    count_at = _REG_PREAMBLE_SIZE + n_entries * _REG_FLAT_KV_SLOT_SIZE
+    if count_at + 8 > len(blob_bytes) or struct.unpack_from("<i", blob_bytes, count_at)[0] != 1:
+        return None
+    return _decode_maker(blob_bytes[count_at + 4:])
+
+
+def _channel_handles(path: str, channels: Optional[Iterable[ChannelRecord]]):
+    """`(names by channel slot, channel handle base)`, or `None` when the
+    file has no readable header."""
+    with open(path, "rb") as f:
+        header = f.read(128)
+    if not check_magic(header):
+        return None
+    fields = header_fields(header)
+    if None in (fields["blobs_max"], fields["lines_max"], fields["data_slots"]):
+        return None
+    if channels is None:
+        channels = read_channels(path)
+    return {c.index: c.name for c in channels}, fields["blobs_max"] + fields["lines_max"]
+
+
+def find_channel_makers(
+    path: str,
+    channels: Optional[Iterable[ChannelRecord]] = None,
+) -> Dict[str, ChannelMaker]:
+    """
+    Scan `path` for how each channel was made.
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file to scan.
+    channels : iterable of ChannelRecord, optional
+        The file's channel table, used to resolve each record's owning
+        channel handle to a name. If not given, this calls
+        `read_channels(path)` itself -- pass `db.channels` if the caller
+        already has it.
+
+    Returns
+    -------
+    dict of {str : ChannelMaker}
+        `{channel name: ChannelMaker}` for every channel whose registry
+        object holds a `MAKER` record. A channel with none -- imported
+        rather than made by a tool, or a file whose writer kept no record
+        -- is absent. `{}` for a file with no readable blob-symbol table.
+
+    Warns
+    -----
+    GDBParseWarning
+        If `path` doesn't start with the expected magic. Also raised, once
+        per channel, if stale copies of its registry object hold different
+        `MAKER` records -- the last one in blob-chain order is kept.
+
+    Notes
+    -----
+    Attribution follows `find_channel_settings`: the record is owned by
+    the channel named by its object's blob-symbol handle (docs/spec.md
+    section 2.1). Every copy of the object in the chain is read, since a
+    rewritten object can leave its `MAKER` record only in an older copy
+    of itself; differing copies are warned about, never merged.
+    """
+    resolved = _channel_handles(path, channels)
+    if resolved is None:
+        _warn(f"{path}: not a readable .gdb header -- no channel creation records")
+        return {}
+    channel_names, handle_base = resolved
+    with open(path, "rb") as f:
+        fields = header_fields(f.read(128))
+    data_slots, page_size = fields["data_slots"], fields["page_size"]
+    symbols = read_blob_symbols(path)
+    if symbols is None or not page_size:
+        return {}
+    candidates: Dict[int, List[ChannelMaker]] = {}
+    with open(path, "rb") as f:
+        for blob in iter_blobs(path):
+            if blob.blob_index < data_slots:
+                continue
+            m = _CHANNEL_OBJECT_NAME_RE.fullmatch(symbols.get(blob.blob_index - data_slots, ""))
+            if not m:
+                continue
+            channel_slot = int(m.group(1)) - handle_base
+            if channel_slot not in channel_names:
+                continue
+            f.seek(blob.offset)
+            data = f.read(min(blob.n_pages * page_size, 50_000_000))
+            if len(data) < 28:
+                continue
+            end = 28 + struct.unpack_from("<i", data, 24)[0]
+            maker = _decode_reg_maker(data[:end])
+            if maker is not None:
+                candidates.setdefault(channel_slot, []).append(maker)
+    result: Dict[str, ChannelMaker] = {}
+    for channel_slot, makers in candidates.items():
+        name = channel_names[channel_slot]
+        distinct = []
+        for mk in makers:
+            if mk not in distinct:
+                distinct.append(mk)
+        if len(distinct) > 1:
+            _warn(
+                f"{path}: channel {name!r} has {len(distinct)} different creation "
+                f"records across stale/duplicate registry entries -- using the "
+                f"last one in blob-chain order"
+            )
+        result[name] = makers[-1]
+    return result
+
+
+def find_display_lists(
+    path: str,
+    channels: Optional[Iterable[ChannelRecord]] = None,
+) -> List[List[DisplayListEntry]]:
+    """
+    Read the file's `Display List` objects.
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file to scan.
+    channels : iterable of ChannelRecord, optional
+        The file's channel table, used to resolve each entry's handle to
+        the channel's current name. If not given, this calls
+        `read_channels(path)` itself.
+
+    Returns
+    -------
+    list of list of DisplayListEntry
+        One list per live `Display List` object, in blob-symbol slot order,
+        each in stored order. `[]` for a file with none, or with no
+        readable blob-symbol table.
+
+    Warns
+    -----
+    GDBParseWarning
+        If `path` doesn't start with the expected magic.
+
+    Notes
+    -----
+    **[CONFIRMED]** layout on all 48 corpus instances (docs/spec.md
+    section 9): a VV of fixed-width strings (82 or 130 bytes), each
+    `name\\0handle\\0`. **[LIKELY]** meaning: the channels shown in the
+    database's spreadsheet view. The live copy of each object comes from
+    the blob directory (docs/spec.md section 2.2).
+    """
+    resolved = _channel_handles(path, channels)
+    if resolved is None:
+        _warn(f"{path}: not a readable .gdb header -- no display lists")
+        return []
+    channel_names, handle_base = resolved
+    symbols = read_blob_symbols(path)
+    if symbols is None:
+        return []
+    objects = _live_admin_objects(path)
+    lists: List[List[DisplayListEntry]] = []
+    for slot in sorted(k for k, name in symbols.items() if name == _DISPLAY_LIST_NAME):
+        data = objects.get(slot)
+        if data is None:
+            continue
+        at = data.find(_VV_TAG_BLOCK)
+        if at == -1 or at + 20 > len(data):
+            continue
+        _zero, element_type, count = struct.unpack_from("<iii", data, at + 8)
+        width = -element_type
+        start = at + 20
+        if width <= 0 or count < 0 or start + count * width > len(data):
+            continue
+        entries = []
+        for i in range(count):
+            parts = data[start + i * width:start + (i + 1) * width].split(b"\x00")
+            label = parts[0].decode("latin-1")
+            handle_text = parts[1].decode("latin-1") if len(parts) > 1 else ""
+            if not handle_text.isdigit():
+                continue
+            handle = int(handle_text)
+            entries.append(DisplayListEntry(
+                label=label, handle=handle, channel=channel_names.get(handle - handle_base),
+            ))
+        lists.append(entries)
+    return lists

@@ -66,6 +66,14 @@ them.
 
 ::: pygdb.ProjectionParameters
 
+::: pygdb.find_channel_makers
+
+::: pygdb.ChannelMaker
+
+::: pygdb.find_display_lists
+
+::: pygdb.DisplayListEntry
+
 ## Warnings and errors
 
 ::: pygdb.GDBParseWarning

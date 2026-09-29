@@ -4044,3 +4044,67 @@ and 6.7b.
     - The `f0f0f0f0` header variant is on all 11 BRIDGE ground-gravity
       databases, 13 of 45 files in all. It follows no tested file
       feature, so it stays unknown.
+
+## Session 13 -- decoding the remaining administrative objects (2026-09-29)
+
+Prompted by: "Let's try to push on decodable contents from the files we
+have." Scripts `dumpobj.py`, `vv.py`, `maker.py`.
+
+1. **Display List.** It is a bare VV object: `00 1a cc ff` + `VV  `,
+   int32 0, int32 -82, int32 count, then count x 82-byte records of
+   `channel name\0handle\0`. It ends exactly at the payload end.
+2. **The VV is a fixed-width string vector.** The element type is minus
+   the width, as in channel string types. It is -256 on every registry
+   (the old "`00 ff ff ff` constant" at `+120`), and -82/-130 on
+   `Display List`s. The count is the VV length: a registry's `+124`.
+   `Display List` handles identify channels, and its names are cached
+   labels (renamed channels keep old names).
+3. **EXT** is an empty list: class `EXT`, a member with code `LMSL`, no
+   content, identical everywhere. Registry-like bytes after it are
+   leftovers outside the payload.
+4. **Preamble generalized.** `+44` is the object's class name inside the
+   object frame, and `+96` the member's code inside the member frame.
+5. **MAKER** decodes on 305 of 305: tool name, a 2-byte zero field,
+   label, then `TOOL.KEY="value"` parameters. The 2-byte field was found
+   when 4-byte alignment fit one tool but not another. All 32
+   `newchan.gx` records carry `DISPWIDTH`/`DISPDIG`/`ARRAYSIZE`/`NAME`
+   equal to the channel record's `+94`/`+96`/`+118`/name, which upgrades
+   channel display width/decimals to [CONFIRMED].
+6. **`__dbmeta`.** Container decoded (class `META`, member `ATEM`, an
+   11-int header ending with the zlib and raw lengths, then zlib). The
+   content is a per-file typed metadata tree of vendor types and a
+   snapshot of the database's channel metadata. The node-record grammar
+   is left undecoded (3 of 47 files).
+
+## Session 14 -- checking whether channel `+116` tracks dtype (2026-09-29)
+
+Prompted by a coordinator question before treating channel `+116`
+(always `5` on 535 of 535 corpus channels, per Session 11/§6.2d) as a
+genuinely independent constant: had it only been checked on
+`GS_DOUBLE` channels, where `5` also happens to be the real dtype
+code? If `+116` tracks `+84` (the channel's own dtype code) it is a
+second copy of the type, not an unexplained field.
+
+Checked directly with `pygdb.gdb_reader.read_channels()` against every
+`.gdb` under `samples/` (48 files, all parse). Grouped every channel's
+`+116` value by its own `dtype_code`:
+
+```
+dtype_code=-255..−9 (9 distinct string widths)  -> +116 always 5
+dtype_code=1  (GS_USHORT, incl. Radiometric_Data.gdb's 512-wide
+               ISPD/ISPU spectrum channels)      -> +116 always 5
+dtype_code=2  (GS_SHORT)                          -> +116 always 5
+dtype_code=3  (GS_LONG)                            -> +116 always 5
+dtype_code=4  (GS_FLOAT)                           -> +116 always 5
+dtype_code=5  (GS_DOUBLE)                          -> +116 always 5
+```
+
+**Result: refuted.** `+116` reads exactly `5` regardless of the
+channel's real dtype -- including on `GS_USHORT` array channels whose
+own dtype code is `1`, not `5`. It is not an echo or second copy of
+`+84`; whatever it is, it is genuinely independent of the channel's
+type. `docs/spec.md` §3.1's "[UNKNOWN]" label for `+116` stands as
+before; this session only strengthens the "independent constant"
+framing with an explicit non-`GS_DOUBLE` cross-check, since the
+existing "535 of 535" figure did not previously call out that it spans
+every real dtype in the corpus, not just `GS_DOUBLE`.

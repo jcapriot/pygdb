@@ -35,6 +35,15 @@ from there.
 
 ### Added
 
+- `pygdb.find_channel_makers` / `GDB.channel_makers`: how each channel was
+  made, from the `MAKER` records in the file's registry -- the tool
+  (`newchan.gx`, the math expression builder, `newxy.gx`, ...), its label,
+  and the parameters it ran with (a derived channel's formula, source
+  database, display settings). Returned as `ChannelMaker` records keyed by
+  channel name.
+- `pygdb.find_display_lists` / `GDB.display_lists`: the file's `Display List`
+  objects, each entry a `DisplayListEntry` with the stored label, the
+  channel handle, and the channel's current name resolved from that handle.
 - `pygdb.registry.find_channel_settings` / `GDB.channel_settings`: real
   per-channel settings recorded in a file's own REG registry -- units,
   labels, processing formulas, and whatever else a real file happens to

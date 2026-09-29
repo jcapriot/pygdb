@@ -1140,7 +1140,18 @@ All 16 have dtype 0, array width 0 (one reads garbage), `+108 = 0.0` and
 `+116 = 0`, and none owns a single blob. `GDB.channel_names` listed
 them, duplicating real names. Every genuine channel has `+108 = 1.0`
 and `+116 = 5`: 535 of 535 corpus channels, a still-unexplained
-constant pair. It also has array width 1 or more. The reader now
+constant pair. **Checked directly (Session 14) whether `+116` tracks
+the channel's own `+84` dtype code instead of being independent** --
+prompted by `+116`'s value (`5`) coinciding with `GS_DOUBLE`'s own code
+(`5`), and most corpus channels being `GS_DOUBLE`. Grouped `+116` by
+`dtype_code` across all 48 corpus files: `+116` reads exactly `5` on
+every `GS_USHORT` channel (including `Radiometric_Data.gdb`'s 512-wide
+`ISPD`/`ISPU` spectra, dtype `1`), every `GS_SHORT` (`2`), `GS_LONG`
+(`3`), `GS_FLOAT` (`4`) channel, and all 9 distinct string-width dtypes
+seen -- never anything but `5`, regardless of the real dtype. **Not a
+type-code echo**; the field is genuinely independent of dtype, and the
+mystery stands as such rather than as a redundant field. It also has
+array width 1 or more. The reader now
 rejects width 0; the width test is structural (zero elements per
 fiducial is meaningless), so the unexplained `+108`/`+116` constants
 are not relied on.
@@ -1465,6 +1476,66 @@ from word 108. The file now reads 72 channels x 124 rows. Tests:
 synthetic junk-page cases for both fixes, a real-file regression, and
 the word-116 / free-list tests exempt a file carrying class-100 blobs in
 the data range.
+
+**Session 12, decodable contents: Display List, EXT, MAKER, META --
+[CONFIRMED] layouts** (`dumpobj.py`, `vv.py`, `maker.py`).
+
+- **VV = vector of fixed-width strings.** The `Display List` in
+  `Kalay_pk.gdb` reads, after its `VV  ` block, int32 `0`, int32 `-82`,
+  int32 `6`, then six 82-byte records `Profile_Distance\0550`,
+  `ohm\0551`, `Afghan_X\0552`, `Afghan_Y\0553`, `__X\0554`,
+  `__Y\0555`. The payload ends at exactly 124 + 6 x 82 = 616. The same
+  test on every VV in the corpus:
+  - element type `-256` on 1,870 `__<n>` and 48 `__dbreg` registries;
+  - `-82` on 33 and `-130` on 15 `Display List`s;
+  - every `Display List` ends exactly after its elements;
+  - every registry continues with its nested-object count.
+
+  So a registry's "constant" `00 ff ff ff` at `+120` is the element type
+  `-256`, and its `+124` entry count is the VV length. In 37 of 48
+  `Display List`s every handle names a channel whose current name
+  matches. The rest are renamed channels: the list keeps `Afghan_X`
+  where the channel is now `AfghanTM_X`.
+- **EXT is an empty list.** Payload `+28..+107` on every instance:
+  - object frame (length 48), class name `EXT\0` at `+44`;
+  - member frame (length 16);
+  - a `00 1a cc ff` block with code `LMSL` and nothing else.
+
+  The registry-like VV that follows in some files lies beyond the
+  payload, so it is a leftover.
+- **Preamble generalized.** The name at `+44` is the object's class
+  name inside its object frame (`+28`), and `+96` is the member's
+  4-character code inside its member frame (`+60`). The old
+  "`4670802` = `REG\0`" identity is that class name.
+- **MAKER** (305 of 305 decode):
+  - `MAKE`, int32 1;
+  - an `L1`-prefixed tool string, a 2-byte zero field, and an
+    `L2`-prefixed label;
+  - `TOOL.KEY="value"` lines (UTF-8 with BOM, or plain ASCII in
+    2004-2006 files), ending in `0x1A`.
+
+  The tool name was first mis-parsed without the 2-byte field; aligning
+  to 4 bytes worked for one tool but not another, which exposed it.
+  28 tools occur: MathExpressionBuilder 82 (+3 with a full path),
+  `newxy.gx` 48, `newchan.gx` 32, `lookupdbch.gx` 23, `grboug.gx` 23,
+  `lookup1.gx` 14, `gridsamp.gx` 12, and others.
+  **Independent confirmation of channel `+94`/`+96`:** on all 32
+  `newchan.gx` records, `NEWCHAN.DISPWIDTH`/`DISPDIG`/`ARRAYSIZE`/`NAME`
+  equal the channel record's `+94`/`+96`/`+118`/name. Those were
+  [LIKELY] on one `.dfn`; now [CONFIRMED].
+- **`__dbmeta`** (`DB_EM_MountGordon_1003`, `DB_Mag_1141`,
+  `DB_Rad_1141`):
+  - class `META`, member `ATEM`;
+  - `ATEM` header ints `(2, N, N, 24, 27, 63, a, b, 0, zlib_len,
+    raw_len)`, where `N` is 363/329/361 and `raw_len` is
+    12,185/11,094/12,211;
+  - the zlib stream at `+144`.
+
+  The decompressed content differs per file. Its strings hold the
+  vendor type vocabulary and the database's own channel names,
+  `LABEL`/`UNITS` values and X/Y channel assignment. Node records begin
+  `02`/`03` + a kind letter; the meaning of their link fields is not
+  decoded.
 
 **IPJ member 0: a 64-byte name field and a type word -- [CONFIRMED]
 layout.**

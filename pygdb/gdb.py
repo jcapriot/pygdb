@@ -40,10 +40,14 @@ from .gdb_reader import (
     DIRECTORY_LIVE,
 )
 from .registry import (
+    ChannelMaker,
+    DisplayListEntry,
     ProjectionParameters,
+    find_channel_makers,
     find_channel_roles,
     find_channel_settings,
     find_coordinate_systems,
+    find_display_lists,
     find_projection_parameters,
 )
 
@@ -193,6 +197,8 @@ class GDB:
         self._coordinate_channels: Optional[Dict[str, Optional[str]]] = None
         self._channel_settings: Optional[Dict[str, Dict[str, str]]] = None
         self._projection_parameters: Optional[Dict[str, ProjectionParameters]] = None
+        self._channel_makers: Optional[Dict[str, ChannelMaker]] = None
+        self._display_lists: Optional[List[List[DisplayListEntry]]] = None
 
     def __repr__(self) -> str:
         return f"GDB({self.path!r})"
@@ -292,11 +298,37 @@ class GDB:
         populated registry key is present; most real files have none for
         most channels -- see `pygdb.registry.find_channel_settings` for
         what is and isn't decoded (the registry's key/value entries, not
-        its nested `MAKER` records).
+        its nested `MAKER` records, which are `channel_makers`).
         """
         if self._channel_settings is None:
             self._channel_settings = find_channel_settings(self.path, channels=self.channels)
         return self._channel_settings
+
+    @property
+    def channel_makers(self) -> Dict[str, ChannelMaker]:
+        """
+        dict of {str : ChannelMaker}: How each channel was made, from the
+        `MAKER` records in this file's registry (docs/spec.md section 9) --
+        the tool (`"newchan.gx"`, a math expression, `"newxy.gx"`, ...),
+        its label, and the parameters it ran with, e.g. a derived
+        channel's formula. Only channels with a record are present; see
+        `pygdb.registry.find_channel_makers`.
+        """
+        if self._channel_makers is None:
+            self._channel_makers = find_channel_makers(self.path, channels=self.channels)
+        return self._channel_makers
+
+    @property
+    def display_lists(self) -> List[List[DisplayListEntry]]:
+        """
+        list of list of DisplayListEntry: The file's `Display List` objects
+        (docs/spec.md section 9) -- **[LIKELY]** the channels shown in the
+        database's spreadsheet view -- each entry resolved by handle to the
+        channel's current name. See `pygdb.registry.find_display_lists`.
+        """
+        if self._display_lists is None:
+            self._display_lists = find_display_lists(self.path, channels=self.channels)
+        return self._display_lists
 
     @property
     def projection_parameters(self) -> Dict[str, ProjectionParameters]:

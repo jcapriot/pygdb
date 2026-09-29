@@ -14,7 +14,11 @@ import pytest
 
 from pygdb.gdb_reader import GDBParseWarning, read_blob_symbols, read_channels
 from pygdb.registry import (
+    ChannelMaker,
+    DisplayListEntry,
     ProjectionParameters,
+    find_channel_makers,
+    find_display_lists,
     find_channel_roles,
     find_channel_settings,
     find_coordinate_systems,
@@ -743,3 +747,141 @@ def test_find_projection_parameters_bad_magic_returns_empty(tmp_path):
     path.write_bytes(b"NOPE" + b"\x00" * 60)
     with pytest.warns(GDBParseWarning):
         assert find_projection_parameters(str(path)) == {}
+
+
+# -- find_channel_makers / find_display_lists (docs/spec.md section 9) --------
+
+
+def _maker_record(tool: str, label: str, text: bytes) -> bytes:
+    """A `MAKER` nested object laid out as real files store it: object and
+    member frames, the `MAKE` tag block, the length-prefixed tool (plus its
+    2-byte field) and label, then the parameter text ending in 0x1A."""
+    body = bytearray()
+    body += b"\x00\x1a\xcc\xffMAKE" + struct.pack("<i", 1)
+    tool_b = tool.encode("latin-1") + b"\x00"
+    body += struct.pack("<i", len(tool_b)) + tool_b + b"\x00\x00"
+    label_b = label.encode("latin-1") + b"\x00"
+    body += struct.pack("<i", len(label_b)) + label_b
+    body += text + b"\x1a"
+    member = b"\xff\x00\xe1\x1e" + struct.pack("<iii", len(body) + 4, 0, 1) + bytes(16) + bytes(body)
+    obj = (b"\xff\x00\xf0\x0f" + struct.pack("<iii", len(member) + 4, 0, 1)
+           + b"MAKER".ljust(16, b"\x00") + member)
+    return obj
+
+
+def _reg_maker_blob(blob_index: int, page_size: int, maker: bytes, keyvalues: dict = None) -> bytes:
+    """A REG object with `keyvalues` entries followed by one nested object
+    (`maker`), its payload length at +24 set to end exactly there."""
+    keyvalues = keyvalues or {}
+    n = len(keyvalues)
+    content = bytearray()
+    for key, value in keyvalues.items():
+        slot = (key.encode("ascii") + b"\x00" + value.encode("ascii") + b"\x00").ljust(256, b"\x00")
+        content += slot
+    content += struct.pack("<i", 1) + maker
+    end = 128 + len(content)
+    n_pages = max(1, math.ceil(end / page_size))
+    blob = bytearray(n_pages * page_size)
+    blob[0:4] = BLOB_MAGIC
+    struct.pack_into("<i", blob, 4, n_pages)
+    struct.pack_into("<i", blob, 8, n_pages)
+    struct.pack_into("<i", blob, 12, blob_index)
+    struct.pack_into("<i", blob, 24, end - 28)
+    blob[44:48] = b"REG\x00"
+    struct.pack_into("<i", blob, 124, n)
+    blob[128:end] = content
+    return bytes(blob)
+
+
+def _display_list_blob(blob_index: int, page_size: int, records, width: int = 82) -> bytes:
+    """A `Display List` object: a VV of `width`-byte `name\\0handle\\0`
+    records after the `00 1a cc ff VV  ` block."""
+    vv = b"\x00\x1a\xcc\xffVV  " + struct.pack("<iii", 0, -width, len(records))
+    for name, handle in records:
+        vv += (name.encode("latin-1") + b"\x00" + str(handle).encode("ascii") + b"\x00").ljust(width, b"\x00")
+    start = 100
+    end = start + len(vv)
+    n_pages = max(1, math.ceil(end / page_size))
+    blob = bytearray(n_pages * page_size)
+    blob[0:4] = BLOB_MAGIC
+    struct.pack_into("<i", blob, 4, n_pages)
+    struct.pack_into("<i", blob, 8, n_pages)
+    struct.pack_into("<i", blob, 12, blob_index)
+    struct.pack_into("<i", blob, 24, end - 28)
+    blob[start:end] = vv
+    return bytes(blob)
+
+
+_NEWCHAN_TEXT = (b"\xef\xbb\xbfNEWCHAN.DISPWIDTH=\"10\"\r\nNEWCHAN.NAME=\"raw_mag\"\r\n"
+                 b"NEWCHAN.FORMULA=\"a=\"\"b\"\"\"\r\n")
+
+
+def test_find_channel_makers_decodes_tool_label_and_parameters(tmp_path):
+    make = lambda blob_index, page_size: _reg_maker_blob(  # noqa: E731
+        blob_index, page_size, _maker_record("newchan.gx", "New channel", _NEWCHAN_TEXT),
+    )
+    path = _settings_file(tmp_path, [(0, _channel_handle(0), make)])
+    makers = find_channel_makers(path)
+    assert makers == {"raw_mag": ChannelMaker(
+        tool="newchan.gx", label="New channel",
+        parameters={"NEWCHAN.DISPWIDTH": "10", "NEWCHAN.NAME": "raw_mag", "NEWCHAN.FORMULA": 'a=""b""'},
+    )}
+
+
+def test_find_channel_makers_after_entries_and_without_a_bom(tmp_path):
+    """The record follows the object's key/value entries; the 2004-2006
+    files write the parameter text as plain ASCII without a BOM."""
+    make = lambda blob_index, page_size: _reg_maker_blob(  # noqa: E731
+        blob_index, page_size,
+        _maker_record("gx\\copy.gx", "Copy channel", b'COPY.FROM="lon"\r\nCOPY.TO="longitude"\r\n'),
+        keyvalues={"LABEL": "Longitude"},
+    )
+    path = _settings_file(tmp_path, [(0, _channel_handle(1), make)])
+    maker = find_channel_makers(path)["Easting"]
+    assert (maker.tool, maker.label) == ("gx\\copy.gx", "Copy channel")
+    assert maker.parameters == {"COPY.FROM": "lon", "COPY.TO": "longitude"}
+    assert find_channel_settings(path) == {"Easting": {"LABEL": "Longitude"}}
+
+
+def test_find_channel_makers_empty_parameter_set(tmp_path):
+    """Real (24 corpus records): a tool that recorded no parameters stores
+    only the BOM and 0x1A."""
+    make = lambda blob_index, page_size: _reg_maker_blob(  # noqa: E731
+        blob_index, page_size, _maker_record("grboug.gx", "Free-air and Bouguer anomaly", b"\xef\xbb\xbf"),
+    )
+    path = _settings_file(tmp_path, [(0, _channel_handle(0), make)])
+    assert find_channel_makers(path)["raw_mag"].parameters == {}
+
+
+def test_find_channel_makers_skips_objects_without_a_record(tmp_path):
+    path = _settings_file(tmp_path, [(0, _channel_handle(0), _kv({"UNITS": "nT"}))])
+    assert find_channel_makers(path) == {}
+
+
+def test_find_display_lists_resolves_handles_to_current_names(tmp_path):
+    """Real (docs/spec.md section 9): entries identify channels by handle;
+    the stored name is a cached label that a later rename leaves behind."""
+    raw_mag, easting = (int(_channel_handle(i)[2:]) for i in (0, 1))
+    make = lambda blob_index, page_size: _display_list_blob(  # noqa: E731
+        blob_index, page_size, [("raw_mag", raw_mag), ("East_old", easting), ("gone", 9999)],
+    )
+    path = _settings_file(tmp_path, [(1, "Display List", make)])
+    assert find_display_lists(path) == [[
+        DisplayListEntry(label="raw_mag", handle=raw_mag, channel="raw_mag"),
+        DisplayListEntry(label="East_old", handle=easting, channel="Easting"),
+        DisplayListEntry(label="gone", handle=9999, channel=None),
+    ]]
+
+
+def test_find_display_lists_reads_130_byte_records(tmp_path):
+    raw_mag = int(_channel_handle(0)[2:])
+    make = lambda blob_index, page_size: _display_list_blob(  # noqa: E731
+        blob_index, page_size, [("raw_mag", raw_mag)], width=130,
+    )
+    path = _settings_file(tmp_path, [(1, "Display List", make)])
+    assert find_display_lists(path) == [[DisplayListEntry("raw_mag", raw_mag, "raw_mag")]]
+
+
+def test_find_display_lists_none_present(tmp_path):
+    path = _settings_file(tmp_path, [(0, _channel_handle(0), _kv({"UNITS": "nT"}))])
+    assert find_display_lists(path) == []

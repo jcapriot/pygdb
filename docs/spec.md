@@ -177,10 +177,10 @@ the directory (§2.2) gives its location. The names are:
   |---|---|---|
   | `__<n>`, `__dbreg` | `REG\0` | registry (§9) |
   | `?\|IPJ_<X>:<Y>` | `IPJ\0` | projection (§8) |
-  | `Database Extension Objects` | `EXT\0` | not decoded |
-  | `__dbmeta` | `META` | the vendor type library (§9) |
+  | `Database Extension Objects` | `EXT\0` | **an empty list** -- one member (code `LMSL`) with no content, identical in every file (payload always 80 bytes, ending at `+108`). Bytes after `+108` are leftovers |
+  | `__dbmeta` | `META` | a typed metadata tree, zlib-compressed (§9) |
   | `Line Selection` | (payload bytes) | **one byte per line slot**: `lines_max` rounded up to a multiple of 8 bytes of `ff` from `+28` (that count is the blob's `+24`), in every file. There is no tag: the `ff ff ff ff` seen at `+44` is line-selection bytes 16-19, and when the payload is shorter than 16 bytes (`lines_max = 10`, payload 16), `+44` lies beyond it and holds leftovers. **[LIKELY]** a per-line selected flag, all lines selected |
-  | `Display List` | a varying int32 | the same VV framing as a registry, holding NUL-terminated channel names each followed by its channel handle as text (`lat\0` `2070`) -- **[LIKELY]** the channels shown in the spreadsheet view |
+  | `Display List` | (the object frame's length) | a bare VV of fixed-width strings (§9): records of 82 or 130 bytes, each a channel name, NUL, the channel's handle as decimal text (`lat\0` `2070`). **[CONFIRMED]** layout on every instance; the handle identifies the channel and the name is a cached label (renamed channels keep the old name). **[LIKELY]** the channels shown in the spreadsheet view |
   | `OE.DB_ACTIVITY_LOG` | text | plain-text creation record: source path, `Created:` timestamp, `Lines:`/`Channels:` equal to the file's own `lines_max`/`chans_max`, `Compression level:` (4 Melinda Downs files, 2008). The text starts before `+44`, so the blob header overwrites its first bytes |
   | `OE32.View` | text | plain-text `[OASIS VIEW]` configuration -- the old `LINE` "tag" false positive (§9) |
 - **Projections:** `?|IPJ_<X>:<Y>`, naming the coordinate-channel pair.
@@ -357,10 +357,10 @@ first channel.
 | `+84` | int16 | Data-type code: positive = `GS_*` type (§4); negative = **string byte-width** (literal, not ×4) | **[CONFIRMED]** |
 | `+86` | int16 | Matches the vendor's `DB_ARRAY_BASETYPE_*` enum *values*, but not reliably an array indicator on its own | **[LIKELY]** name match, **[UNKNOWN]** exact write-time semantics — see §5 |
 | `+92` | int16 | Display format code (§4) — matches `DB_CHAN_FORMAT_DATE`/`TIME` exactly on real date/time channels, `0` (NORMAL) elsewhere | **[CONFIRMED]** |
-| `+94` | int16 | **Display width** (vendor `get_chan_width`). Equals the ASEG-GDF2 `.dfn` field width on 34 of 35 scalar channels of `AG106386`; differs on its two array channels | **[LIKELY]** — one independent oracle |
-| `+96` | int32 | **Display decimals** (vendor `get_chan_decimal`). Equals the `.dfn` decimal count on 37 of 37 channels of `AG106386`, array channels included | **[LIKELY]** — one independent oracle |
+| `+94` | int16 | **Display width** (vendor `get_chan_width`). Equals `NEWCHAN.DISPWIDTH` in the channel's own `MAKER` record (§9) on 32 of 32 channels created by `newchan.gx`, and the ASEG-GDF2 `.dfn` field width on 34 of 35 scalar channels of `AG106386` | **[CONFIRMED]** |
+| `+96` | int32 | **Display decimals** (vendor `get_chan_decimal`). Equals `NEWCHAN.DISPDIG` in the channel's `MAKER` record on 32 of 32, and the `.dfn` decimal count on 37 of 37 channels of `AG106386` | **[CONFIRMED]** |
 | `+108` | float64 | Exactly `1.0` on every genuine channel (535 of 535) | **[UNKNOWN]** — plausible scale-factor field, never seen a non-1.0 value on a real channel |
-| `+116` | int16 | Exactly `5` on every genuine channel (535 of 535) | **[UNKNOWN]** |
+| `+116` | int16 | Exactly `5` on every genuine channel (535 of 535), regardless of the channel's own dtype at `+84` — confirmed independent, not a copy of the type code, by checking it against every non-`GS_DOUBLE` dtype in the corpus (`GS_USHORT` incl. 512-wide array channels, `GS_SHORT`, `GS_LONG`, `GS_FLOAT`, and 9 string widths — all still read `5`) | **[UNKNOWN]** |
 | `+118` | int16 | **Array width**: number of elements per fiducial. `1` = scalar (the overwhelming majority); `>1` = true VA/array channel | **[CONFIRMED]** — see §5 |
 
 Unused channel-table capacity (slots beyond the real channel count, up
@@ -1165,6 +1165,83 @@ documentation. A sibling entry `ASSOCIATED.<class>$$$` with an empty
 value accompanies it. It is an ordinary counted entry, and the registry
 grammar above holds for these objects (six USGS files). The one grammar
 exception (the supplied file) is additional data after such an entry.
+
+**The VV: a vector of fixed-width strings -- [CONFIRMED], 1,985 VVs in
+the corpus.** Every `00 1a cc ff` + `VV  ` block is followed by an int32 0,
+an int32 element type, an int32 count `n`, then the `n` elements. The
+element type is **negative**, and minus it is the element width in bytes:
+the same convention as a channel's string type (§3.1).
+
+| Object | Element type | Element |
+|---|---|---|
+| registries (`__<n>`, `__dbreg`) | `-256` (the "constant" `00 ff ff ff` at `+120`) | `KEY\0value\0` |
+| `Display List` | `-82` (33 objects) or `-130` (15, newer files) | `channel name\0handle\0` |
+| `Database Extension Objects` (leftover bytes only) | `-256` | -- |
+
+So a registry's `+124` entry count is simply the VV's length. A
+`Display List` ends exactly after its elements.
+
+**The administrative-object preamble, generalized -- [CONFIRMED].** A
+framed object starts with the object frame at `+28` (`ff 00 f0 0f`,
+length), an int32 1 at `+40`, and the object's **class name** at `+44`
+(`REG`, `IPJ`, `EXT`, `META`). Then comes the member frame at `+60`
+(`ff 00 e1 1e`, length), and at `+92` a `00 1a cc ff` block carrying the
+member's 4-character code (`REG `, ` JPI`, `LMSL`, `ATEM`). A
+`Display List` is a bare VV object instead: a `00 1a cc ff` block at
+`+28`, its object frame at `+40` and class name `VV` at `+56`.
+`Line Selection` has no framing at all (§2.1).
+
+**`MAKER` records: how a channel was made -- [CONFIRMED], 305 of 305.**
+A registry's nested object (the grammar above) is a `MAKER` record. In
+order, it holds:
+
+- the object frame and class name `MAKER`;
+- the member frame;
+- a `00 1a cc ff` block with the code `MAKE`, then int32 `1`;
+- int32 `L1` and the tool that made the channel (`L1` bytes, NUL
+  included), then a 2-byte field, always 0;
+- int32 `L2` and the tool's label;
+- the tool's parameters as text lines `TOOL.KEY="value"`, CRLF-separated
+  and ending in `0x1A`.
+
+The text is UTF-8 with a BOM on 291 records, and plain ASCII without one
+in the 2004-2006 files. 24 records have an empty parameter set (just the
+BOM and `0x1A`). Examples:
+
+- `newchan.gx` ("New channel"): `NEWCHAN.NAME`, `DTYPE`, `ARRAYSIZE`,
+  `DISPWIDTH`, `DISPDIG`.
+- `geogxnet.dll(Geosoft.GX.MathExpressionBuilder...)`: the formula
+  (`CHANNELINPUTBOX="ch_13=ch_5 - ch_12;"`).
+- `lookupdbch.gx`: source database and channels.
+- `newxy.gx`: old and new coordinate channels and projections.
+
+28 distinct tools occur. On all 32 `newchan.gx` records, `NAME`,
+`ARRAYSIZE`, `DISPWIDTH` and `DISPDIG` equal the channel's own name,
+`+118`, `+94` and `+96` (§3.1).
+
+**Implemented** as `pygdb.find_channel_makers` / `GDB.channel_makers`
+(records attributed by handle, like `find_channel_settings`) and
+`pygdb.find_display_lists` / `GDB.display_lists` (each entry's handle
+resolved to the channel's current name; the live copy of each object
+taken from the blob directory).
+
+**`__dbmeta`: a typed metadata tree -- [CONFIRMED] container, [UNKNOWN]
+node grammar.** Class `META`, member `ATEM`. The member header holds 11
+int32s: `2`, a count repeated twice (329-363), three constants
+(`24, 27, 63`), two more varying counts, `0`, the zlib stream's length,
+and the decompressed length. A zlib stream (`DB_COMP_SIZE` magic, §7.1)
+follows. The decompressed 11-12 KB are node records: a level byte
+(`02`/`03`), a kind letter (`F`, `L`, `G`, `D`), int32 links (`-1` for
+none) and a NUL-terminated name. They cover Geosoft's type vocabulary
+(`Base`, `Attributes`, `Types`, `IPJ Class`, `META Class`, ...) and a
+snapshot of the database's own metadata:
+
+- channel names;
+- `LABEL`/`UNITS` values;
+- `X_Channel Easting` / `Y_Channel Northing`;
+- `_PJ_*` keys.
+
+The content differs per file. Seen only in three 1991 GSQ files.
 
 **A rarer sibling object, tagged `"META\0"` instead of `"REG\0"`, wraps a
 real compressed stream — and it is Geosoft's own internal type library, not

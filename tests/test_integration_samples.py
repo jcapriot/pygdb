@@ -151,6 +151,44 @@ def test_channel_settings_labels_name_their_own_channel(all_gdb_sample_paths):
     assert own / (own + other) >= 0.9
 
 
+def test_channel_makers_and_display_lists_run_cleanly_on_every_real_file(all_gdb_sample_paths):
+    """Corpus sweep for `find_channel_makers` / `find_display_lists`
+    (docs/spec.md section 9): no exceptions, and every display-list entry
+    carries a handle."""
+    failures = []
+    for path in all_gdb_sample_paths:
+        try:
+            db = GDB(path)
+            db.channel_makers
+            for entries in db.display_lists:
+                assert all(isinstance(e.handle, int) for e in entries)
+        except Exception as e:  # noqa: BLE001 -- deliberately broad, this is a corpus sweep
+            failures.append(f"{_basename(path)}: {e!r}")
+    assert not failures, "\n".join(failures)
+
+
+def test_channel_makers_and_display_lists_known_real_values(samples_dir):
+    """
+    `AG106386`'s `Date` channel was made by the math expression builder
+    with a date formula; `Kalay_nk.gdb`'s display list still names two
+    channels by their pre-rename labels (`Afghan_X` for `AfghanTM_X`).
+    """
+    checked = 0
+    ag = os.path.join(samples_dir, "GSQ_Data", "AG106386_Northern Georgetown_Conductivity.gdb")
+    if os.path.exists(ag):
+        maker = GDB(ag).channel_makers["Date"]
+        assert "MathExpressionBuilder" in maker.tool
+        assert maker.parameters["MATHEXPRESSIONBUILDER.CHANNELINPUTBOX"].startswith("C0 = date_year(C1)")
+        checked += 1
+    kalay = os.path.join(samples_dir, "usgs_afghanistan_2011", "Kalay_nk.gdb")
+    if os.path.exists(kalay):
+        (entries,) = GDB(kalay).display_lists
+        assert [(e.label, e.channel) for e in entries][2:4] == [("Afghan_X", "AfghanTM_X"), ("Afghan_Y", "AfghanTM_Y")]
+        checked += 1
+    if not checked:
+        pytest.skip("neither known-value file present locally")
+
+
 def test_projection_parameters_runs_cleanly_on_every_real_file(all_gdb_sample_paths):
     """
     `find_projection_parameters` (docs/spec.md section 8, docs/provenance/
