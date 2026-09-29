@@ -7,11 +7,18 @@ from __future__ import annotations
 
 import math
 import struct
+import warnings
 
 import pytest
 
 from pygdb.gdb_reader import GDBParseWarning, read_channels
-from pygdb.registry import find_channel_roles, find_channel_settings, find_coordinate_systems
+from pygdb.registry import (
+    ProjectionParameters,
+    find_channel_roles,
+    find_channel_settings,
+    find_coordinate_systems,
+    find_projection_parameters,
+)
 
 from helpers import BLOB_MAGIC, ChannelSpec, LineSpec, build_gdb_bytes, pack_plain_blob
 
@@ -380,3 +387,175 @@ def test_find_channel_settings_bad_magic_returns_empty(tmp_path):
     path.write_bytes(b"NOPE" + b"\x00" * 60)
     with pytest.warns(GDBParseWarning):
         assert find_channel_settings(str(path)) == {}
+
+
+# -- find_projection_parameters (docs/spec.md section 8, docs/provenance/notes.md section 6.7b) --
+
+_IPJ_DUMMY = -1.0e32
+
+
+def _inject_ipj_blob_full(
+    data: bytes,
+    blob_index: int,
+    page_size: int,
+    name: str,
+    datum_name: str,
+    ellipsoid_name: str,
+    semi_major_axis: float,
+    eccentricity: float,
+    datum_transform_name: str = None,
+    central_meridian: float = None,
+    scale_factor: float = None,
+    false_easting: float = None,
+    false_northing: float = None,
+    gate_tag: bytes = b" JPI",
+) -> bytes:
+    """
+    An IPJ registry object shaped like a real one (docs/spec.md section 8):
+    the plain 48-byte blob header with `b"IPJ\\x00"` at its own type-code
+    field (+44), the `" JPI"` name marker at +96 (`" JPI"` + int32(1) +
+    name + NUL -- the same position real files were found to use it at),
+    then the fixed-offset geodetic fields at +180/+244/+308/+316/+332/
+    +596/+620/+628/+636. A projection field left `None` is written as the
+    real vendor `rDUMMY` sentinel, exactly as a real ellipsoid/datum-only
+    object does -- not omitted.
+    """
+    n_pages = max(1, math.ceil(644 / page_size))
+    blob = bytearray(n_pages * page_size)
+    blob[0:4] = BLOB_MAGIC
+    struct.pack_into("<i", blob, 4, n_pages)
+    struct.pack_into("<i", blob, 8, n_pages)
+    struct.pack_into("<i", blob, 12, blob_index)
+    blob[44:48] = b"IPJ\x00"
+    marker = gate_tag + (1).to_bytes(4, "little") + name.encode("ascii") + b"\x00"
+    blob[96:96 + len(marker)] = marker
+
+    def write_cstr(offset, s):
+        enc = s.encode("ascii") + b"\x00"
+        blob[offset:offset + len(enc)] = enc
+
+    write_cstr(180, datum_name)
+    write_cstr(244, ellipsoid_name)
+    if datum_transform_name is not None:
+        write_cstr(332, datum_transform_name)
+    struct.pack_into("<d", blob, 308, semi_major_axis)
+    struct.pack_into("<d", blob, 316, eccentricity)
+    struct.pack_into("<d", blob, 596, central_meridian if central_meridian is not None else _IPJ_DUMMY)
+    struct.pack_into("<d", blob, 604, _IPJ_DUMMY)
+    struct.pack_into("<d", blob, 612, _IPJ_DUMMY)
+    struct.pack_into("<d", blob, 620, scale_factor if scale_factor is not None else _IPJ_DUMMY)
+    struct.pack_into("<d", blob, 628, false_easting if false_easting is not None else _IPJ_DUMMY)
+    struct.pack_into("<d", blob, 636, false_northing if false_northing is not None else _IPJ_DUMMY)
+    return bytes(data) + bytes(blob)
+
+
+_UTM54S = dict(
+    name="WGS 84 / UTM zone 54S", datum_name="WGS 84", ellipsoid_name="WGS 84",
+    semi_major_axis=6378137.0, eccentricity=0.0818191908426215,
+    central_meridian=141.0, scale_factor=0.9996, false_easting=500000.0, false_northing=10000000.0,
+)
+
+
+def test_find_projection_parameters_extracts_a_full_projection(tmp_path):
+    page_size = 1024
+    data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
+    data = _inject_ipj_blob_full(data, 50, page_size, **_UTM54S)
+    path = tmp_path / "ipj.gdb"
+    path.write_bytes(data)
+
+    result = find_projection_parameters(str(path))
+    assert result == {
+        "WGS 84 / UTM zone 54S": ProjectionParameters(
+            name="WGS 84 / UTM zone 54S", datum_name="WGS 84", ellipsoid_name="WGS 84",
+            datum_transform_name=None, semi_major_axis=6378137.0, eccentricity=0.0818191908426215,
+            central_meridian=141.0, scale_factor=0.9996, false_easting=500000.0, false_northing=10000000.0,
+        )
+    }
+
+
+def test_find_projection_parameters_ellipsoid_only_object_gives_none_projection_fields(tmp_path):
+    page_size = 1024
+    data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
+    data = _inject_ipj_blob_full(
+        data, 50, page_size, name="GDA2020", datum_name="GDA2020",
+        ellipsoid_name="GRS 1980", semi_major_axis=6378137.0, eccentricity=0.0818191910428158,
+        # central_meridian/scale/easting/northing left None -> written as the real dummy sentinel
+    )
+    path = tmp_path / "ipj.gdb"
+    path.write_bytes(data)
+
+    result = find_projection_parameters(str(path))
+    params = result["GDA2020"]
+    assert params.central_meridian is None
+    assert params.scale_factor is None
+    assert params.false_easting is None
+    assert params.false_northing is None
+
+
+def test_find_projection_parameters_transform_name_none_without_a_real_transform(tmp_path):
+    """A datum already stated in WGS 84 has nothing to transform (section
+    6.7b's correction) -- whatever short string sits at +332 there (here,
+    the datum's own name) must not be mistaken for a real transform name."""
+    page_size = 1024
+    data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
+    data = _inject_ipj_blob_full(data, 50, page_size, datum_transform_name="WGS 84", **_UTM54S)
+    path = tmp_path / "ipj.gdb"
+    path.write_bytes(data)
+
+    assert find_projection_parameters(str(path))["WGS 84 / UTM zone 54S"].datum_transform_name is None
+
+
+def test_find_projection_parameters_extracts_a_real_transform_name(tmp_path):
+    page_size = 1024
+    data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
+    fields = dict(_UTM54S, name="NAD83 / UTM zone 17N", datum_name="NAD83")
+    data = _inject_ipj_blob_full(data, 50, page_size, datum_transform_name="NAD83 to WGS 84 (1)", **fields)
+    path = tmp_path / "ipj.gdb"
+    path.write_bytes(data)
+
+    assert find_projection_parameters(str(path))["NAD83 / UTM zone 17N"].datum_transform_name == "NAD83 to WGS 84 (1)"
+
+
+def test_find_projection_parameters_last_wins_and_warns_when_they_disagree(tmp_path):
+    page_size = 1024
+    data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
+    data = _inject_ipj_blob_full(data, 50, page_size, **_UTM54S)
+    other = dict(_UTM54S, central_meridian=147.0)  # a genuinely different, stale copy
+    data = _inject_ipj_blob_full(data, 51, page_size, **other)
+    path = tmp_path / "ipj.gdb"
+    path.write_bytes(data)
+
+    with pytest.warns(GDBParseWarning, match=r"WGS 84 / UTM zone 54S"):
+        result = find_projection_parameters(str(path))
+    assert result["WGS 84 / UTM zone 54S"].central_meridian == 147.0  # last in chain order
+
+
+def test_find_projection_parameters_silent_when_duplicates_agree(tmp_path):
+    page_size = 1024
+    data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
+    data = _inject_ipj_blob_full(data, 50, page_size, **_UTM54S)
+    data = _inject_ipj_blob_full(data, 51, page_size, **_UTM54S)
+    path = tmp_path / "ipj.gdb"
+    path.write_bytes(data)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result = find_projection_parameters(str(path))
+    assert result["WGS 84 / UTM zone 54S"].central_meridian == 141.0
+
+
+def test_find_projection_parameters_skips_a_blob_missing_the_gate_tag(tmp_path):
+    page_size = 1024
+    data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
+    data = _inject_ipj_blob_full(data, 50, page_size, gate_tag=b"XXXX", **_UTM54S)
+    path = tmp_path / "ipj.gdb"
+    path.write_bytes(data)
+
+    assert find_projection_parameters(str(path)) == {}
+
+
+def test_find_projection_parameters_bad_magic_returns_empty(tmp_path):
+    path = tmp_path / "not_a_gdb.gdb"
+    path.write_bytes(b"NOPE" + b"\x00" * 60)
+    with pytest.warns(GDBParseWarning):
+        assert find_projection_parameters(str(path)) == {}

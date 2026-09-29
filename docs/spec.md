@@ -828,6 +828,15 @@ string `"IPJ"` read across an alignment boundary) followed by an
 string. **[CONFIRMED]** directly on the working projected-CRS name in
 every file checked.
 
+**Implemented as `pygdb.registry.find_projection_parameters` /
+`GDB.projection_parameters`**, returning a `ProjectionParameters` per
+working coordinate-system name (the offset table above, mapping the
+`rDUMMY` sentinel to `None` on the four projection fields rather than
+returning it as a raw float). Covers the fixed-offset record only — the
+`+112` grid-system tag and the always-`rDUMMY` `+604`/`+612` fields are
+not decoded, same exclusion policy §9's `find_channel_settings` uses for
+the `REG` forms it doesn't decode.
+
 **What's still open, deliberately not force-completed:**
 - What `+604`/`+612` are for — real fields, never once seen populated in
   63 of 63 real corpus-wide instances (every real projection here is a

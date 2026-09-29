@@ -35,7 +35,13 @@ from .gdb_reader import (
 )
 from .grd_reader import GrdHeader, GRDParseWarning, read_grd
 from .lzrw1 import LZRW1DecodeError
-from .registry import find_channel_roles, find_channel_settings, find_coordinate_systems
+from .registry import (
+    ProjectionParameters,
+    find_channel_roles,
+    find_channel_settings,
+    find_coordinate_systems,
+    find_projection_parameters,
+)
 
 __all__ = [
     "GDB",
@@ -48,6 +54,7 @@ __all__ = [
     "GrdHeader",
     "LZRW1DecodeError",
     "LineRecord",
+    "ProjectionParameters",
     "check_magic",
     "exact_line_table_start",
     "find_blob",
@@ -56,6 +63,7 @@ __all__ = [
     "find_channel_table",
     "find_coordinate_systems",
     "find_line_table",
+    "find_projection_parameters",
     "header_fields",
     "iter_blobs",
     "read_blob_directory",

@@ -60,6 +60,10 @@ them.
 
 ::: pygdb.find_channel_settings
 
+::: pygdb.find_projection_parameters
+
+::: pygdb.ProjectionParameters
+
 ## Warnings and errors
 
 ::: pygdb.GDBParseWarning

@@ -21,6 +21,13 @@ from there.
   real, are not decoded yet).
 - `pygdb.find_channel_roles` is now re-exported at the top level (it was
   previously only reachable via `pygdb.registry.find_channel_roles`).
+- `pygdb.registry.find_projection_parameters` / `GDB.projection_parameters`:
+  real geodetic parameters (datum, ellipsoid, datum-transformation name,
+  central meridian, scale factor, false easting/northing) decoded from a
+  file's own IPJ registry, keyed by the same coordinate-system name
+  `coordinate_systems` already returns. Where a coordinate system defines
+  no projection (a datum/ellipsoid-only entry), the projection fields are
+  `None` rather than the on-disk dummy sentinel.
 
 ## [0.3.0] - 2026-09-26
 

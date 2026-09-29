@@ -26,7 +26,9 @@ tied to one corpus's line-numbering conventions.
 from __future__ import annotations
 
 import re
+import struct
 import warnings
+from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional
 
 from .gdb_reader import (
@@ -485,3 +487,220 @@ def find_channel_settings(
         if resolved:
             settings[name] = resolved
     return settings
+
+
+# The IPJ object's own binary framing (docs/spec.md section 8,
+# docs/provenance/notes.md section 6.7b): the same 128-byte preamble as a
+# REG object (section 6.8c), but where REG's content is mostly the flat
+# key/value form, an IPJ object's content is a fixed-offset binary record.
+# Every offset below is relative to the blob's own start (its `CC CC 00 FF`
+# magic) and was confirmed identically on 63 of 63 real IPJ objects across
+# all three agencies this project has files from.
+_IPJ_GATE_TAG = b" JPI"
+_IPJ_MIN_LENGTH = 644  # the highest fixed offset used (+636) plus 8 bytes
+_IPJ_DATUM_NAME_OFFSET = 180
+_IPJ_ELLIPSOID_NAME_OFFSET = 244
+_IPJ_SEMI_MAJOR_AXIS_OFFSET = 308
+_IPJ_ECCENTRICITY_OFFSET = 316
+_IPJ_DATUM_TRANSFORM_NAME_OFFSET = 332
+_IPJ_CENTRAL_MERIDIAN_OFFSET = 596
+_IPJ_SCALE_FACTOR_OFFSET = 620
+_IPJ_FALSE_EASTING_OFFSET = 628
+_IPJ_FALSE_NORTHING_OFFSET = 636
+# The vendor's own float64 "not set" sentinel (docs/spec.md section 4),
+# read here at the four projection-parameter offsets on every real
+# ellipsoid/datum-only IPJ object (one that defines no projection) -- a
+# real, confirmed marker, not undecoded garbage.
+_IPJ_DUMMY_FLOAT = -1.0e32
+
+
+def _read_ascii_cstr(buf: bytes, offset: int, max_len: int = 64) -> Optional[str]:
+    """NUL-terminated ASCII string at `buf[offset:offset+max_len]`, or
+    `None` if `buf` is too short or no terminating NUL is found in range
+    (a truncated read, not a real empty string)."""
+    window = buf[offset:offset + max_len]
+    end = window.find(b"\x00")
+    if end == -1:
+        return None
+    return window[:end].decode("ascii", errors="replace")
+
+
+@dataclass(eq=True)
+class ProjectionParameters:
+    """
+    Real geodetic parameters decoded from one `IPJ` registry object.
+
+    Attributes
+    ----------
+    name : str
+        The working coordinate-system name (the same string
+        `find_coordinate_systems` returns for this object).
+    datum_name : str
+        E.g. `"NAD83"`, `"GDA2020"`, `"WGS 84"`.
+    ellipsoid_name : str
+        E.g. `"GRS 1980"`, `"WGS 84"`.
+    datum_transform_name : str or None
+        E.g. `"NAD83 to WGS 84 (1)"`. `None` when this object's datum is
+        already WGS 84 -- nothing to transform, not a decode failure.
+    semi_major_axis : float
+        The ellipsoid's semi-major axis, in metres.
+    eccentricity : float
+        The ellipsoid's eccentricity.
+    central_meridian, scale_factor, false_easting, false_northing : float or None
+        The projection's own parameters. `None` on an object that defines
+        only a datum/ellipsoid, no projection (see Notes).
+
+    Notes
+    -----
+    **[CONFIRMED]** structure and every field except the `None`-mapping
+    convention itself, which is this reader's own choice: the real,
+    on-disk value for an undefined projection field is the vendor's own
+    float64 `rDUMMY` sentinel (`-1.0e32`, docs/spec.md section 4), mapped
+    to `None` here rather than returned as a raw dummy a caller could
+    mistake for a real coordinate. See docs/spec.md section 8 and
+    docs/provenance/notes.md section 6.7b for the full derivation and
+    per-field evidence. Two real fields at fixed offsets in every object
+    (`+604`, `+612`) are not exposed here at all -- never once seen
+    populated in this project's real corpus, so there is nothing
+    confirmed to name them.
+    """
+
+    name: str
+    datum_name: str
+    ellipsoid_name: str
+    datum_transform_name: Optional[str]
+    semi_major_axis: float
+    eccentricity: float
+    central_meridian: Optional[float]
+    scale_factor: Optional[float]
+    false_easting: Optional[float]
+    false_northing: Optional[float]
+
+
+def find_projection_parameters(
+    path: str, max_real_line_slot: Optional[int] = None,
+) -> Dict[str, ProjectionParameters]:
+    """
+    Scan `path` for real geodetic parameters recorded in its IPJ registry.
+
+    Reads the same `IPJ`-tagged administrative-blob content
+    `find_coordinate_systems` already scans for a name, but decodes the
+    object's fixed-offset binary record directly (docs/provenance/
+    notes.md section 6.7b) instead of stopping at the name -- real datum,
+    ellipsoid, and projection parameters, cross-validated against
+    independent ground truth on real files (docs/spec.md section 8).
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file to scan.
+    max_real_line_slot : int, optional
+        See `find_coordinate_systems` -- same meaning and same
+        "pass it if you already have it" reasoning.
+
+    Returns
+    -------
+    dict of {str : ProjectionParameters}
+        Keyed by the same working coordinate-system name
+        `find_coordinate_systems` returns; a real file with no `IPJ`
+        content at all (docs/spec.md section 9) gives `{}`, which is
+        expected and normal, not a sign of a problem.
+
+    Warns
+    -----
+    GDBParseWarning
+        If `path` doesn't start with the expected magic, or its header
+        is too short to read `chans_max` -- fails gracefully like the
+        sibling functions, returning `{}` rather than raising. Also
+        raised, once per name, if two of a coordinate system's `IPJ`
+        entries decode to genuinely *different* parameter sets -- the
+        last one in blob-chain order is kept, but this is never decided
+        silently (the same convention `find_channel_settings` uses).
+
+    Notes
+    -----
+    A candidate blob is only decoded if it has the confirmed `IPJ`
+    object shape: the type-code field reading `b"IPJ\\x00"`, at least
+    644 bytes (enough for every fixed offset used), and the `" JPI"`
+    marker's own tag also present at its fixed `+96` position -- a
+    structural gate before trusting the fixed-offset fields, matching
+    the validation `find_channel_settings` applies to `REG` objects.
+    Anything else is silently skipped, not warned about.
+    """
+    with open(path, "rb") as f:
+        header = f.read(128)
+    if not check_magic(header):
+        _warn(f"{path}: does not start with the expected '!CBD' magic -- "
+              f"no projection parameters")
+        return {}
+    fields = header_fields(header)
+    chans_max = fields["chans_max"]
+    page_size = fields["page_size"]
+    if chans_max is None or not page_size:
+        _warn(f"{path}: header too short to read chans_max/page_size -- "
+              f"no projection parameters")
+        return {}
+
+    if max_real_line_slot is None:
+        lines = read_lines(path)
+        max_real_line_slot = max((line.index for line in lines), default=-1)
+
+    candidates: Dict[str, List[ProjectionParameters]] = {}
+    with open(path, "rb") as f:
+        for blob in iter_blobs(path):
+            line_slot, _channel_slot = blob.line_channel(chans_max)
+            if line_slot <= max_real_line_slot:
+                continue  # a real survey line's data, not administrative metadata
+            f.seek(blob.offset)
+            blob_size = min(blob.n_pages * page_size, 50_000_000)
+            chunk = f.read(blob_size)
+            if (
+                len(chunk) < _IPJ_MIN_LENGTH
+                or chunk[96:100] != _IPJ_GATE_TAG
+            ):
+                continue
+            m = _IPJ_NAME_RE.search(chunk)
+            if not m:
+                continue
+            name = m.group(1).decode("ascii", errors="replace")
+            datum_name = _read_ascii_cstr(chunk, _IPJ_DATUM_NAME_OFFSET)
+            ellipsoid_name = _read_ascii_cstr(chunk, _IPJ_ELLIPSOID_NAME_OFFSET)
+            if datum_name is None or ellipsoid_name is None:
+                continue  # truncated read -- a name ran past what was read
+            transform_name = _read_ascii_cstr(chunk, _IPJ_DATUM_TRANSFORM_NAME_OFFSET)
+            if transform_name is not None and " to " not in transform_name:
+                transform_name = None  # the datum's own name repeated, not a real transform
+
+            def _param(offset: int) -> Optional[float]:
+                value = struct.unpack_from("<d", chunk, offset)[0]
+                return None if value == _IPJ_DUMMY_FLOAT else value
+
+            params = ProjectionParameters(
+                name=name,
+                datum_name=datum_name,
+                ellipsoid_name=ellipsoid_name,
+                datum_transform_name=transform_name,
+                semi_major_axis=struct.unpack_from("<d", chunk, _IPJ_SEMI_MAJOR_AXIS_OFFSET)[0],
+                eccentricity=struct.unpack_from("<d", chunk, _IPJ_ECCENTRICITY_OFFSET)[0],
+                central_meridian=_param(_IPJ_CENTRAL_MERIDIAN_OFFSET),
+                scale_factor=_param(_IPJ_SCALE_FACTOR_OFFSET),
+                false_easting=_param(_IPJ_FALSE_EASTING_OFFSET),
+                false_northing=_param(_IPJ_FALSE_NORTHING_OFFSET),
+            )
+            candidates.setdefault(name, []).append(params)
+
+    result: Dict[str, ProjectionParameters] = {}
+    for name, params_list in candidates.items():
+        distinct = []
+        for p in params_list:
+            if p not in distinct:
+                distinct.append(p)
+        if len(distinct) > 1:
+            _warn(
+                f"{path}: coordinate system {name!r} has {len(distinct)} "
+                f"different sets of projection parameters across "
+                f"stale/duplicate IPJ entries -- using the last one in "
+                f"blob-chain order"
+            )
+        result[name] = params_list[-1]
+    return result

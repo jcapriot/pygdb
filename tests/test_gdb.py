@@ -132,6 +132,49 @@ def test_gdb_channel_settings_reflects_real_registry_content_and_is_cached(tmp_p
     assert db.channel_settings is first  # cached, not recomputed
 
 
+def test_gdb_projection_parameters_empty_when_no_registry_present(db):
+    assert db.projection_parameters == {}
+
+
+def _inject_ipj_blob(data: bytes, blob_index: int, page_size: int) -> bytes:
+    """A minimal, real-shaped IPJ registry object (docs/spec.md section 8)
+    for GDB-level tests -- see tests/test_registry.py's own fuller helper
+    for the byte layout and every field's meaning."""
+    n_pages = max(1, -(-644 // page_size))
+    blob = bytearray(n_pages * page_size)
+    blob[0:4] = BLOB_MAGIC
+    struct.pack_into("<i", blob, 4, n_pages)
+    struct.pack_into("<i", blob, 8, n_pages)
+    struct.pack_into("<i", blob, 12, blob_index)
+    blob[44:48] = b"IPJ\x00"
+    marker = b" JPI" + (1).to_bytes(4, "little") + b"WGS 84 / UTM zone 54S\x00"
+    blob[96:96 + len(marker)] = marker
+    blob[180:187] = b"WGS 84\x00"
+    blob[244:251] = b"WGS 84\x00"
+    struct.pack_into("<d", blob, 308, 6378137.0)
+    struct.pack_into("<d", blob, 316, 0.0818191908426215)
+    struct.pack_into("<d", blob, 596, 141.0)
+    struct.pack_into("<d", blob, 604, -1.0e32)
+    struct.pack_into("<d", blob, 612, -1.0e32)
+    struct.pack_into("<d", blob, 620, 0.9996)
+    struct.pack_into("<d", blob, 628, 500000.0)
+    struct.pack_into("<d", blob, 636, 10000000.0)
+    return bytes(data) + bytes(blob)
+
+
+def test_gdb_projection_parameters_reflects_real_registry_content_and_is_cached(tmp_path):
+    page_size = 1024
+    data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
+    data = _inject_ipj_blob(data, 50 * len(CHANNELS), page_size)
+    path = tmp_path / "ipj.gdb"
+    path.write_bytes(data)
+    db = GDB(str(path))
+
+    first = db.projection_parameters
+    assert first["WGS 84 / UTM zone 54S"].central_meridian == 141.0
+    assert db.projection_parameters is first  # cached, not recomputed
+
+
 def test_gdb_channels_on_line_reflects_sparse_grid(db):
     assert set(db.channels_on_line("L100")) == {"Fiducial", "Easting", "Depths"}
     assert set(db.channels_on_line("L200")) == {"Fiducial", "Easting"}

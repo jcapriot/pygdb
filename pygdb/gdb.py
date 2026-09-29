@@ -38,7 +38,13 @@ from .gdb_reader import (
     DIRECTORY_INVALID,
     DIRECTORY_LIVE,
 )
-from .registry import find_channel_roles, find_channel_settings, find_coordinate_systems
+from .registry import (
+    ProjectionParameters,
+    find_channel_roles,
+    find_channel_settings,
+    find_coordinate_systems,
+    find_projection_parameters,
+)
 
 # docs/spec.md section 7
 _DB_COMP_NAMES = {
@@ -185,6 +191,7 @@ class GDB:
         self._coordinate_systems: Optional[List[str]] = None
         self._coordinate_channels: Optional[Dict[str, Optional[str]]] = None
         self._channel_settings: Optional[Dict[str, Dict[str, str]]] = None
+        self._projection_parameters: Optional[Dict[str, ProjectionParameters]] = None
 
     def __repr__(self) -> str:
         return f"GDB({self.path!r})"
@@ -293,6 +300,26 @@ class GDB:
                 channels=self.channels,
             )
         return self._channel_settings
+
+    @property
+    def projection_parameters(self) -> Dict[str, ProjectionParameters]:
+        """
+        dict of {str : ProjectionParameters}: Real geodetic parameters for
+        each coordinate system named in `coordinate_systems`, decoded from
+        this file's own internal IPJ registry (docs/spec.md section 8,
+        docs/provenance/notes.md section 6.7b) -- datum, ellipsoid, and
+        (when this coordinate system is a projected one) central
+        meridian, scale factor, and false easting/northing. An empty
+        dict just means no `IPJ` content was found, same as
+        `coordinate_systems`; see `pygdb.registry.find_projection_parameters`
+        for exactly what is and isn't decoded.
+        """
+        if self._projection_parameters is None:
+            max_real_line_slot = max((line.index for line in self.lines), default=-1)
+            self._projection_parameters = find_projection_parameters(
+                self.path, max_real_line_slot=max_real_line_slot,
+            )
+        return self._projection_parameters
 
     # -- channels / lines ----------------------------------------------------
 

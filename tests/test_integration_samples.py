@@ -87,6 +87,43 @@ def test_channel_settings_matches_known_real_values(samples_dir):
     assert settings["base"]["LABEL"] == r"Source: .\delete.gdb"
 
 
+def test_projection_parameters_runs_cleanly_on_every_real_file(all_gdb_sample_paths):
+    """
+    `find_projection_parameters` (docs/spec.md section 8, docs/provenance/
+    notes.md section 6.7b) is the newest, least-tested-in-the-wild
+    registry function -- sweep the whole corpus to catch anything the
+    synthetic fixtures in tests/test_registry.py can't.
+    """
+    failures = []
+    for path in all_gdb_sample_paths:
+        try:
+            GDB(path).projection_parameters
+        except Exception as e:  # noqa: BLE001 -- deliberately broad, this is a corpus sweep
+            failures.append(f"{_basename(path)}: {e!r}")
+    assert not failures, "\n".join(failures)
+
+
+def test_projection_parameters_matches_known_real_values(samples_dir):
+    """
+    Cross-checked against this session's own by-hand decode
+    (docs/spec.md section 8, docs/provenance/notes.md section 6.7b):
+    `AG106386`'s working CRS parameters match the paired ASEG-GDF2
+    `.prj` sidecar exactly, digit for digit, independently of
+    `find_projection_parameters`.
+    """
+    path = os.path.join(samples_dir, "GSQ_Data", "AG106386_Northern Georgetown_Conductivity.gdb")
+    if not os.path.exists(path):
+        pytest.skip("AG106386_Northern Georgetown_Conductivity.gdb not present locally")
+    params = GDB(path).projection_parameters["WGS 84 / UTM zone 54S"]
+    assert params.datum_name == "WGS 84"
+    assert params.semi_major_axis == 6378137.0
+    assert params.eccentricity == pytest.approx(0.0818191908426215)
+    assert params.central_meridian == 141.0
+    assert params.scale_factor == 0.9996
+    assert params.false_easting == 500000.0
+    assert params.false_northing == 10000000.0
+
+
 def test_every_real_file_has_reg_or_ipj_content(all_gdb_sample_paths):
     """
     Regression test for the correction in docs/spec.md section 9: an
