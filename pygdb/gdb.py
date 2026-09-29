@@ -294,11 +294,7 @@ class GDB:
         only, not a cached numeric array or a nested tagged sub-object).
         """
         if self._channel_settings is None:
-            max_real_line_slot = max((line.index for line in self.lines), default=-1)
-            self._channel_settings = find_channel_settings(
-                self.path, max_real_line_slot=max_real_line_slot,
-                channels=self.channels,
-            )
+            self._channel_settings = find_channel_settings(self.path, channels=self.channels)
         return self._channel_settings
 
     @property

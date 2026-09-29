@@ -11,8 +11,10 @@ regression coverage; everyone else just doesn't run these tests.
 
 from __future__ import annotations
 
+import glob
 import os
 import struct
+import warnings
 import zlib
 
 import numpy as np
@@ -73,18 +75,57 @@ def test_channel_settings_runs_cleanly_on_every_real_file(all_gdb_sample_paths):
 
 def test_channel_settings_matches_known_real_values(samples_dir):
     """
-    Cross-checked against this session's own by-hand decode
-    (docs/provenance/notes.md section 6.8/6.8c): `ch_11`'s real
-    `FORMULA` and `base`'s real provenance `LABEL` are both already on
-    record there, found independently before `find_channel_settings`
-    existed.
+    Values whose owning channel is evident from the value itself
+    (docs/provenance/notes.md section 6.2d). An earlier version of this
+    test asserted `ch_11`/`base` values on `Magnetic_Data.gdb` that came
+    from the old `blob_index % chans_max` attribution, which named the
+    wrong channel: `ch_11`'s formula object carries a line handle, and
+    the label pinned on `base` belongs to `time`.
     """
-    path = os.path.join(samples_dir, "usgs_mojave_2020", "Magnetic_Data.gdb")
-    if not os.path.exists(path):
-        pytest.skip("Magnetic_Data.gdb not present locally")
-    settings = GDB(path).channel_settings
-    assert settings["ch_11"]["FORMULA"] == "time(hh,mm,ss)"
-    assert settings["base"]["LABEL"] == r"Source: .\delete.gdb"
+    cases = {
+        "DB_Mag_1141.gdb": {("Line", "LABEL"): "Line number", ("Date", "UNITS"): "YYYYMMDD",
+                            ("Longitude", "LABEL"): "WGS84 Longitude"},
+        "DB_EM_MountGordon_1003.gdb": {("FLIGHT", "LABEL"): "FLIGHT"},
+    }
+    found = {os.path.basename(p): p for p in glob.glob(os.path.join(samples_dir, "**", "*.gdb"), recursive=True)}
+    checked = 0
+    for name, expected in cases.items():
+        if name not in found:
+            continue
+        settings = GDB(found[name]).channel_settings
+        for (channel, key), value in expected.items():
+            assert settings[channel][key] == value
+        checked += 1
+    if not checked:
+        pytest.skip("none of the known-value files present locally")
+
+
+def test_channel_settings_labels_name_their_own_channel(all_gdb_sample_paths):
+    """
+    Corpus-wide regression for docs/provenance/notes.md section 6.2d:
+    where a channel's `LABEL` is itself the name of a real channel, it
+    should almost always be that channel's own name. The exceptions are
+    derived channels whose label was copied from their source (e.g.
+    `MGA_East` labelled `EASTING`). Under the old modulo attribution
+    this held for 0 objects.
+    """
+    own = other = 0
+    for path in all_gdb_sample_paths:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            db = GDB(path)
+            settings = db.channel_settings
+        names = set(db.channel_names)
+        for channel, keys in settings.items():
+            label = keys.get("LABEL")
+            if label in names:
+                if label == channel:
+                    own += 1
+                else:
+                    other += 1
+    if own + other == 0:
+        pytest.skip("no checkable labels in the local corpus")
+    assert own / (own + other) >= 0.9
 
 
 def test_projection_parameters_runs_cleanly_on_every_real_file(all_gdb_sample_paths):

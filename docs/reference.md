@@ -44,6 +44,8 @@ them.
 
 ::: pygdb.read_blob_directory
 
+::: pygdb.read_blob_symbols
+
 ::: pygdb.read_blob_values
 
 ## `.grd` reader

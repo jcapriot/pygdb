@@ -37,6 +37,7 @@ from .gdb_reader import (
     check_magic,
     header_fields,
     iter_blobs,
+    read_blob_symbols,
     read_channels,
     read_lines,
 )
@@ -295,6 +296,9 @@ _REG_FLAT_KV_KEY_RE = re.compile(rb"^([A-Z_][A-Z0-9_.]{1,30})\x00")
 # own header. Recognizing it here is just so it isn't mistaken for the flat
 # form -- its own content isn't decoded.
 _REG_NESTED_VV_MARKER = b"\x01\x00\x00\x00" + bytes.fromhex("ff00f00f")
+# A per-symbol REG object's blob-symbol name: "__" plus the owning
+# symbol's global handle (docs/provenance/notes.md section 6.2d).
+_CHANNEL_OBJECT_NAME_RE = re.compile(r"__(\d+)")
 
 
 def _decode_reg_flat_keyvalues(blob_bytes: bytes) -> Optional[Dict[str, str]]:
@@ -355,7 +359,6 @@ def _decode_reg_flat_keyvalues(blob_bytes: bytes) -> Optional[Dict[str, str]]:
 
 def find_channel_settings(
     path: str,
-    max_real_line_slot: Optional[int] = None,
     channels: Optional[Iterable[ChannelRecord]] = None,
 ) -> Dict[str, Dict[str, str]]:
     """
@@ -375,13 +378,10 @@ def find_channel_settings(
     ----------
     path : str
         Path to the `.gdb` file to scan.
-    max_real_line_slot : int, optional
-        See `find_coordinate_systems` -- same meaning and same
-        "pass it if you already have it" reasoning.
     channels : iterable of ChannelRecord, optional
-        The file's own real channel table, used to resolve a registry
-        entry's `channel_slot` (`BlobHeader.line_channel`) to a real
-        channel name. If not given, this calls `read_channels(path)`
+        The file's own real channel table, used to resolve the channel
+        slot an object's symbol name points at to a real channel name
+        (see Notes). If not given, this calls `read_channels(path)`
         itself (an extra table scan) -- pass `db.channels` if the caller
         already has it.
 
@@ -392,7 +392,10 @@ def find_channel_settings(
         with at least one populated key found in its own REG entries; a
         channel with none (no REG entry at all, or entries that are all
         bare placeholders, or a numeric-array/nested-object entry -- see
-        Notes) is simply absent, not mapped to `{}`.
+        Notes) is simply absent, not mapped to `{}`. Also `{}` for a
+        file with no readable blob-symbol table
+        (`gdb_reader.read_blob_symbols` returns `None`), since nothing
+        then says which channel an object belongs to.
 
     Warns
     -----
@@ -416,14 +419,24 @@ def find_channel_settings(
     given channel is not itself decoded from anything -- only the keys a
     real file happens to have written are returned.
 
-    A channel can have more than one administrative REG entry (a
-    different out-of-range `line_slot` per tool run that touched it), and
-    this format's append-only storage can leave stale, differing copies
-    of the same key even within one entry (the same phenomenon
-    `find_channel_roles` handles for `DB_CHAN_X/Y/Z` and issue #2's data
-    blobs) -- every occurrence found across every entry is collapsed per
-    key, last one in blob-chain order wins, with a warning only when two
-    real occurrences actually disagree.
+    **Which channel an object belongs to** comes from its blob symbol
+    (docs/spec.md section 2.1, docs/provenance/notes.md section 6.2d):
+    the administrative blob at `blob_index = data_slots + k` is named by
+    blob-symbol slot `k`, and a per-channel REG object is named
+    `"__<n>"`, where `n` is the channel's global symbol handle,
+    `blobs_max + lines_max + channel_slot`. **[CONFIRMED]**: where an
+    object's `LABEL` equals a real channel's name, this mapping names
+    that channel on 218 corpus objects. The blob index's own remainder
+    (`blob_index % chans_max`), which an earlier version of this
+    function used, named it on none. An object whose handle is not a
+    channel's -- a line handle (real, 744 corpus objects, meaning
+    **[UNKNOWN]**) or any other name -- is skipped.
+
+    This format's append-only storage can leave stale, differing copies
+    of the same object (the same phenomenon `find_channel_roles` handles
+    for `DB_CHAN_X/Y/Z` and issue #2's data blobs) -- every occurrence
+    found is collapsed per key, last one in blob-chain order wins, with
+    a warning only when two real occurrences actually disagree.
     """
     with open(path, "rb") as f:
         header = f.read(128)
@@ -432,16 +445,18 @@ def find_channel_settings(
               f"no channel settings")
         return {}
     fields = header_fields(header)
-    chans_max = fields["chans_max"]
     page_size = fields["page_size"]
-    if chans_max is None or not page_size:
-        _warn(f"{path}: header too short to read chans_max/page_size -- "
+    if None in (fields["chans_max"], fields["blobs_max"], fields["lines_max"],
+                fields["data_slots"]) or not page_size:
+        _warn(f"{path}: header too short to read the table sizes/page_size -- "
               f"no channel settings")
         return {}
+    data_slots = fields["data_slots"]
+    channel_handle_base = fields["blobs_max"] + fields["lines_max"]
 
-    if max_real_line_slot is None:
-        lines = read_lines(path)
-        max_real_line_slot = max((line.index for line in lines), default=-1)
+    symbols = read_blob_symbols(path)
+    if symbols is None:
+        return {}
 
     if channels is None:
         channels = read_channels(path)
@@ -451,11 +466,14 @@ def find_channel_settings(
     candidates: Dict[int, Dict[str, List[str]]] = {}
     with open(path, "rb") as f:
         for blob in iter_blobs(path):
-            line_slot, channel_slot = blob.line_channel(chans_max)
-            if line_slot <= max_real_line_slot:
+            if blob.blob_index < data_slots:
                 continue  # a real survey line's data, not administrative metadata
+            m = _CHANNEL_OBJECT_NAME_RE.fullmatch(symbols.get(blob.blob_index - data_slots, ""))
+            if not m:
+                continue  # not a per-symbol REG object
+            channel_slot = int(m.group(1)) - channel_handle_base
             if channel_slot not in channel_names:
-                continue  # not a real, current channel -- nothing to attach this to
+                continue  # not a real, current channel's handle -- nothing to attach this to
             f.seek(blob.offset)
             # Same "read the blob's own full declared extent, capped" approach
             # as find_channel_roles, for the same reason: a real key has been

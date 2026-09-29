@@ -50,7 +50,7 @@ import warnings
 import zlib
 from dataclasses import dataclass
 
-from typing import BinaryIO, List, Optional, Tuple
+from typing import BinaryIO, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -1538,6 +1538,77 @@ def read_blob_directory(path: str) -> Optional[BlobDirectory]:
         int(i): (int(slots["word"][i]), int(slots["n_pages"][i])) for i in nonzero
     }
     return BlobDirectory(data_slots=data_slots, entries=entries)
+
+
+# Blob-symbol record fields, measured from the record's first byte (its
+# name) -- docs/spec.md section 2.1, docs/provenance/notes.md section 6.2d.
+_BLOB_SYMBOL_CATEGORY_OFFSET = 76
+_DB_CATEGORY_BLOB_NORMAL = 0  # vendor constant; the live-symbol category
+
+
+def read_blob_symbols(path: str) -> Optional[Dict[int, str]]:
+    """
+    Read the names of the file's live administrative objects.
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file.
+
+    Returns
+    -------
+    dict of {int : str} or None
+        `{symbol_slot: name}` for every live blob symbol. The object
+        named by slot `k` is the administrative blob whose `blob_index`
+        is `data_slots + k` (`header_fields()["data_slots"]`). `None`
+        when the file has no table to trust: a bad magic or truncated
+        header, or header words that would put the table outside the
+        region before the first blob. Absence is not an anomaly, so
+        nothing is warned.
+
+    Notes
+    -----
+    **[CONFIRMED]** layout (docs/spec.md section 2.1,
+    docs/provenance/notes.md section 6.2d): `blobs_max` 128-byte records
+    starting right after the blob directory, at `280 + 6 * index_slots`,
+    each beginning with its NUL-terminated name. A record is live when
+    its category (record `+76`) is `DB_CATEGORY_BLOB_NORMAL` (0), which
+    held on exactly the 1,267 corpus records that own an administrative
+    blob. A freed slot has bit `0x10000` set and may still hold its old
+    name, so the category, not the name, decides.
+
+    Names seen on real files: four fixed objects (`"__dbreg"`,
+    `"Display List"`, `"Line Selection"`, `"Database Extension
+    Objects"`), `"?|IPJ_<X>:<Y>"` projection objects, and `"__<n>"` REG
+    objects where `n` is a global symbol handle (`blobs_max + lines_max
+    + channel_slot` for a channel).
+    """
+    with open(path, "rb") as f:
+        header = f.read(4096)
+        if not check_magic(header):
+            return None
+        fields = header_fields(header)
+        blobs_max, index_slots = fields["blobs_max"], fields["index_slots"]
+        if blobs_max is None or index_slots is None or blobs_max <= 0 or index_slots <= 0:
+            return None
+        blob_start = blob_region_start(header)
+        start = DIRECTORY_OFFSET + index_slots * _DIRECTORY_SLOT_DTYPE.itemsize
+        size = blobs_max * SYMBOL_RECORD_SIZE
+        if blob_start is None or start + size > blob_start:
+            return None
+        f.seek(start)
+        raw = f.read(size)
+    if len(raw) != size:
+        return None
+    symbols = {}
+    for slot in range(blobs_max):
+        rec = raw[slot * SYMBOL_RECORD_SIZE:(slot + 1) * SYMBOL_RECORD_SIZE]
+        if struct.unpack_from("<i", rec, _BLOB_SYMBOL_CATEGORY_OFFSET)[0] != _DB_CATEGORY_BLOB_NORMAL:
+            continue
+        name, is_clean = _read_name(rec, 0)
+        if name and is_clean:
+            symbols[slot] = name
+    return symbols
 
 
 def _element_width(channel: ChannelRecord) -> Optional[int]:

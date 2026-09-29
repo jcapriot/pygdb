@@ -102,7 +102,7 @@ def test_gdb_channel_settings_empty_when_no_registry_present(db):
     assert db.channel_settings == {}
 
 
-def _inject_reg_flat_kv_blob(data: bytes, blob_index: int, key: str, value: str, page_size: int) -> bytes:
+def _reg_flat_kv_blob(blob_index: int, key: str, value: str, page_size: int) -> bytes:
     """A REG object's flat key/value form (docs/provenance/notes.md
     section 6.8c), minimal single-key version for GDB-level tests -- see
     tests/test_registry.py's own fuller helper for the byte layout."""
@@ -115,14 +115,20 @@ def _inject_reg_flat_kv_blob(data: bytes, blob_index: int, key: str, value: str,
     blob[44:48] = b"REG\x00"
     slot = key.encode("ascii") + b"\x00" + value.encode("ascii") + b"\x00"
     blob[128:128 + len(slot)] = slot
-    return bytes(data) + bytes(blob)
+    return bytes(blob)
 
 
 def test_gdb_channel_settings_reflects_real_registry_content_and_is_cached(tmp_path):
     page_size = 512
-    data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
-    admin_slot = 50 * len(CHANNELS) + 1  # channel_slot 1 = Easting
-    data = _inject_reg_flat_kv_blob(data, admin_slot, "UNITS", "m", page_size)
+    lines_max = len(LINES) + 1  # build_real_layout_gdb_bytes: one spare line slot
+    blobs_max = 4
+    data_slots = lines_max * len(CHANNELS)
+    easting_handle = blobs_max + lines_max + 1  # channel slot 1 = Easting
+    data = build_real_layout_gdb_bytes(
+        CHANNELS, LINES, page_size=page_size, blobs_max=blobs_max,
+        blob_symbols={0: f"__{easting_handle}"},
+        admin_blobs=[_reg_flat_kv_blob(data_slots + 0, "UNITS", "m", page_size)],
+    )
     path = tmp_path / "settings.gdb"
     path.write_bytes(data)
     db = GDB(str(path))

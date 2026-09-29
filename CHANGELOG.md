@@ -18,7 +18,13 @@ from there.
   have written -- decoded from the registry's flat key/value binary
   framing rather than searched for by marker. Covers that one framing
   form only (a cached numeric array or a nested tagged sub-object, both
-  real, are not decoded yet).
+  real, are not decoded yet). Each registry object is attributed to its
+  channel through the object's own name in the blob-symbol table, which
+  carries the channel's symbol handle. Objects that belong to a line
+  handle, or to nothing recognisable, are left out.
+- `pygdb.read_blob_symbols`: the names of a file's live administrative
+  objects (`__dbreg`, `Display List`, projection and per-channel registry
+  objects), read from the blob-symbol table after the blob directory.
 - `pygdb.find_channel_roles` is now re-exported at the top level (it was
   previously only reachable via `pygdb.registry.find_channel_roles`).
 - `pygdb.registry.find_projection_parameters` / `GDB.projection_parameters`:

@@ -96,7 +96,7 @@ from the start of the file.
 | 104 | int32 | `index_size` — the size in bytes of everything up to the end of the symbol tables (vendor `DB_INFO_INDEX_SIZE`) | **[CONFIRMED]** | Exactly `channel_table_start + (chans_max + users_max) × 128 + 8` in 23 of 23 files; the blob region then starts at the next page boundary (offset 108). (It was earlier read as *close to but not exactly on* the end of the symbol tables: the missing piece is the 8 trailing bytes.) |
 | 108 | int32 | `blob_start_page` — the **page number** where the blob/data region begins | **[CONFIRMED]** | Multiply by `page_size` (offset 100) to get the absolute byte offset of the very first blob header. Verified exactly on 16+ real files across every compression mode (§6.3). |
 | 112 | int32 | Number of pages in the blob region | **[CONFIRMED]** | Equals `file_size / page_size − blob_start_page` in 23 of 23 files (also the sum of every blob's `n_pages`, where checked). |
-| 116 | int32 | Unknown statistic | **[UNKNOWN]** | Zero in 21 of 23 files; non-zero (26966, 26) in exactly the two files whose cache slots (§2.2) are **full** (no empty slot, or one). It may count something that overflowed or was evicted from the cache, or belong to the vendor's `DB_INFO_LOST_SIZE`/`FREE_SIZE`/`CHANGESLOST` group; **[GUESS]**, not established. |
+| 116 | int32 | Unknown statistic | **[UNKNOWN]** | Zero in 21 of 23 files; non-zero (26966, 26) in exactly the two files whose cache slots (§2.2) are **full** (no empty slot, or one). It may count something that overflowed or was evicted from the cache, or belong to the vendor's `DB_INFO_LOST_SIZE`/`FREE_SIZE`/`CHANGESLOST` group; **[GUESS]**, not established. It is *not* the page count of chain blobs that no directory slot references (34,852 and 172 on those two files, and non-zero on every file where word 116 is zero). |
 | 120 | int32 | `comp_level` — compression mode: `0`=`DB_COMP_NONE`, `1`=`DB_COMP_SPEED`, `2`=`DB_COMP_SIZE` | **[CONFIRMED]** | All three values directly observed in real files; see §7 for what each actually means on disk (and its real, honestly-documented exceptions). |
 | 84, 88, 92, 96 | int32 (each) | Capacities of the blob, line, channel and user symbol tables, **in the vendor's `DB_SYMB_*` order** (`BLOB=0, LINE=1, CHAN=2, USER=3`) | **[CONFIRMED]** | 92 == `chans_max`, 96 == `users_max`, 88 == `lines_max`, 84 == `blobs_max` in 23 of 23 files. |
 | 72, 76, 80, 64 | int32 (each) | Running totals of those capacities: blobs, + lines, + channels, + users (= **total symbol slots**) | **[CONFIRMED]** | Exact cumulative sums in 23 of 23 files. |
@@ -133,11 +133,48 @@ uses this exact position, so its slot numbers are true and the blob-chain
 calibration in `pygdb.GDB` is only a fallback for a file where the arithmetic
 cannot be validated.
 
-**The blob-symbol table** holds the named registry-style blobs (one symbol per
-administrative blob, §6.4/§9): mostly empty records (a default `65536` at byte
-108) with named ones scattered through it, and a size-like number at word 29.
-No record holds a blob's location; the location of an administrative blob is
-its entry in the directory (§2.2), at slot `lines_max × chans_max + symbol slot`.
+**The real record boundaries: every symbol record begins with its name --
+[CONFIRMED]** (`provenance/notes.md` §6.2d). The offsets above, and those in
+§3, measure each record from a point *before* its name: 8 bytes before for
+channels and users, 32 bytes before for lines and blob symbols. Measured
+from the name instead, the four tables are one contiguous run of 128-byte
+records with no gaps, on 22 of 22 files:
+
+```
+280 + word44 × 6                    blob symbols   blobs_max × 128
+c0 + 8 − lines_max × 128            lines          lines_max × 128
+c0 + 8                              channels       chans_max × 128
+c0 + 8 + chans_max × 128            users          users_max × 128
+                                    ... ends exactly at word 104
+```
+
+The "24 bytes (unexplained)", the "8 bytes" before word 104 and the
+blob-symbol/directory overlap above are all artefacts of the old
+boundaries. A field the §3 tables place *before* the name belongs to the
+previous record: line `+0..+31` is the previous line's true `+96..+127`;
+channel/user `+0..+7` is the previous record's true `+120..+127`. The §3
+tables keep the old offsets because `pygdb.gdb_reader` parses at them;
+each gives the true offset where it matters.
+
+**The blob-symbol table** names every administrative blob (§6.4/§9). Record
+`k`, measured from its name:
+
+| True offset | Field | Status |
+|---|---|---|
+| `+0` | Name, NUL-terminated | **[CONFIRMED]** |
+| `+76` | Category: `0` (`DB_CATEGORY_BLOB_NORMAL`) when the symbol is live; bit `0x10000` set when the slot is free | **[CONFIRMED]** `0` on exactly the 1,267 records that own a blob; **[LIKELY]** meaning of `0x10000` (all 1,050 name-bearing records with it own no blob) |
+| `+84` | The object's size, equal to the owning blob's own `+24` field (§9) | **[CONFIRMED]**, 1,265 of 1,267 |
+
+The owning blob is the one at `blob_index = lines_max × chans_max + k`, and
+the directory (§2.2) gives its location. The names are:
+
+- **Fixed objects** (22 of 22 files): `Line Selection`, `Display List`,
+  `Database Extension Objects` and `__dbreg`.
+- **Projections:** `?|IPJ_<X>:<Y>`, naming the coordinate-channel pair.
+- **Per-symbol REG objects:** `__<n>`, where `n` is a global symbol
+  handle. Words 72/76/80 (§2) are the running totals of the blob, line
+  and channel tables, so handles `[word 76, word 80)` are channels (slot
+  `n − word 76`) and `[word 72, word 76)` are lines.
 
 ### 2.2 The blob directory
 
@@ -247,13 +284,13 @@ first channel.
 
 | Rel. offset | Type | Field | Status |
 |---|---|---|---|
-| `+0..+7` | 8 bytes | Always zero in every record seen | **[UNKNOWN]** — possibly an unpopulated pointer/link field |
+| `+0..+7` | 8 bytes | Always zero (602 of 602 real channels). Not part of this record: it is the previous record's true `+120..+127` (§2.1) | **[CONFIRMED]** zero; **[UNKNOWN]** meaning |
 | `+8` | 64 bytes | NUL-padded channel name (budget matches vendor's `DB_SYMB_NAME_SIZE=64`) | **[CONFIRMED]** |
 | `+84` | int16 | Data-type code: positive = `GS_*` type (§4); negative = **string byte-width** (literal, not ×4) | **[CONFIRMED]** |
 | `+86` | int16 | Matches the vendor's `DB_ARRAY_BASETYPE_*` enum *values*, but not reliably an array indicator on its own | **[LIKELY]** name match, **[UNKNOWN]** exact write-time semantics — see §5 |
 | `+92` | int16 | Display format code (§4) — matches `DB_CHAN_FORMAT_DATE`/`TIME` exactly on real date/time channels, `0` (NORMAL) elsewhere | **[CONFIRMED]** |
-| `+94` | int16 | Small integer (10–24 seen); pattern suggests decimal-places/significant-digits display setting | **[GUESS]** |
-| `+96` | int32 | Small integer (0–6 seen) | **[UNKNOWN]** |
+| `+94` | int16 | **Display width** (vendor `get_chan_width`). Equals the ASEG-GDF2 `.dfn` field width on 34 of 35 scalar channels of `AG106386`; differs on its two array channels | **[LIKELY]** — one independent oracle |
+| `+96` | int32 | **Display decimals** (vendor `get_chan_decimal`). Equals the `.dfn` decimal count on 37 of 37 channels of `AG106386`, array channels included | **[LIKELY]** — one independent oracle |
 | `+108` | float64 | Seen as exactly `1.0` in every record examined | **[UNKNOWN]** — plausible scale-factor field, never seen a non-1.0 value |
 | `+118` | int16 | **Array width**: number of elements per fiducial. `1` = scalar (the overwhelming majority); `>1` = true VA/array channel | **[CONFIRMED]** — see §5 |
 
@@ -268,14 +305,30 @@ real false-positive case this guards against.
 
 ### 3.2 Line record layout (128 bytes)
 
-**[CONFIRMED]** existence, stride, and two fields; **[UNKNOWN]** the
-rest of the layout. `provenance/notes.md` §6.3.
+**[CONFIRMED]** existence, stride, and most fields now; a byte census
+across all 22 real files (5,003 real line records, `provenance/
+notes.md` §6.3b) resolved most of what was previously `[UNKNOWN]`.
 
 | Rel. offset | Type | Field | Status |
 |---|---|---|---|
+| `+0` | int32 | **Previous line's type** — true `+96` of the previous record (§2.1): `DB_LINE_TYPE_*`, `0` = `NORMAL` on every `"L"` line, `2` = `TIE` on every `"T"` line, 5,003 of 5,003 once read against the right line | **[CONFIRMED]** |
+| `+4` | int32 | **Previous line's flight number** (true `+100`) — mostly `0`; where it varies, adjacent line pairs share values; no independent ground truth | **[LIKELY]** |
+| `+8` | 20 bytes | Previous line's true `+104..+123`. Always the identical byte pattern when populated (4,985 of 5,003 real lines) — a float32 `-1e32` at `+8`, a float64 `+1e32` at `+20` (both the vendor's `rDUMMY` sentinels, §4), and a middle 8 bytes (`+12`) that decode exactly to the nearest float64 to a round `-9×10^31` — not itself a catalogued vendor dummy; all-zero on the other 18 | **[CONFIRMED]** structure, real content never observed |
+| `+28` | int32 | **Previous line's version** (true `+124`) — the number after the dot in a repeat-line name: `1` for each of the 9 `.1` lines, `0` for every other line, 5,003 of 5,003 | **[CONFIRMED]** |
 | `+32` | up to 64 bytes | NUL-padded line name (note: **not** at `+8` the way channel names are — line records reserve more leading fields) | **[CONFIRMED]** |
+| `+96` | 12 bytes | Always exactly zero, 5,003 of 5,003 | **[CONFIRMED]** reserved/unused |
 | `+108` | int32 | Category code — `100` matches `DB_CATEGORY_LINE_NORMAL` exactly on every real normal line seen; `200` (`DB_CATEGORY_LINE_GROUP`) also seen; a `65536` sentinel value seen on unused capacity slots | **[CONFIRMED]** |
-| everything else | — | Not decoded | **[UNKNOWN]** |
+| `+112` | int32 | Always exactly zero, 5,003 of 5,003 | **[CONFIRMED]** reserved/unused |
+| `+116` | float64 | A per-*file*, near-constant decimal-year timestamp (present on 18 of 22 files; the 4 oldest, 1991 GSQ, files have none) — reads as when the database itself was created/saved, not a per-line flight date (real lines in one file all share the identical value); the exact same value, byte for byte, as the user record's own `+72` (§3.3) | **[LIKELY]** |
+| `+124` | int32 | The line's own numeric line number — **4,994 of 4,994** real lines whose name ends in an integer match exactly (`"L1150"` → `1150`); for a `.1`/`.2` repeat-line name, holds the integer part only. The fraction is the line's version, stored in the *next* slot's `+28` (its own true `+124`) | **[CONFIRMED]** |
+
+Measured from the name (§2.1), one line's own values are: name `+0`,
+category `+76`, date `+84`, number `+92`, type `+96`, flight `+100`, the
+20-byte dummy block `+104`, version `+124`. The number, version, type,
+flight and date are exactly the vendor's `DB_LINE_LABEL_FORMAT_*` label
+parts. The last line's `+96..+127` falls on the old 24-byte gap plus the
+first channel's old `+0..+7`. The first slot's old `+0..+31` is the tail
+of the blob-symbol table's last record.
 
 Line-table physical slot numbering is 0-based, exactly like the channel
 table, and — critically — this slot number is exactly the
@@ -288,11 +341,10 @@ universally**, see the correction immediately below.
 **Correction, found while building a name-based reader on top of this
 table (`pygdb.GDB`, §12):** on a real GSQ file (`rm001141`), physical
 slot 0 is a genuine, named record — `"L0"` — whose category code is
-`65636`, not `100`/`200`/`65536`. **[GUESS]**: `65536 + 100`, plausibly
-"a `NORMAL` line that was since cleared/renamed" — the vendor's own
-`65536` unused-capacity sentinel plus its original category, though
-this is speculative and not independently confirmed. Whatever it
-means, this slot has **no data blob for any channel** — it's a real
+`65636`, not `100`/`200`/`65536`. **[LIKELY]**: `0x10000 | 100`, a
+freed `NORMAL` line. The `0x10000` bit marks a free slot in the
+blob-symbol table too, where it is set on exactly the records that own
+no blob (§2.1). This slot has **no data blob for any channel** — it's a real
 table entry, but not a usable survey line — and a scanner that only
 recognizes categories `100`/`200` (as this specification's own
 reference reader originally did) skips it, landing one slot **late**
@@ -308,14 +360,30 @@ methods give identical line names and indices on all 22 corpus files.
 
 ### 3.3 User record layout (128 bytes)
 
-Only lightly investigated. The default super-user's name sits at the
-same `+8` offset as a channel name (case varies by file: uppercase
-`"SUPER"` or lowercase `"super"` both seen in real files — **[CONFIRMED]**
-both are the same structure, not a format difference). A user record
-was also observed to carry what looks like a **UTF-16LE-encoded
-embedded Windows file path** (the database's own creation path)
-immediately after the short ASCII username field — **[UNKNOWN]**,
-observed once, not investigated further (`provenance/log.md` Session 2 §2.3).
+**Only one real user has ever been found in this project's entire
+corpus: slot 0, the default superuser** — 22 of 22 real files,
+`provenance/notes.md` §6.2c. Records that first looked like more real
+users in 3 files turned out to be leftover embedded-blob bytes landing
+in unused table capacity by chance, indistinguishable from a name
+until checked against the same clean-name test channel records already
+needed (§3.1).
+
+The default super-user's name sits at the same `+8` offset as a channel
+name (case varies by file: uppercase `"SUPER"` or lowercase `"super"`
+both seen in real files — **[CONFIRMED]** both are the same structure,
+not a format difference), but the field itself is **[LIKELY]** only 32
+bytes wide here, not 64 like a channel/line name — inferred from real
+content resuming cleanly at `+40`, not directly proven (no real user
+name in this corpus is long enough to test the boundary).
+
+| Rel. offset | Type | Field | Status |
+|---|---|---|---|
+| `+8` | up to 32 bytes | NUL-padded user name | **[CONFIRMED]** |
+| `+40` | 32 bytes | A UTF-16LE fragment of the file's own path at creation/save time — clean and NUL-terminated when the real path is short enough to fit; silently truncated (losing the terminator, sometimes the last real character) when it isn't, with leftover non-zeroed bytes after a real terminator. Confirmed on 13 of 22 real files, matching that exact file's own name (e.g. `"AGG_1212.gdb"`, `"\Device\..."` on the two USGS files) | **[CONFIRMED]** existence and offset; **[LIKELY]** the exact truncation rule |
+| `+72` | float64 | The same per-file decimal-year timestamp as the line record's `+116` (§3.2) — confirmed byte-for-byte identical on 2 real files checked directly | **[LIKELY]** |
+| `+84` | int32 | Always exactly `131072` (`0x20000`) on every real superuser record. Measured from the name this is true `+76`, the category position in every symbol table (§2.1); `DB_CATEGORY_USER_NORMAL` is `0`, so the `0x20000` bit is unexplained | **[CONFIRMED]** value, **[UNKNOWN]** meaning |
+| `+124` | int32 | Always exactly `-1` on every real superuser record | **[CONFIRMED]** value, meaning open |
+| everything else | — | Small varying integers and pointer-shaped values, no pattern found | **[UNKNOWN]** |
 
 ---
 
@@ -993,7 +1061,15 @@ on every agency checked:
   match exactly, §6.8c); covers only the flat key/value content form, not
   a cached numeric array or a nested tagged sub-object (also real, not
   yet decoded). Implemented as `pygdb.registry.find_channel_settings` /
-  `GDB.channel_settings`.
+  `GDB.channel_settings`. **The owning channel comes from the object's
+  blob symbol -- [CONFIRMED]:** the object at `blob_index = data_slots +
+  k` is named by blob-symbol slot `k` (read by `pygdb.read_blob_symbols`),
+  and a per-channel object is named `__<n>` with `n − (blobs_max +
+  lines_max)` its channel slot (§2.1). On a corpus-wide oracle (a `LABEL`
+  equal to a channel's name) this names the right channel 218 times; the
+  blob index's own remainder (`blob_index % chans_max`), which the first
+  implementation used, named it 0 times. Objects with a line handle or
+  any other name are skipped. `provenance/notes.md` §6.2d.
 
 **Correction — actually [CONFIRMED] universal across all 22 real files,
 not the patterned absence previously documented here.** An earlier
@@ -1029,16 +1105,27 @@ finding.
 `VV`-tagged sub-objects beyond the fixed 128-byte preamble now decoded
 (the two remaining preamble constants are now fully characterized at the
 bit level — `(0xFF, 0x00, X, ~X)` with `X` fixed per field, `0xF0`/`0xE1` —
-but not semantically explained, and a "dirty slot 0" content shape that
-doesn't fit the flat/nested split); why a `LABEL`/`UNITS` slot specifically
-is populated or a bare
+but not semantically explained; a "dirty slot 0" content shape whose
+leading byte turns out to correlate with the specific set of real keys
+that follow for two values — `'S'`ettings-style and `'D'`atum-style
+objects — but is uninitialized-memory noise for the rest, `provenance/
+notes.md` §6.8c; and no discriminator beyond the `+24` length proxy
+has been found for flat-vs-nested `VV` content. Two refutations
+recorded in §6.8c relied on the wrong channel attribution (see
+`find_channel_settings` above) and are withdrawn; the owning symbol,
+now readable from the blob-symbol table, is an open candidate); why a
+`LABEL`/`UNITS` slot specifically is populated or a bare
 placeholder — two sibling keys, `CLASS` and `FORMULA`, turned out to be
-fully deterministic instead (always empty / always populated), but four
-real hypotheses for `LABEL`/`UNITS` (channel data presence, dtype,
-array-ness, display format) were tested and ruled out, `provenance/notes.md`
-§6.8c; the precise mapping from a blob's
-`channel_slot` to which real channel or tool-run instance it concerns;
-whether any real file has genuinely no REG/IPJ content at all; and a
+fully deterministic instead (always empty / always populated). Re-run
+corpus-wide with the correct channel attribution, `LABEL`/`UNITS`
+population is not explained by the channel's dtype, array-ness, display
+format, or whether the object is the live copy. Data presence cannot
+discriminate, because every attributed channel has data. Population is
+instead strongly per-file (all or nothing in most files), which points
+at the writing tool; `provenance/notes.md` §6.8c; what the `__<n>` REG objects with a *line* handle are, and
+whether some channel-handle objects are orphans of a reused handle
+(`provenance/notes.md` §6.2d -- which channel an object concerns is
+otherwise now decoded, §2.1); whether any real file has genuinely no REG/IPJ content at all; and a
 small, genuinely unidentified third administrative-blob tag variant
 (neither `REG `/`IPJ` nor the empty-placeholder pattern) found on two
 real GSQ files.
@@ -1067,8 +1154,13 @@ but their actual meaning is genuinely **[UNKNOWN]**:
 
 - The `f0f0f0f0` header-signature variant (§2) — seen twice, in two
   unrelated real deliveries, always the identical 4 bytes.
-- A UTF-16LE-looking embedded Windows file path inside a real user
-  record (§3.3) — observed once.
+- The UTF-16LE embedded path at user-record `+40` (§3.3) — now confirmed
+  on 13 of 22 real files with a precise offset, but the exact truncation
+  rule for a path too long to fit is still a guess.
+- The line record's 20-byte dummy-filled block (§3.2) — real, confirmed
+  present, but never seen holding anything but the vendor's dummy
+  sentinels. (The fields around it are now explained: they are the
+  previous line's type, flight and version, §2.1.)
 - Reserved/administrative blobs with out-of-range line numbers and a
   constant `4670802` in place of a valid type code (§6.4) — the
   constant itself is now explained (it is the object's own `"REG\0"`/
@@ -1079,9 +1171,10 @@ but their actual meaning is genuinely **[UNKNOWN]**:
   compressed (§7.4) blob headers, for older (pre-2020) file vintages —
   the fields that decode sensibly on 2020-era files often don't at the
   same offsets in 1990s files.
-- Header offset 104 (§2) and the channel-record `+94`/`+96`/`+108`
-  fields (§3.1) — small, plausible-looking values with no confirmed
-  meaning.
+- The channel-record `+108` field (§3.1) — always `1.0`, no confirmed
+  meaning. (`+94`/`+96` are now the display width and decimals.)
+- The superuser record's `0x20000` category bit (§3.3), and the 744
+  REG objects whose `__<n>` names are *line* handles (§2.1).
 - The exact reason some whole files/blobs never engage their declared
   compression mode (§7.6) — size is ruled out; delivery/tool-version
   provenance is an untested candidate.
@@ -1098,7 +1191,11 @@ but their actual meaning is genuinely **[UNKNOWN]**:
   `provenance/notes.md` §6.1c "What remains unexplained" for the census.
 - A line-record category code of `65636` (§3.2) on a real, named
   (`"L0"`) but dataless line-table slot — seen on one real GSQ file
-  (`rm001141`), plausibly `65536 + 100` but not confirmed.
+  (`rm001141`). Now **[LIKELY]** `0x10000 | 100`, a freed `NORMAL` line:
+  the same `0x10000` bit marks exactly the freed slots of the
+  blob-symbol table (§2.1). Still open: that the bit means "freed" is
+  inferred from the blob-symbol table alone, and no second line example
+  exists.
 
 ---
 

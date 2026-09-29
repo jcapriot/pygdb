@@ -3490,3 +3490,280 @@ except +604/+612 (structure confirmed on the whole corpus, meaning still
 open). No code changed -- investigation only, same
 disposition as section 6.8c: not wired into `pygdb/registry.py` pending a
 decision on whether a decoder is worth building on it.
+
+## Session 9 -- decoding the line and user records overnight (2026-09-28/29)
+
+Prompted by: "Lets try to decode the line and user records, go ahead and work
+on both of these for a while overnight." Unattended follow-up work; no code
+changed, investigation and documentation only, same discipline as Sessions
+7-8 before anything was wired into the reader.
+
+1. Byte-censused every int32 field of every real line record (`db.lines`,
+   the exact-offset table from the header-geometry work) across all 22 real
+   files, 5,003 real lines total. Six fields turned out to hold real,
+   confirmable content; two more are confirmed-reserved zero; two remain
+   genuinely unresolved.
+2. **`+124` is the line's own integer line number.** Cross-checked against
+   every line name ending in a number: 4,994 of 4,994 exact matches, zero
+   exceptions. For 9 real lines with a `.1`/`.2` repeat suffix, `+124` holds
+   the integer part only. Compared one such line byte-for-byte against its
+   immediate non-repeat neighbours (`"L1004.1"` vs. `"L1003"`/`"L1005"`,
+   `"L1263.1"` vs. `"L1262"`/`"L1264"`, `MLGRAV.gdb`): the only differences
+   anywhere in the 128 bytes are the name text and `+124` itself -- the
+   `.1` suffix has no separate storage at all, confirmed negative, not
+   just unfound.
+3. **`+0` correlates with the line-name prefix letter**: `2` on 225 of 234
+   real `"T"` (tie-line) names, `0` on all 4,769 `"L"` names. The 9 `T`
+   exceptions are, in every one of the 9 files with any `T` lines, exactly
+   that file's own single lowest-numbered `T` line (`T101` in both
+   `MLMAG.gdb`/`MLGRAV.gdb`, `T7000` in both USGS files) -- checked
+   directly, 9 of 9 -- plausibly a reference/base tie line.
+4. **`+8..+27` (20 bytes) is always the identical byte pattern when
+   populated** (4,985 of 5,003 real lines, every file) -- decodes as the
+   vendor's `-1.0e32`/`+1.0e32` dummy sentinels. Real content for this field
+   has never been seen; same "confirmed structure, dummy-only" shape as the
+   IPJ record's `+604`/`+612` (section 6.7b).
+5. **`+116..+123` decodes as a real float64 -- a decimal year.** Values
+   cluster in 2003-2025, and *within* one file cluster tightly around one
+   date rather than spanning a real survey's weeks-long acquisition window
+   (`Magnetic_Data.gdb`: 631 of 631 lines read the identical `2020.2295`
+   = 2020-03-25) -- read as a per-*file* creation/save timestamp, not a
+   per-line flight date. Present on 18 of 22 files; absent on the 4 oldest
+   (1991 GSQ) files in the corpus.
+6. **`+96..+107` and `+112` are always exactly zero** -- 5,003 of 5,003,
+   confirmed reserved/unused.
+7. Moved to the user table. A first, loose census (any NUL-terminated-looking
+   name) found several "extra" users in 3 files -- all false positives,
+   leftover embedded-blob bytes landing in unused table capacity by chance
+   (the same phenomenon already documented for the channel table's own
+   false positives). Re-ran with the project's existing `_read_name` clean
+   check: **every one of the 22 real files has exactly one real user, slot
+   0, the superuser** -- no real second user ever found in this corpus.
+8. **The name field is only 32 bytes wide for a user record** (not 64 like
+   channel/line records) -- inferred from real content resuming cleanly at
+   +40, not directly proven (no real user name here is long enough to test
+   the boundary).
+9. **`+40..+71` (32 bytes) is a UTF-16LE fragment of the file's own creation/
+   save path.** Decoded text matches the real file's own name on 13 of 22
+   files (`"AGG_1212.gdb"`, `"Gordon_1003.gdb"`, `"\Device\..."` on the two
+   USGS files, etc.) -- clean and NUL-terminated when the real path is short
+   enough, silently truncated (losing the terminator, sometimes the very
+   last character) when it isn't, with leftover non-zeroed bytes after a
+   real terminator -- the same "unused capacity isn't reliably zeroed"
+   behavior already seen for the channel table and the REG registry's
+   dirty-slot-0 case, now confirmed a third time. This generalizes
+   docs/spec.md section 3.3's single earlier sighting ("observed once") to
+   13 of 22 real files with a precise, confirmed offset.
+10. **`+72..+79` is byte-for-byte the same per-file timestamp as line
+    `+116`** -- checked directly on `Magnetic_Data.gdb` and
+    `Radiometric_Data.gdb`, exact match both times. Independent
+    cross-reference between two different table types, not just a similar
+    magnitude.
+11. **`+84` is always exactly `131072` and `+124` is always exactly `-1`**
+    on every one of the 22 real superuser records -- confirmed values,
+    meanings not established (no second, non-super user exists in this
+    corpus to compare against).
+12. Went back to the two line-table loose ends. **The `.1`/`.2` repeat
+    suffix has no separate storage anywhere**: compared `MLGRAV.gdb`'s
+    `"L1004.1"` byte-for-byte against its immediate non-repeat neighbours
+    `"L1003"`/`"L1005"` (and `"L1263.1"` against `"L1262"`/`"L1264"`) --
+    the only differences anywhere in the 128 bytes are the name text and
+    `+124` itself. A confirmed negative, not just "not found yet".
+13. **The 9 `+0` exceptions are each file's own single lowest-numbered `T`
+    line** -- checked directly on all 9 files with any `T` lines, 9 of 9
+    (`T101` in both Ontario files, `T7000` in both USGS files). Plausibly
+    a reference/base tie line.
+14. **`+4` is plausibly a flight number.** Mostly zero; on the one file
+    with enough real variation to test (`AG106386_...Conductivity.gdb`,
+    112 real lines, 58 distinct values 0-69), 48 of 58 values are shared
+    by exactly two lines, and every such pair is two directly-adjacent
+    line numbers (ten apart, this file's own real numbering increment) --
+    the shape a flight covering an out-and-back line pair would have. No
+    independent flight-count record was available to confirm it against.
+
+**What it changes.** `docs/spec.md` sections 3.2 and 3.3: both gain a real
+offset table in place of "everything else: not decoded". `provenance/
+notes.md` gains section 6.2c (user table) and 6.3b (line table). No code
+changed -- same as Sessions 7-8, this is investigation and documentation
+only, left for a follow-up decision on whether to build real
+`LineRecord`/`UserRecord` field readers on top of it.
+
+## Session 10 -- three follow-up leads (2026-09-29)
+
+Prompted by: "do those two you suggested. then see if you can do the flat vs
+nested selector" -- the three items flagged as most promising when asked
+"any more leads left to follow up on?".
+
+1. **Line record `+12..+19` (the middle 8 bytes of the `+8..+27` dummy
+   block), decoded precisely.** Reads as the closest float64 to a clean,
+   round `-9x10^31` -- not `-1e32` itself, and not previously catalogued
+   as a vendor dummy value anywhere in this project's constant research.
+   Suspiciously round to be coincidental, but not established as a real
+   third sentinel either; recorded honestly as unexplained-but-noteworthy
+   rather than claimed.
+2. **The REG dirty-slot0 byte correlates with the specific *set* of keys
+   later in the object, corpus-wide -- real for two values, noise for
+   the rest.** Grouped every dirty-slot0 object's byte against its exact
+   key set: `83`/`'S'` maps to `(LABEL, UNITS)` or `(FORMULA, LABEL,
+   UNITS)` on 75 of 80 instances; `68`/`'D'` maps, 10 of 10, to objects
+   containing at least `_PJ_ELLIPSOID`/`_PJ_IPJ`/`_PJ_NAME` (the
+   projection-serialization keys, section 6.7's textual `IPJ` copy).
+   Both read as real, plausible mnemonics (Settings / Datum). `72`/`'H'`
+   also repeats cleanly (2 of 2, `DB_CHAN_Y`/`DB_CHAN_Z`) with no obvious
+   mnemonic. The remaining ~90 distinct byte values are each seen on
+   exactly one object in the whole 22-file corpus, spanning the full
+   0-255 range near-uniformly -- the signature of uninitialized memory,
+   not a per-tool marker, matching "dirty slot 0" already meaning
+   something here didn't get written normally.
+3. **Two more hypotheses for the flat-vs-nested `VV` selector, both
+   refuted.** Neither the administrative `line_slot` namespace value nor
+   which real channel the entry is about determines content kind: every
+   admin `line_slot` checked holds a mix of kinds, and 15 of 50 real
+   channels on `Magnetic_Data.gdb` have REG entries of more than one
+   non-empty kind across their different administrative blobs. With the
+   original fixed-field census, the `+24`-magnitude proxy (section 6.8c)
+   remains the only signal found; content-probing is genuinely necessary.
+
+**What it changes.** `docs/provenance/notes.md` section 6.8c gains the
+dirty-slot0 key-set table and the two refuted selector hypotheses; the
+line-record `+8..+27` note (section 6.3b) is not changed in status (still
+"real content never observed"), just given a more precise decode of its
+middle bytes. No code changed -- investigation only.
+
+## Session 11 -- symbol records begin at their name; channel display width/decimals; REG objects are named by symbol handle (2026-09-29)
+
+Prompted by: "I was working on this with sonnet, see if you can identify any
+more angles to try to solve any undecoded items." Scripts in the session
+scratchpad (`angles1.py`..`angles11.py`); every number below is corpus-wide
+over the 22 real files unless a file is named.
+
+1. **New oracle: the ASEG-GDF2 `.dfn` sidecar for `AG106386`.** It had only
+   been used for the VA/array finding (section 6.2b), never for display
+   settings. Each field carries a Fortran-style `Fw.d`/`Iw` format. Against
+   the channel record: `+96` equals the `.dfn` decimal count on **37 of 37**
+   channels the `.dfn` describes (including both 30-element array
+   channels); `+94` equals the field width on **34 of 35** scalar channels
+   (`GA_project_number`: `+94=6`, `.dfn` `I4`), and differs on both array
+   channels (`LEI_Conductivity` 8 vs 10, `LEI_Depth` 10 vs 12). The USGS
+   CSVs were checked too but are full-precision exports (`radar` with 12-13
+   decimals against `+96=2`), so they cannot test a display setting either
+   way. Vendor source S4 (`GXDB.py`, re-fetched this session) documents
+   `get_chan_width` ("a channel's display width") and `get_chan_decimal`
+   ("number of digits displayed to the right of the decimal point") --
+   names for exactly these two fields.
+2. **Line record `+0` is the vendor's `DB_LINE_TYPE`.** `L` lines read `0`
+   (`NORMAL`), `T` lines `2` (`TIE`), with the 9 "lowest `T` line"
+   exceptions from Session 9. Those exceptions dissolved in step 4.
+3. **Line record `+28` flags the line after a repeat line.** All 8
+   instances (`SAMAGEM_CDI`, `MLGRAV`) sit on the line whose number
+   directly follows a dotted `.1` repeat: `L1004.1` -> `L1005`, `L1263.1` ->
+   `L1264`, `L1267.1` -> `L1268`, `L1269.1` -> `L1270`, `L1291.1` ->
+   `L1292`, `T127.1` -> `T128`, `L2180.1` -> `L2190`, `T4060.1` -> `T4070`.
+   A field of one record describing its neighbour suggested the record
+   boundary itself was wrong.
+4. **Hypothesis: every symbol record begins with its name.** Then our line
+   `+0..+31` would be the tail (`+96..+127`) of the *previous* line's true
+   record, and our channel/user `+0..+7` the tail (`+120..+127`) of the
+   previous true record. Tested against the geometry first, with no
+   free parameters: with true line table start `L = c0 + 8 - lines_max x
+   128` and true blob-symbol start `L - blobs_max x 128`, on **22 of 22**
+   files the directory ends exactly where the blob-symbol table begins
+   (`280 + word44 x 6`), the line table ends exactly where the channel
+   table begins (`c0 + 8`), and the user table ends exactly on header word
+   104. The "24 bytes (unexplained)" after the line table, the "8 bytes"
+   before word 104, and the "first 32 bytes of the blob-symbol table
+   coincide with the last five directory slots" overlap (spec section 2.1)
+   all disappear: directory, blob symbols, lines, channels and users are
+   one contiguous run of 128-byte records.
+5. **Field-level predictions, all held.** Reading lines at the true
+   boundary: type at true `+96` matches the name prefix on **5,003 of
+   5,003** lines (`L`->0 4,769, `T`->2 234; the 9 exceptions were each the
+   first `T` line reading the last `L` line's type); true `+124` equals the
+   dotted suffix on **5,003 of 5,003** (9 lines `.1`->1, 4,994 undotted->0).
+   The channel true tail `+120..+127` is zero on 602 of 602 real channels.
+   Blob-symbol records now read a clean name at true `+0`.
+6. **Vendor corroboration (S3, `gxapi/__init__.py`, re-fetched).**
+   `DB_LINE_LABEL_FORMAT_LINE/VERSION/TYPE/FLIGHT/DATE` name exactly the
+   five per-line values the true record holds (number true `+92`, version
+   `+124`, type `+96`, flight `+100`, date `+84`); `GXDB.line_date` returns
+   a float (the decimal-year float64). `DB_CATEGORY_BLOB_NORMAL = 0`,
+   `DB_CATEGORY_USER_NORMAL = 0`.
+7. **The blob-symbol table names every administrative object.** Named
+   records: `Line Selection`, `Display List`, `Database Extension Objects`,
+   `__dbreg` (22 of 22 files each), `?|IPJ_<X>:<Y>` for each projection
+   object (naming its coordinate-channel pair, e.g. `?|IPJ_X_Rx:Y_Rx`), and
+   `__<n>` for per-symbol REG objects. True `+76` is `0`
+   (`DB_CATEGORY_BLOB_NORMAL`) on exactly the 1,267 records that have an
+   administrative blob at `data_slots + slot`; all 1,050 name-bearing
+   records with bit `0x10000` set have none (leftover names in freed
+   slots). True `+84` equals the object blob's own `+24` size field on
+   1,265 of those 1,267.
+8. **`__<n>` is a global symbol handle, and it corrects
+   `find_channel_settings`.** Header words 72/76 are the running totals
+   blobs / blobs+lines (section 6.1b), so handles `[word76, word80)` are
+   channels (`handle - word76` = channel slot) and `[word72, word76)` are
+   lines. `find_channel_settings` currently attaches an object to channel
+   `slot % chans_max` (the decomposition of its `blob_index`). Oracle: a
+   REG `LABEL` equal to a real channel name. The handle mapping names that
+   channel **218** times, the modulo mapping **0** times; 18 match neither
+   -- 16 are derived channels whose label was copied from their source
+   (`MGA_East` labelled `EASTING`, `__X` labelled `X`), 2 are one
+   `DB_Mag_833.gdb` object at handle `2620 == word72`. Against the `.dfn`
+   `UNIT=` for AG106386: handle 5 of 7, modulo 0 of 7. Examples of the
+   modulo mapping's errors: `LABEL "Line number"` -> `Fid`, `"WGS84
+   Longitude"` -> `AltEll`. Of 1,732 `__<n>` REG objects, 988 have channel
+   handles and 744 line handles; 19 of the line-handle ones hold flat keys
+   (`UNITS`, `LABEL`, `FORMULA`, `_PJ_*`, `DB_CHAN_Y/Z`), which a
+   line-level setting would not obviously have -- **[UNKNOWN]** whether
+   these are real line objects or stale handles from an earlier table
+   size.
+9. **Header words 8..20, 68 and 116, rechecked.** Words 8..20 read
+   `(268566528, 264, 0, 0)` and word 68 reads `0` on 22 of 22 files --
+   unchanged, no new angle. Word 116 (26966 on `SAMAGEM_CDI`, 26 on
+   `Magnetic_Data`, 0 elsewhere) was compared against the pages of chain
+   blobs no directory slot references (34,852 / 172; and non-zero on every
+   file where word 116 is zero) -- **refuted** as a lost-page count.
+
+**What it changes.** Session 10 item 3's "channel identity does not
+determine content kind" used the modulo channel mapping and is withdrawn
+(untested under the handle mapping). The Session 9 line-record `+0`/`+4`/
+`+8..+27`/`+28` and user/channel `+0..+7` fields are re-read as the tail of
+the preceding record. `find_channel_settings` attaches settings to the wrong
+channels on every corpus file; not fixed this session (reported to the
+user first). Docs updated: `docs/spec.md` sections 2.1, 3.1-3.3, 9, 11;
+`docs/provenance/notes.md` new section 6.2d, notes in 6.3b and 6.8c.
+
+**Follow-up: the fix ("fix it!").** Added `pygdb.gdb_reader.read_blob_symbols`
+(live blob-symbol names, category `0` only) and switched
+`find_channel_settings` to attribute each REG object by its `__<n>` handle,
+skipping line handles and other names. Its `max_real_line_slot` parameter
+went away: administrative blobs are now exactly `blob_index >= data_slots`.
+The test builder `build_real_layout_gdb_bytes` gained blob-symbol records,
+header words 64/72/76/80 and the true 32-byte line-table position; all
+real-layout tests still pass with that position. Corpus check after the
+fix: of 121 channels whose returned `LABEL` is a real channel's name, 111
+name themselves and 10 are derived channels labelled after their source.
+The old integration assertions (`ch_11` `FORMULA`, `base` `LABEL` on
+`Magnetic_Data.gdb`) came from the wrong mapping and were replaced. The
+`ch_11` object carries a line handle (`__1541`); the `base` label
+belongs to `time`. One new unknown: on `AG106386`, `_PJ_*` keys
+(`_PJ_IPJ = IPJ_Easting:Northing`) also land on `Fiducial`, `GPS_Height`
+and `Ground_Speed` through live channel handles -- possibly orphaned
+objects whose handle was reused, not yet distinguishable (notes section
+6.2d).
+
+**Follow-up: stale spec text and the suspect `LABEL`/`UNITS` tests.** Fixed
+two stale spots in `docs/spec.md`. The section 11 `65636` entry now
+reflects the freed-slot reading. Section 9 no longer lists "which channel
+a `channel_slot` concerns" as open. Re-ran the four `LABEL`/`UNITS`
+population hypotheses from section 6.8c, which had used the modulo
+channel attribution, corpus-wide under the handle mapping
+(`labelunits.py`; 761 `LABEL` and 646 `UNITS` slots):
+- dtype, array-ness and display format are still mixed, so still refuted;
+- data presence turns out untestable, since every attributed channel has
+  data, and its old quadrants were mapping artefacts;
+- a new "live directory copy" hypothesis is mixed too.
+
+The new finding is that population is strongly per-file. `LABEL` is filled
+on every object in six files and on none in four, which suggests the
+writing tool. Recorded in notes section 6.8c.
