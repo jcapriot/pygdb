@@ -1024,12 +1024,12 @@ channel readers still parse at the legacy offsets, which give the right
 values for every field they decode (name, type, format, array width,
 line category).
 
-**Caveat seen after the fix -- [UNKNOWN].** On `AG106386`, `_PJ_*`
-projection keys (`_PJ_IPJ = IPJ_Easting:Northing`) land on `Fiducial`,
-`GPS_Height` and `Ground_Speed` as well as on `Easting`/`Northing`. The
-handles are channel handles and the symbols are live, so the mapping
-rule is not the cause. These may be orphaned objects whose handle a
-later channel reused, but nothing in the file distinguishes them yet.
+**Caveat seen after the fix -- resolved later in Session 11.** On
+`AG106386`, `_PJ_*` projection keys (`_PJ_IPJ = IPJ_Easting:Northing`)
+landed on `Fiducial`, `GPS_Height` and `Ground_Speed` as well as on
+`Easting`/`Northing`. They came from leftover slots past each object's
+entry count (section 6.8c), not from reused handles. Honouring the count
+removes them.
 
 ### 6.3 Line table — [LIKELY] existence and stride, [UNKNOWN] full layout
 
@@ -3449,9 +3449,68 @@ independent discriminator rather than the length proxy above:
   `(data_slots + symbol slot) // chans_max`, not a namespace. It too is
   withdrawn.
 
-*(Session 10's conclusion, kept for the record. After the Session 11
-withdrawal above, the owning symbol, given by the blob-symbol name, is an
-open candidate selector again.)* With these two ruled out alongside the
+**Session 11: the selector is preamble `+124` -- [CONFIRMED], 1,758 of
+1,758 corpus `REG` objects.** Content kinds were classified against the
+owner named by each object's blob symbol (section 6.2d), which led to the
+field. Every live `__<n>` handle names exactly one object (1,109 of
+1,109).
+
+- **`+124 = n > 0` on exactly the 860 objects whose `+128` starts a
+  key.** `n` equals the number of consecutive key slots from slot 0 on
+  860 of 860. It is the entry count, not the unreliable field it was
+  taken for above.
+- **`+124 = 0` on all 898 others.** The int32 at `+128` is then a
+  field:
+  - **`1` followed by `ff 00 f0 0f`: the nested form, on 24 of 24.** It is
+    always a `MAKER` record naming the GX that created the channel
+    (`newchan.gx` ×20, `linechan.gx` ×4). All 24 are channel-owned. 23
+    have no other keys; 1 also has the GX parameter `LOOKUPDBCH`.
+  - **`0`** covers three shapes:
+    - 641 objects all zero;
+    - 123 objects of binary content (the "numeric array" form);
+    - **110 objects whose slot 0 is a real key with its first 4 bytes
+      zeroed.** 107 of the 110 tails equal a known key minus its first 4
+      characters: `S` ×75 (`UNITS`/`CLASS`), `L` ×13, `DATUM_TRANSFORM`
+      ×10, `ULA` ×7, `HAN_X` ×2. 91 of the 110 have more full keys in
+      later slots.
+- **By owner:** line-handle objects are only empty (555), binary (106)
+  or zeroed-key (83). They are never clean flat or nested. Channel-handle
+  objects are mostly clean flat (834 of 988). The 26 fixed `__dbreg`
+  objects are all clean flat.
+
+**This reframes the "dirty slot 0" of Session 10 -- [LIKELY].** The
+`+132` byte is the 5th character of an overwritten key: `S` for `UNITS`,
+`D` for `_PJ_DATUM_TRANSFORM`, `H` for `DB_CHAN_Y`. That is why it
+tracked the key set. The best reading is an object rewritten with zero
+entries (`+124 = 0`, `+128 = 0`) over an old buffer, whose earlier
+key/value bytes survive past the new header. Keys past `n` in 8 clean
+objects (`DB_EM_293`, `SAMAGEM_CDI`) are leftovers the same way.
+Neither liveness in the directory nor owner separates the zeroed-key
+objects from the binary ones. Whether the binary ones are genuine
+numeric arrays or leftovers too is **[UNKNOWN]**.
+
+**Reader change.** `_decode_reg_flat_keyvalues` now reads only the first
+`+124` slots. Before, it returned keys from 7 channel-owned `+124 = 0`
+objects and from the slots past `n` in the 8 objects above. Effect on
+`channel_settings` across the corpus:
+
+- `AG106386`: 7 → 4 channels.
+- `DB_EM_293`: 4 → 2 channels.
+- `SAMAGEM_CDI`: 10 → 5 channels, and its 6 conflicting-value warnings
+  disappear.
+- The label oracle (section 6.2d) is unchanged, 111 own / 10 other.
+
+**Independent support for the leftover reading.** Every dropped entry
+that carried `_PJ_*` projection keys was on a non-coordinate channel
+(`Fiducial`, `GPS_Height`, `Ground_Speed` on `AG106386`). After the
+change, projection keys sit only on real coordinate pairs
+(`Easting`/`Northing`, `x_NAD83`/`y_NAD83`, `Lat_NAD83`/`Lon_NAD83`,
+`Easting_AMGz55`/`Northing_AMGz55`). That resolves section 6.2d's
+"orphaned objects" caveat: those were leftover bytes in objects that
+now declare no entries (or fewer), not reused handles.
+
+*(Session 10's conclusion below is kept for the record; superseded by
+the `+124` finding above.)* With these two ruled out alongside the
 fixed-field census above, every
 plausible discriminator this project could think to check has now been
 tried; the `+24`-magnitude proxy is the only signal found, and genuine

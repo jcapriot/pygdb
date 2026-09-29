@@ -937,8 +937,8 @@ the `REG` forms it doesn't decode.
 files from. The binary framing is **partially decoded**: a fixed
 128-byte preamble common to every `REG` blob is **[CONFIRMED]** (1,033
 of 1,033 real instances checked); what follows it is **[CONFIRMED]** to
-take at least three different real forms, but which a given blob uses
-is **[UNKNOWN]**. `provenance/notes.md` §6.8, §6.8c.
+take at least three different real forms, and preamble `+124` says which
+(**[CONFIRMED]**, below). `provenance/notes.md` §6.8, §6.8c.
 
 **The fixed preamble** (§6.4 has the `4670802`/`REG\0` identity this
 starts from): the ordinary 48-byte blob header, its `+44` type-code
@@ -961,12 +961,34 @@ fields. Every `REG` blob's first 128 bytes matches this exactly.
    `0x1A` DOS EOF byte) holding exactly the kind of tool-run parameter
    content described below.
 
-No field explicitly flags which of these three a given `VV` object holds —
-but the length field two paragraphs up correlates with content in a way
-that, empirically, cleanly separates a nested object from a flat-slot one:
-on every file checked with both present, the nested case's length sits in a
-narrow band no flat-slot instance ever lands in (`provenance/notes.md`
-§6.8c). Not proven as a deliberate rule, only observed to hold.
+**Preamble `+124` selects the form -- [CONFIRMED], 1,758 of 1,758 corpus
+`REG` objects.** It is the number of flat entries:
+
+- **`+124 = n > 0`: flat key/value.** Exactly the first `n` 256-byte slots
+  hold keys. It matched the count of consecutive key slots from slot 0 on
+  860 of 860 objects.
+- **`+124 = 0`: no flat entries** (898 of 898 objects whose byte `+128`
+  does not start a key). The int32 at `+128` is then a field, not key
+  text:
+  - `1` followed by `ff 00 f0 0f` is form 3, the nested object. It was a
+    `MAKER` record on all 24 instances, each naming the GX that created
+    its channel (`newchan.gx` ×20, `linechan.gx` ×4). All 24 belong to
+    channel handles.
+  - `0` covers the all-zero objects, form 1's numeric content, and
+    objects whose slot 0 holds a real key minus its first 4 characters.
+    The last are 107 of 110 matches such as `S` (`UNITS`), `L` (`LABEL`),
+    `ULA` (`FORMULA`) and `DATUM_TRANSFORM`.
+
+These last objects are the "dirty slot 0" shape. Its tell-tale byte at
+`+132` is simply the 5th character of the overwritten key, **[LIKELY]**
+leftover bytes of an object rewritten with no entries. Key-shaped slots
+past `n` (8 objects) are **[LIKELY]** leftovers the same way. Support for
+the leftover reading: ignoring them removes every `_PJ_*` projection key
+that had landed on a non-coordinate channel (e.g. `Fiducial`,
+`GPS_Height` on AG106386). The ones kept sit only on coordinate pairs.
+
+The length field two paragraphs up also separates nested from flat in
+practice, but `+124` makes that proxy unnecessary.
 
 **A rarer sibling object, tagged `"META\0"` instead of `"REG\0"`, wraps a
 real compressed stream — and it is Geosoft's own internal type library, not
@@ -1069,7 +1091,11 @@ on every agency checked:
   equal to a channel's name) this names the right channel 218 times; the
   blob index's own remainder (`blob_index % chans_max`), which the first
   implementation used, named it 0 times. Objects with a line handle or
-  any other name are skipped. `provenance/notes.md` §6.2d.
+  any other name are skipped. `provenance/notes.md` §6.2d. Only the
+  first `+124` slots of an object are read (the entry count, below), so
+  leftover keys from an earlier version of the object are not returned.
+  With that in place, `_PJ_*` projection keys land only on real
+  coordinate channel pairs across the corpus.
 
 **Correction — actually [CONFIRMED] universal across all 22 real files,
 not the patterned absence previously documented here.** An earlier
@@ -1105,15 +1131,10 @@ finding.
 `VV`-tagged sub-objects beyond the fixed 128-byte preamble now decoded
 (the two remaining preamble constants are now fully characterized at the
 bit level — `(0xFF, 0x00, X, ~X)` with `X` fixed per field, `0xF0`/`0xE1` —
-but not semantically explained; a "dirty slot 0" content shape whose
-leading byte turns out to correlate with the specific set of real keys
-that follow for two values — `'S'`ettings-style and `'D'`atum-style
-objects — but is uninitialized-memory noise for the rest, `provenance/
-notes.md` §6.8c; and no discriminator beyond the `+24` length proxy
-has been found for flat-vs-nested `VV` content. Two refutations
-recorded in §6.8c relied on the wrong channel attribution (see
-`find_channel_settings` above) and are withdrawn; the owning symbol,
-now readable from the blob-symbol table, is an open candidate); why a
+but not semantically explained; whether the `+124 = 0`, `+128 = 0`
+objects are numeric arrays, leftovers, or both -- the two cannot yet be
+told apart; and why line-handle objects are never clean flat or nested,
+only empty or `+124 = 0`); why a
 `LABEL`/`UNITS` slot specifically is populated or a bare
 placeholder — two sibling keys, `CLASS` and `FORMULA`, turned out to be
 fully deterministic instead (always empty / always populated). Re-run
@@ -1122,8 +1143,7 @@ population is not explained by the channel's dtype, array-ness, display
 format, or whether the object is the live copy. Data presence cannot
 discriminate, because every attributed channel has data. Population is
 instead strongly per-file (all or nothing in most files), which points
-at the writing tool; `provenance/notes.md` §6.8c; what the `__<n>` REG objects with a *line* handle are, and
-whether some channel-handle objects are orphans of a reused handle
+at the writing tool; `provenance/notes.md` §6.8c; what the `__<n>` REG objects with a *line* handle are
 (`provenance/notes.md` §6.2d -- which channel an object concerns is
 otherwise now decoded, §2.1); whether any real file has genuinely no REG/IPJ content at all; and a
 small, genuinely unidentified third administrative-blob tag variant

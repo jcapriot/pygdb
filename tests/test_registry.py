@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 import struct
 import warnings
+from typing import Optional
 
 import pytest
 
@@ -222,15 +223,22 @@ def test_find_channel_roles_bad_magic_returns_all_none(tmp_path):
 # -- find_channel_settings (docs/provenance/notes.md section 6.8c) ----------
 
 
-def _reg_flat_kv_blob(blob_index: int, keyvalues: dict, page_size: int) -> bytes:
+def _reg_flat_kv_blob(
+    blob_index: int, keyvalues: dict, page_size: int, n_entries: Optional[int] = None,
+) -> bytes:
     """
     One administrative blob shaped like a real REG object's flat
     key/value form (docs/provenance/notes.md section 6.8c): the plain
     48-byte blob header with `b"REG\\x00"` at its own type-code field
-    (+44), then one `KEY\\0value\\0` pair per 256-byte-aligned slot from
-    byte 128. Deliberately doesn't reproduce the real preamble's other
-    constant fields (+60, +92, ...) -- `find_channel_settings` doesn't
-    read them, and this should exercise exactly what it does check.
+    (+44), the entry count at +124, then one `KEY\\0value\\0` pair per
+    256-byte-aligned slot from byte 128. Deliberately doesn't reproduce
+    the real preamble's other constant fields (+60, +92, ...) --
+    `find_channel_settings` doesn't read them, and this should exercise
+    exactly what it does check.
+
+    `n_entries` overrides the count at +124 (default: one per pair), to
+    build the real leftover shapes -- slots past the count, or a count
+    of 0 over old slots.
 
     Built directly (not via `pack_plain_blob`, which sizes itself from
     encoded *values*, not a fixed byte layout like this one) so `n_pages`
@@ -246,6 +254,7 @@ def _reg_flat_kv_blob(blob_index: int, keyvalues: dict, page_size: int) -> bytes
     struct.pack_into("<i", blob, 8, n_pages)
     struct.pack_into("<i", blob, 12, blob_index)
     blob[44:48] = b"REG\x00"
+    struct.pack_into("<i", blob, 124, len(keyvalues) if n_entries is None else n_entries)
     for i, (key, value) in enumerate(keyvalues.items()):
         slot_start = 128 + 256 * i
         slot = key.encode("ascii") + b"\x00" + value.encode("ascii") + b"\x00"
@@ -346,6 +355,31 @@ def test_find_channel_settings_attributes_by_symbol_handle_not_blob_index(tmp_pa
     assert blob_index % len(SETTINGS_CHANNELS) == 1  # the old mapping would say Easting
     path = _settings_file(tmp_path, [(1, _channel_handle(0), _kv({"UNITS": "nT"}))])
     assert find_channel_settings(path) == {"raw_mag": {"UNITS": "nT"}}
+
+
+def test_find_channel_settings_reads_only_the_declared_entries(tmp_path):
+    """Real (8 corpus objects, docs/provenance/notes.md section 6.8c):
+    key slots past the entry count at +124 are leftovers of an earlier
+    version of the object, not settings."""
+    make = lambda blob_index, page_size: _reg_flat_kv_blob(  # noqa: E731
+        blob_index, {"UNITS": "nT", "LABEL": "stale label"}, page_size, n_entries=1,
+    )
+    path = _settings_file(tmp_path, [(0, _channel_handle(0), make)])
+    assert find_channel_settings(path) == {"raw_mag": {"UNITS": "nT"}}
+
+
+def test_find_channel_settings_ignores_an_object_rewritten_with_no_entries(tmp_path):
+    """Real (110 corpus objects, section 6.8c): an object whose count at
+    +124 is 0, with slot 0's first 4 bytes zeroed and old keys still in
+    the slots after it."""
+    def make(blob_index, page_size):
+        blob = bytearray(_reg_flat_kv_blob(
+            blob_index, {"UNITS": "m", "LABEL": "old"}, page_size, n_entries=0,
+        ))
+        blob[128:132] = b"\x00" * 4  # "UNITS" -> "\0\0\0\0S"
+        return bytes(blob)
+    path = _settings_file(tmp_path, [(0, _channel_handle(0), make)])
+    assert find_channel_settings(path) == {}
 
 
 def test_find_channel_settings_skips_a_key_with_an_empty_value(tmp_path):

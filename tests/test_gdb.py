@@ -113,6 +113,7 @@ def _reg_flat_kv_blob(blob_index: int, key: str, value: str, page_size: int) -> 
     struct.pack_into("<i", blob, 8, n_pages)
     struct.pack_into("<i", blob, 12, blob_index)
     blob[44:48] = b"REG\x00"
+    struct.pack_into("<i", blob, 124, 1)  # the entry count
     slot = key.encode("ascii") + b"\x00" + value.encode("ascii") + b"\x00"
     blob[128:128 + len(slot)] = slot
     return bytes(blob)

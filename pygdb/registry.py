@@ -281,13 +281,14 @@ def find_channel_roles(
 # 6.8c): a fixed 128-byte preamble (48-byte blob header with the object's
 # own name -- "REG\0" here -- in place of a GS_* type code, then 80 more
 # bytes of nested-tag framing), after which the content is one of three
-# forms. This decodes only the best-validated one: a flat `KEY\0value\0`
-# pair per 256-byte-aligned slot (245 of 245 clean instances matched
-# exactly across 5 real files). A numeric cached float64 array and a
-# second level of the same recursive tagged-object framing are real too
-# but are not decoded here -- see the module/function docstrings below.
+# forms, selected by the entry count at +124. This decodes only the
+# best-validated one: a flat `KEY\0value\0` pair per 256-byte-aligned slot,
+# `+124` of them. A numeric cached float64 array and a second level of the
+# same recursive tagged-object framing are real too but are not decoded
+# here -- see the module/function docstrings below.
 _REG_OBJECT_NAME = b"REG\x00"
 _REG_PREAMBLE_SIZE = 128
+_REG_ENTRY_COUNT_OFFSET = 124
 _REG_FLAT_KV_SLOT_SIZE = 256
 _REG_FLAT_KV_KEY_RE = re.compile(rb"^([A-Z_][A-Z0-9_.]{1,30})\x00")
 # A VV object recurses into a second, named tagged object (docs/provenance/
@@ -317,22 +318,23 @@ def _decode_reg_flat_keyvalues(blob_bytes: bytes) -> Optional[Dict[str, str]]:
         the 128-byte preamble, or its content recurses into a second
         tagged object instead of holding flat slots (see Notes) -- the
         caller should not treat these as "no settings", just "not this
-        form". Otherwise, `{key: value}` for every 256-byte-aligned slot
-        from byte 128 on whose value is non-empty; `{}` is a real result
-        (either a flat object with every key still a bare placeholder --
-        confirmed real for some keys, e.g. `CLASS` -- or a numeric-array
-        object, which looks the same from here: no key-shaped bytes
-        anywhere).
+        form". Otherwise, `{key: value}` for each of the object's
+        declared entries (see Notes) whose value is non-empty. `{}` is a
+        real result: an object with no entries (`+124` is 0), or one
+        whose every key is still a bare placeholder (confirmed real for
+        some keys, e.g. `CLASS`).
 
     Notes
     -----
-    Does not use blob-header `+124` (the object's own declared count of
-    populated keys) to validate the result: `docs/provenance/notes.md`
-    section 6.8c found it unreliable for a real, sizeable minority of
-    instances (garbage in the object's first slot instead of a key,
-    `+124` reading `0` regardless of how many real keyed slots follow) --
-    trusting it would produce false warnings on valid files. Scanning
-    every slot directly, as this does, finds those real keys anyway.
+    The preamble's int32 at `+124` is the number of flat entries, which
+    occupy the first that many 256-byte slots from byte 128
+    (**[CONFIRMED]**: equal to the count of consecutive key slots from
+    slot 0 on 860 of 860 corpus objects; `docs/provenance/notes.md`
+    section 6.8c). Only those slots are read. Key-shaped bytes past
+    them, or in an object whose count is 0, are **[LIKELY]** leftovers of
+    an earlier version of the object. The case seen is a slot 0 whose
+    key has its first 4 bytes zeroed and later slots that still hold
+    old keys. They are not returned.
     """
     if blob_bytes[44:48] != _REG_OBJECT_NAME:
         return None
@@ -341,8 +343,9 @@ def _decode_reg_flat_keyvalues(blob_bytes: bytes) -> Optional[Dict[str, str]]:
     rest = blob_bytes[_REG_PREAMBLE_SIZE:]
     if rest[:8] == _REG_NESTED_VV_MARKER:
         return None
+    n_entries = struct.unpack_from("<i", blob_bytes, _REG_ENTRY_COUNT_OFFSET)[0]
     result: Dict[str, str] = {}
-    for i in range(0, len(rest), _REG_FLAT_KV_SLOT_SIZE):
+    for i in range(0, min(max(n_entries, 0) * _REG_FLAT_KV_SLOT_SIZE, len(rest)), _REG_FLAT_KV_SLOT_SIZE):
         slot = rest[i:i + _REG_FLAT_KV_SLOT_SIZE]
         m = _REG_FLAT_KV_KEY_RE.match(slot)
         if not m:

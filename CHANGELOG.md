@@ -21,7 +21,9 @@ from there.
   real, are not decoded yet). Each registry object is attributed to its
   channel through the object's own name in the blob-symbol table, which
   carries the channel's symbol handle. Objects that belong to a line
-  handle, or to nothing recognisable, are left out.
+  handle, or to nothing recognisable, are left out. Only the entries an
+  object declares (its entry count) are read, so leftover bytes from an
+  earlier version of the object are not reported as settings.
 - `pygdb.read_blob_symbols`: the names of a file's live administrative
   objects (`__dbreg`, `Display List`, projection and per-channel registry
   objects), read from the blob-symbol table after the blob directory.

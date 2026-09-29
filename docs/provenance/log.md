@@ -3767,3 +3767,44 @@ channel attribution, corpus-wide under the handle mapping
 The new finding is that population is strongly per-file. `LABEL` is filled
 on every object in six files and on none in four, which suggests the
 writing tool. Recorded in notes section 6.8c.
+
+**Follow-up: the flat-vs-nested selector, re-tested with the correct
+owner ("Can you test now what selects flat vs nested content").**
+Classified every `REG` object's content against the owner its blob
+symbol names (`selector.py`..`selector5.py`).
+
+1. **Every nested object is a `MAKER` record.** 24 of 24, all on channel
+   handles, naming the creating GX (`newchan.gx` 20, `linechan.gx` 4).
+   Every live `__<n>` handle names exactly one object (1,109 of 1,109).
+2. **Many "numeric" objects were really flat objects with slot 0's first
+   4 bytes zeroed.** 107 of 110 tails equal a known key minus its first
+   4 characters (`S`, `L`, `ULA`, `DATUM_TRANSFORM`, `HAN_X`). This
+   explains the Session 10 "dirty slot 0" byte as the key's 5th
+   character.
+3. **Preamble `+124` is the selector.** It is non-zero on exactly the 860
+   objects whose `+128` starts a key. There it equals the count of
+   consecutive key slots from slot 0 (860 of 860). It is zero on all 898
+   others, where `+128` is `1` + `ff 00 f0 0f` for the nested `MAKER` form
+   (24) and `0` otherwise.
+4. **Line-handle objects are never clean flat or nested.** They are only
+   empty, binary, or zeroed-key objects.
+
+Reading: an object rewritten with zero entries keeps its old bytes past
+the header, and 8 objects also carry key slots past their count.
+`find_channel_settings` currently returns keys from 7 channel-owned
+`+124 = 0` objects and from those surplus slots -- not changed yet,
+reported to the user. Recorded in notes section 6.8c and spec section 9.
+
+**Follow-up: the reader honours `+124` ("yes").**
+`_decode_reg_flat_keyvalues` now reads only the first `+124` slots; a
+count of 0 means no flat entries. Test fixtures write the count, and two
+new tests cover the real leftover shapes. Corpus effect on
+`channel_settings`:
+
+- `AG106386` 7 → 4 channels, `DB_EM_293` 4 → 2, `SAMAGEM_CDI` 10 → 5
+  (its 6 conflicting-value warnings gone); label oracle unchanged at
+  111/10.
+- Every dropped `_PJ_*` entry had sat on a non-coordinate channel. After
+  the change, projection keys appear only on real coordinate pairs. That
+  resolves the Session 11 "orphaned handle" caveat as leftover slots, and
+  independently supports reading the dropped bytes as stale.
