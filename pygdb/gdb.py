@@ -38,7 +38,7 @@ from .gdb_reader import (
     DIRECTORY_INVALID,
     DIRECTORY_LIVE,
 )
-from .registry import find_channel_roles, find_coordinate_systems
+from .registry import find_channel_roles, find_channel_settings, find_coordinate_systems
 
 # docs/spec.md section 7
 _DB_COMP_NAMES = {
@@ -184,6 +184,7 @@ class GDB:
         self._blob_index: Optional[Dict[Tuple[int, int], BlobHeader]] = None
         self._coordinate_systems: Optional[List[str]] = None
         self._coordinate_channels: Optional[Dict[str, Optional[str]]] = None
+        self._channel_settings: Optional[Dict[str, Dict[str, str]]] = None
 
     def __repr__(self) -> str:
         return f"GDB({self.path!r})"
@@ -272,6 +273,26 @@ class GDB:
                 channel_names=self.channel_names,
             )
         return self._coordinate_channels
+
+    @property
+    def channel_settings(self) -> Dict[str, Dict[str, str]]:
+        """
+        dict of {str : dict of {str : str}}: Real per-channel settings
+        recorded in this file's own internal registry
+        (docs/provenance/notes.md section 6.8c), e.g. `{"raw_mag":
+        {"UNITS": "nT"}, ...}`. Only a channel with at least one
+        populated registry key is present; most real files have none for
+        most channels -- see `pygdb.registry.find_channel_settings` for
+        what is and isn't decoded (the flat key/value registry form
+        only, not a cached numeric array or a nested tagged sub-object).
+        """
+        if self._channel_settings is None:
+            max_real_line_slot = max((line.index for line in self.lines), default=-1)
+            self._channel_settings = find_channel_settings(
+                self.path, max_real_line_slot=max_real_line_slot,
+                channels=self.channels,
+            )
+        return self._channel_settings
 
     # -- channels / lines ----------------------------------------------------
 

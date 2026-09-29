@@ -52,9 +52,13 @@ them.
 
 ::: pygdb.GrdHeader
 
-## Coordinate-system registry
+## Registry
 
 ::: pygdb.find_coordinate_systems
+
+::: pygdb.find_channel_roles
+
+::: pygdb.find_channel_settings
 
 ## Warnings and errors
 

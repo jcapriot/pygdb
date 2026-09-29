@@ -4,6 +4,8 @@ Unit tests for the pygdb.GDB high-level facade.
 
 from __future__ import annotations
 
+import struct
+
 import numpy as np
 import numpy.testing as npt
 import pytest
@@ -11,8 +13,8 @@ import pytest
 from pygdb import GDB
 
 from helpers import (
-    ChannelSpec, LineSpec, build_gdb_bytes, build_real_layout_gdb_bytes, pack_line_record,
-    pack_plain_blob,
+    BLOB_MAGIC, ChannelSpec, LineSpec, build_gdb_bytes, build_real_layout_gdb_bytes,
+    pack_line_record, pack_plain_blob,
 )
 
 CHANNELS = [
@@ -94,6 +96,40 @@ def test_gdb_coordinate_channels_all_none_when_no_registry_present(db):
     contract as `coordinate_systems`.
     """
     assert db.coordinate_channels == {"X": None, "Y": None, "Z": None}
+
+
+def test_gdb_channel_settings_empty_when_no_registry_present(db):
+    assert db.channel_settings == {}
+
+
+def _inject_reg_flat_kv_blob(data: bytes, blob_index: int, key: str, value: str, page_size: int) -> bytes:
+    """A REG object's flat key/value form (docs/provenance/notes.md
+    section 6.8c), minimal single-key version for GDB-level tests -- see
+    tests/test_registry.py's own fuller helper for the byte layout."""
+    n_pages = max(1, -(-384 // page_size))  # 128-byte preamble + one 256-byte slot
+    blob = bytearray(n_pages * page_size)
+    blob[0:4] = BLOB_MAGIC
+    struct.pack_into("<i", blob, 4, n_pages)
+    struct.pack_into("<i", blob, 8, n_pages)
+    struct.pack_into("<i", blob, 12, blob_index)
+    blob[44:48] = b"REG\x00"
+    slot = key.encode("ascii") + b"\x00" + value.encode("ascii") + b"\x00"
+    blob[128:128 + len(slot)] = slot
+    return bytes(data) + bytes(blob)
+
+
+def test_gdb_channel_settings_reflects_real_registry_content_and_is_cached(tmp_path):
+    page_size = 512
+    data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
+    admin_slot = 50 * len(CHANNELS) + 1  # channel_slot 1 = Easting
+    data = _inject_reg_flat_kv_blob(data, admin_slot, "UNITS", "m", page_size)
+    path = tmp_path / "settings.gdb"
+    path.write_bytes(data)
+    db = GDB(str(path))
+
+    first = db.channel_settings
+    assert first == {"Easting": {"UNITS": "m"}}
+    assert db.channel_settings is first  # cached, not recomputed
 
 
 def test_gdb_channels_on_line_reflects_sparse_grid(db):

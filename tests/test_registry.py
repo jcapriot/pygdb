@@ -5,12 +5,15 @@ using a hand-built administrative blob rather than a real file.
 
 from __future__ import annotations
 
+import math
+import struct
+
 import pytest
 
-from pygdb.gdb_reader import GDBParseWarning
-from pygdb.registry import find_channel_roles, find_coordinate_systems
+from pygdb.gdb_reader import GDBParseWarning, read_channels
+from pygdb.registry import find_channel_roles, find_channel_settings, find_coordinate_systems
 
-from helpers import ChannelSpec, LineSpec, build_gdb_bytes, pack_plain_blob
+from helpers import BLOB_MAGIC, ChannelSpec, LineSpec, build_gdb_bytes, pack_plain_blob
 
 
 def _inject_ipj_blob(data: bytes, blob_index: int, projection_name: str, page_size: int) -> bytes:
@@ -200,3 +203,180 @@ def test_find_channel_roles_bad_magic_returns_all_none(tmp_path):
     path.write_bytes(b"NOPE" + b"\x00" * 60)
     with pytest.warns(GDBParseWarning):
         assert find_channel_roles(str(path)) == {"X": None, "Y": None, "Z": None}
+
+
+# -- find_channel_settings (docs/provenance/notes.md section 6.8c) ----------
+
+
+def _inject_reg_flat_kv_blob(data: bytes, blob_index: int, keyvalues: dict, page_size: int) -> bytes:
+    """
+    Append one administrative blob shaped like a real REG object's flat
+    key/value form (docs/provenance/notes.md section 6.8c): the plain
+    48-byte blob header with `b"REG\\x00"` at its own type-code field
+    (+44), then one `KEY\\0value\\0` pair per 256-byte-aligned slot from
+    byte 128. Deliberately doesn't reproduce the real preamble's other
+    constant fields (+60, +92, ...) -- `find_channel_settings` doesn't
+    read them, and this should exercise exactly what it does check.
+
+    Built directly (not via `pack_plain_blob`, which sizes itself from
+    encoded *values*, not a fixed byte layout like this one) so `n_pages`
+    is correct for the file's real page size regardless of how many
+    key/value slots are requested.
+    """
+    n_slots = max(len(keyvalues), 1)
+    body_size = 128 + 256 * n_slots
+    n_pages = max(1, math.ceil(body_size / page_size))
+    blob = bytearray(n_pages * page_size)
+    blob[0:4] = BLOB_MAGIC
+    struct.pack_into("<i", blob, 4, n_pages)
+    struct.pack_into("<i", blob, 8, n_pages)
+    struct.pack_into("<i", blob, 12, blob_index)
+    blob[44:48] = b"REG\x00"
+    for i, (key, value) in enumerate(keyvalues.items()):
+        slot_start = 128 + 256 * i
+        slot = key.encode("ascii") + b"\x00" + value.encode("ascii") + b"\x00"
+        blob[slot_start:slot_start + len(slot)] = slot
+    return bytes(data) + bytes(blob)
+
+
+def _inject_reg_numeric_array_blob(data: bytes, blob_index: int, page_size: int) -> bytes:
+    """A REG object whose VV holds a flat cached numeric array instead of
+    key/value slots (docs/provenance/notes.md section 6.8c) -- no
+    key-shaped bytes anywhere, so `find_channel_settings` must not
+    mistake it for the flat form."""
+    values = struct.pack("<10d", *([1.5] * 10))
+    n_pages = max(1, math.ceil((128 + len(values)) / page_size))
+    blob = bytearray(n_pages * page_size)
+    blob[0:4] = BLOB_MAGIC
+    struct.pack_into("<i", blob, 4, n_pages)
+    struct.pack_into("<i", blob, 8, n_pages)
+    struct.pack_into("<i", blob, 12, blob_index)
+    blob[44:48] = b"REG\x00"
+    blob[128:128 + len(values)] = values
+    return bytes(data) + bytes(blob)
+
+
+def _inject_reg_nested_object_blob(data: bytes, blob_index: int, page_size: int) -> bytes:
+    """A REG object whose VV recurses into a second tagged object
+    (docs/provenance/notes.md section 6.8c, the "MAKER" -> "MAKE"
+    example) instead of holding flat slots -- `find_channel_settings`
+    must recognize and skip this, not decode it as flat key/value."""
+    n_pages = max(1, math.ceil(160 / page_size))
+    blob = bytearray(n_pages * page_size)
+    blob[0:4] = BLOB_MAGIC
+    struct.pack_into("<i", blob, 4, n_pages)
+    struct.pack_into("<i", blob, 8, n_pages)
+    struct.pack_into("<i", blob, 12, blob_index)
+    blob[44:48] = b"REG\x00"
+    blob[128:136] = b"\x01\x00\x00\x00" + bytes.fromhex("ff00f00f")
+    return bytes(data) + bytes(blob)
+
+
+SETTINGS_CHANNELS = [ChannelSpec("raw_mag", dtype_code=5), ChannelSpec("Easting", dtype_code=5)]
+SETTINGS_LINES = [LineSpec("L100", data={"raw_mag": [1.0], "Easting": [2.0]})]
+
+
+def test_find_channel_settings_extracts_flat_keyvalues(tmp_path):
+    page_size = 512
+    data = build_gdb_bytes(SETTINGS_CHANNELS, SETTINGS_LINES, page_size=page_size)
+    admin_slot = 50 * len(SETTINGS_CHANNELS)  # channel_slot 0 = raw_mag
+    data = _inject_reg_flat_kv_blob(data, admin_slot, {"UNITS": "nT", "LABEL": "Raw magnetics"}, page_size)
+    path = tmp_path / "settings.gdb"
+    path.write_bytes(data)
+
+    settings = find_channel_settings(str(path))
+    assert settings == {"raw_mag": {"UNITS": "nT", "LABEL": "Raw magnetics"}}
+
+
+def test_find_channel_settings_skips_a_key_with_an_empty_value(tmp_path):
+    """A real, confirmed case (section 6.8c): some keys (e.g. `CLASS`) are
+    always a bare placeholder with no value in every real instance."""
+    page_size = 512
+    data = build_gdb_bytes(SETTINGS_CHANNELS, SETTINGS_LINES, page_size=page_size)
+    admin_slot = 50 * len(SETTINGS_CHANNELS)
+    data = _inject_reg_flat_kv_blob(data, admin_slot, {"CLASS": "", "UNITS": "m"}, page_size)
+    path = tmp_path / "settings.gdb"
+    path.write_bytes(data)
+
+    assert find_channel_settings(str(path)) == {"raw_mag": {"UNITS": "m"}}
+
+
+def test_find_channel_settings_ignores_a_numeric_array_object(tmp_path):
+    page_size = 512
+    data = build_gdb_bytes(SETTINGS_CHANNELS, SETTINGS_LINES, page_size=page_size)
+    admin_slot = 50 * len(SETTINGS_CHANNELS)
+    data = _inject_reg_numeric_array_blob(data, admin_slot, page_size)
+    path = tmp_path / "settings.gdb"
+    path.write_bytes(data)
+
+    assert find_channel_settings(str(path)) == {}
+
+
+def test_find_channel_settings_ignores_a_nested_object(tmp_path):
+    page_size = 512
+    data = build_gdb_bytes(SETTINGS_CHANNELS, SETTINGS_LINES, page_size=page_size)
+    admin_slot = 50 * len(SETTINGS_CHANNELS)
+    data = _inject_reg_nested_object_blob(data, admin_slot, page_size)
+    path = tmp_path / "settings.gdb"
+    path.write_bytes(data)
+
+    assert find_channel_settings(str(path)) == {}
+
+
+def test_find_channel_settings_last_wins_and_warns_when_values_disagree(tmp_path):
+    """This format's append-only storage can leave stale, differing copies
+    of the same registry key -- the same phenomenon `find_channel_roles`
+    handles for DB_CHAN_X/Y/Z (section 6.8b)."""
+    page_size = 512
+    data = build_gdb_bytes(SETTINGS_CHANNELS, SETTINGS_LINES, page_size=page_size)
+    cm = len(SETTINGS_CHANNELS)
+    data = _inject_reg_flat_kv_blob(data, 50 * cm, {"UNITS": "nT"}, page_size)
+    data = _inject_reg_flat_kv_blob(data, 51 * cm, {"UNITS": "gamma"}, page_size)
+    path = tmp_path / "settings.gdb"
+    path.write_bytes(data)
+
+    with pytest.warns(GDBParseWarning, match=r"raw_mag.*UNITS"):
+        settings = find_channel_settings(str(path))
+    assert settings == {"raw_mag": {"UNITS": "gamma"}}  # last in chain order
+
+
+def test_find_channel_settings_silent_when_duplicate_values_agree(tmp_path):
+    page_size = 512
+    data = build_gdb_bytes(SETTINGS_CHANNELS, SETTINGS_LINES, page_size=page_size)
+    cm = len(SETTINGS_CHANNELS)
+    data = _inject_reg_flat_kv_blob(data, 50 * cm, {"UNITS": "nT"}, page_size)
+    data = _inject_reg_flat_kv_blob(data, 51 * cm, {"UNITS": "nT"}, page_size)
+    path = tmp_path / "settings.gdb"
+    path.write_bytes(data)
+
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        settings = find_channel_settings(str(path))
+    assert settings == {"raw_mag": {"UNITS": "nT"}}
+
+
+def test_find_channel_settings_ignores_a_channel_slot_with_no_real_channel(tmp_path):
+    """
+    `channel_slot` is a physical channel-table slot, not itself validated
+    against which slots are actually real, current channels -- a caller
+    that already has a narrower/different channel list (e.g. after some
+    channels were dropped) should get that respected, not have every
+    slot number assumed real.
+    """
+    page_size = 512
+    data = build_gdb_bytes(SETTINGS_CHANNELS, SETTINGS_LINES, page_size=page_size)
+    cm = len(SETTINGS_CHANNELS)
+    data = _inject_reg_flat_kv_blob(data, 50 * cm + 1, {"UNITS": "nT"}, page_size)  # channel_slot 1 = Easting
+    path = tmp_path / "settings.gdb"
+    path.write_bytes(data)
+
+    only_raw_mag = [c for c in read_channels(str(path)) if c.name == "raw_mag"]
+    assert find_channel_settings(str(path), channels=only_raw_mag) == {}
+
+
+def test_find_channel_settings_bad_magic_returns_empty(tmp_path):
+    path = tmp_path / "not_a_gdb.gdb"
+    path.write_bytes(b"NOPE" + b"\x00" * 60)
+    with pytest.warns(GDBParseWarning):
+        assert find_channel_settings(str(path)) == {}

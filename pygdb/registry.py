@@ -1,6 +1,7 @@
 """
-Best-effort extraction of coordinate-system (map projection) names from a
-`.gdb` file's REG/IPJ "reserved/administrative" blob region.
+Best-effort extraction of coordinate-system names, channel coordinate
+roles, and per-channel registry settings from a `.gdb` file's REG/IPJ
+"reserved/administrative" blob region.
 
 [CONFIRMED] present and real on every one of 3 independent agencies this
 project has files from; [UNKNOWN] full binary framing beyond the specific
@@ -29,6 +30,7 @@ import warnings
 from typing import Dict, Iterable, List, Optional
 
 from .gdb_reader import (
+    ChannelRecord,
     GDBParseWarning,
     check_magic,
     header_fields,
@@ -270,3 +272,216 @@ def find_channel_roles(
         else:
             roles[role] = next(iter(valid), None)
     return roles
+
+
+# The REG object's own binary framing (docs/provenance/notes.md section
+# 6.8c): a fixed 128-byte preamble (48-byte blob header with the object's
+# own name -- "REG\0" here -- in place of a GS_* type code, then 80 more
+# bytes of nested-tag framing), after which the content is one of three
+# forms. This decodes only the best-validated one: a flat `KEY\0value\0`
+# pair per 256-byte-aligned slot (245 of 245 clean instances matched
+# exactly across 5 real files). A numeric cached float64 array and a
+# second level of the same recursive tagged-object framing are real too
+# but are not decoded here -- see the module/function docstrings below.
+_REG_OBJECT_NAME = b"REG\x00"
+_REG_PREAMBLE_SIZE = 128
+_REG_FLAT_KV_SLOT_SIZE = 256
+_REG_FLAT_KV_KEY_RE = re.compile(rb"^([A-Z_][A-Z0-9_.]{1,30})\x00")
+# A VV object recurses into a second, named tagged object (docs/provenance/
+# notes.md section 6.8c, the "MAKER" -> "MAKE" example) instead of holding
+# flat slots; its content starts with this same shape as the outer object's
+# own header. Recognizing it here is just so it isn't mistaken for the flat
+# form -- its own content isn't decoded.
+_REG_NESTED_VV_MARKER = b"\x01\x00\x00\x00" + bytes.fromhex("ff00f00f")
+
+
+def _decode_reg_flat_keyvalues(blob_bytes: bytes) -> Optional[Dict[str, str]]:
+    """
+    Decode one administrative blob's flat `KEY\\0value\\0` registry entries.
+
+    Parameters
+    ----------
+    blob_bytes : bytes
+        The blob's own bytes, starting at its `CC CC 00 FF` magic.
+
+    Returns
+    -------
+    dict of {str : str} or None
+        `None` if this isn't a `REG` object at all, or is too short for
+        the 128-byte preamble, or its content recurses into a second
+        tagged object instead of holding flat slots (see Notes) -- the
+        caller should not treat these as "no settings", just "not this
+        form". Otherwise, `{key: value}` for every 256-byte-aligned slot
+        from byte 128 on whose value is non-empty; `{}` is a real result
+        (either a flat object with every key still a bare placeholder --
+        confirmed real for some keys, e.g. `CLASS` -- or a numeric-array
+        object, which looks the same from here: no key-shaped bytes
+        anywhere).
+
+    Notes
+    -----
+    Does not use blob-header `+124` (the object's own declared count of
+    populated keys) to validate the result: `docs/provenance/notes.md`
+    section 6.8c found it unreliable for a real, sizeable minority of
+    instances (garbage in the object's first slot instead of a key,
+    `+124` reading `0` regardless of how many real keyed slots follow) --
+    trusting it would produce false warnings on valid files. Scanning
+    every slot directly, as this does, finds those real keys anyway.
+    """
+    if blob_bytes[44:48] != _REG_OBJECT_NAME:
+        return None
+    if len(blob_bytes) < _REG_PREAMBLE_SIZE:
+        return None
+    rest = blob_bytes[_REG_PREAMBLE_SIZE:]
+    if rest[:8] == _REG_NESTED_VV_MARKER:
+        return None
+    result: Dict[str, str] = {}
+    for i in range(0, len(rest), _REG_FLAT_KV_SLOT_SIZE):
+        slot = rest[i:i + _REG_FLAT_KV_SLOT_SIZE]
+        m = _REG_FLAT_KV_KEY_RE.match(slot)
+        if not m:
+            continue
+        value_start = m.end()
+        end = slot.find(b"\x00", value_start)
+        if end == -1:
+            continue  # truncated read -- the value ran past the slot
+        value = slot[value_start:end].decode("ascii", errors="replace")
+        if value:
+            result[m.group(1).decode("ascii")] = value
+    return result
+
+
+def find_channel_settings(
+    path: str,
+    max_real_line_slot: Optional[int] = None,
+    channels: Optional[Iterable[ChannelRecord]] = None,
+) -> Dict[str, Dict[str, str]]:
+    """
+    Scan `path` for real per-channel settings recorded in its REG registry.
+
+    Reads the same "REG "-tagged administrative-blob content
+    `find_coordinate_systems`/`find_channel_roles` already scan, but
+    decodes its flat key/value framing directly (docs/provenance/notes.md
+    section 6.8c) instead of searching for one specific marker -- so this
+    surfaces whatever real settings a channel's REG entries happen to
+    carry: real per-channel display units (`UNITS`), real user-entered
+    processing labels (`LABEL`), real processing formulas (`FORMULA`),
+    among others (docs/spec.md section 9 has the cross-validated evidence
+    for what these keys mean in practice).
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file to scan.
+    max_real_line_slot : int, optional
+        See `find_coordinate_systems` -- same meaning and same
+        "pass it if you already have it" reasoning.
+    channels : iterable of ChannelRecord, optional
+        The file's own real channel table, used to resolve a registry
+        entry's `channel_slot` (`BlobHeader.line_channel`) to a real
+        channel name. If not given, this calls `read_channels(path)`
+        itself (an extra table scan) -- pass `db.channels` if the caller
+        already has it.
+
+    Returns
+    -------
+    dict of {str : dict of {str : str}}
+        `{channel_name: {key: value, ...}, ...}` -- only for a channel
+        with at least one populated key found in its own REG entries; a
+        channel with none (no REG entry at all, or entries that are all
+        bare placeholders, or a numeric-array/nested-object entry -- see
+        Notes) is simply absent, not mapped to `{}`.
+
+    Warns
+    -----
+    GDBParseWarning
+        If `path` doesn't start with the expected magic, or its header
+        is too short to read `chans_max`/`page_size` -- fails gracefully
+        like the sibling functions, returning `{}` rather than raising.
+        Also raised, once per `(channel, key)` pair, if two or more of a
+        channel's REG entries give *different* non-empty values for the
+        same key -- the last one in blob-chain order is kept, but this is
+        never decided silently.
+
+    Notes
+    -----
+    **Only the flat `KEY\\0value\\0` form is decoded** (see
+    `_decode_reg_flat_keyvalues`) -- a channel whose only REG content is
+    a cached numeric array or a second level of nested tagged objects
+    (both real, confirmed forms, docs/provenance/notes.md section 6.8c)
+    contributes nothing here, not because it truly has no settings but
+    because that form isn't decoded yet. Which keys are meaningful for a
+    given channel is not itself decoded from anything -- only the keys a
+    real file happens to have written are returned.
+
+    A channel can have more than one administrative REG entry (a
+    different out-of-range `line_slot` per tool run that touched it), and
+    this format's append-only storage can leave stale, differing copies
+    of the same key even within one entry (the same phenomenon
+    `find_channel_roles` handles for `DB_CHAN_X/Y/Z` and issue #2's data
+    blobs) -- every occurrence found across every entry is collapsed per
+    key, last one in blob-chain order wins, with a warning only when two
+    real occurrences actually disagree.
+    """
+    with open(path, "rb") as f:
+        header = f.read(128)
+    if not check_magic(header):
+        _warn(f"{path}: does not start with the expected '!CBD' magic -- "
+              f"no channel settings")
+        return {}
+    fields = header_fields(header)
+    chans_max = fields["chans_max"]
+    page_size = fields["page_size"]
+    if chans_max is None or not page_size:
+        _warn(f"{path}: header too short to read chans_max/page_size -- "
+              f"no channel settings")
+        return {}
+
+    if max_real_line_slot is None:
+        lines = read_lines(path)
+        max_real_line_slot = max((line.index for line in lines), default=-1)
+
+    if channels is None:
+        channels = read_channels(path)
+    channel_names = {c.index: c.name for c in channels}
+
+    # {channel_slot: {key: [value, ...]}}, in blob-chain order.
+    candidates: Dict[int, Dict[str, List[str]]] = {}
+    with open(path, "rb") as f:
+        for blob in iter_blobs(path):
+            line_slot, channel_slot = blob.line_channel(chans_max)
+            if line_slot <= max_real_line_slot:
+                continue  # a real survey line's data, not administrative metadata
+            if channel_slot not in channel_names:
+                continue  # not a real, current channel -- nothing to attach this to
+            f.seek(blob.offset)
+            # Same "read the blob's own full declared extent, capped" approach
+            # as find_channel_roles, for the same reason: a real key has been
+            # found tens of kilobytes into a real blob, well past any small
+            # fixed-size probe.
+            blob_size = min(blob.n_pages * page_size, 50_000_000)
+            chunk = f.read(blob_size)
+            kv = _decode_reg_flat_keyvalues(chunk)
+            if not kv:
+                continue
+            by_key = candidates.setdefault(channel_slot, {})
+            for key, value in kv.items():
+                by_key.setdefault(key, []).append(value)
+
+    settings: Dict[str, Dict[str, str]] = {}
+    for channel_slot, by_key in candidates.items():
+        name = channel_names[channel_slot]
+        resolved: Dict[str, str] = {}
+        for key, values in by_key.items():
+            distinct = set(values)
+            if len(distinct) > 1:
+                _warn(
+                    f"{path}: channel {name!r} has {len(distinct)} different "
+                    f"values for registry key {key!r} across stale/duplicate "
+                    f"entries ({sorted(distinct)!r}) -- using the last one in "
+                    f"blob-chain order"
+                )
+            resolved[key] = values[-1]
+        if resolved:
+            settings[name] = resolved
+    return settings

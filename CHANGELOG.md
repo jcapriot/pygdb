@@ -8,6 +8,20 @@ minor releases may change behavior, patch releases fix bugs).
 The version number lives in `rust/Cargo.toml`; `pyproject.toml` reads it
 from there.
 
+## [Unreleased]
+
+### Added
+
+- `pygdb.registry.find_channel_settings` / `GDB.channel_settings`: real
+  per-channel settings recorded in a file's own REG registry -- units,
+  labels, processing formulas, and whatever else a real file happens to
+  have written -- decoded from the registry's flat key/value binary
+  framing rather than searched for by marker. Covers that one framing
+  form only (a cached numeric array or a nested tagged sub-object, both
+  real, are not decoded yet).
+- `pygdb.find_channel_roles` is now re-exported at the top level (it was
+  previously only reachable via `pygdb.registry.find_channel_roles`).
+
 ## [0.3.0] - 2026-09-26
 
 ### Changed

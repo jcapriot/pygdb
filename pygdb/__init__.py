@@ -35,7 +35,7 @@ from .gdb_reader import (
 )
 from .grd_reader import GrdHeader, GRDParseWarning, read_grd
 from .lzrw1 import LZRW1DecodeError
-from .registry import find_coordinate_systems
+from .registry import find_channel_roles, find_channel_settings, find_coordinate_systems
 
 __all__ = [
     "GDB",
@@ -51,6 +51,8 @@ __all__ = [
     "check_magic",
     "exact_line_table_start",
     "find_blob",
+    "find_channel_roles",
+    "find_channel_settings",
     "find_channel_table",
     "find_coordinate_systems",
     "find_line_table",

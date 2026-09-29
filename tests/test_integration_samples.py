@@ -55,6 +55,38 @@ def test_every_real_file_parses_without_exception(all_gdb_sample_paths):
     assert not failures, "\n".join(failures)
 
 
+def test_channel_settings_runs_cleanly_on_every_real_file(all_gdb_sample_paths):
+    """
+    `find_channel_settings` (docs/provenance/notes.md section 6.8c) is
+    the newest, least-tested-in-the-wild registry function -- sweep the
+    whole corpus to catch anything the synthetic fixtures in
+    tests/test_registry.py can't (an unexpected real byte layout).
+    """
+    failures = []
+    for path in all_gdb_sample_paths:
+        try:
+            GDB(path).channel_settings
+        except Exception as e:  # noqa: BLE001 -- deliberately broad, this is a corpus sweep
+            failures.append(f"{_basename(path)}: {e!r}")
+    assert not failures, "\n".join(failures)
+
+
+def test_channel_settings_matches_known_real_values(samples_dir):
+    """
+    Cross-checked against this session's own by-hand decode
+    (docs/provenance/notes.md section 6.8/6.8c): `ch_11`'s real
+    `FORMULA` and `base`'s real provenance `LABEL` are both already on
+    record there, found independently before `find_channel_settings`
+    existed.
+    """
+    path = os.path.join(samples_dir, "usgs_mojave_2020", "Magnetic_Data.gdb")
+    if not os.path.exists(path):
+        pytest.skip("Magnetic_Data.gdb not present locally")
+    settings = GDB(path).channel_settings
+    assert settings["ch_11"]["FORMULA"] == "time(hh,mm,ss)"
+    assert settings["base"]["LABEL"] == r"Source: .\delete.gdb"
+
+
 def test_every_real_file_has_reg_or_ipj_content(all_gdb_sample_paths):
     """
     Regression test for the correction in docs/spec.md section 9: an

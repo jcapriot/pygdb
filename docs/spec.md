@@ -925,6 +925,16 @@ on every agency checked:
   `pygdb.registry.find_channel_roles` / `GDB.coordinate_channels`, and
   used by `GDB.to_geoh5` to pick each line's coordinate channels
   automatically wherever the registry confirms them.
+- **Real per-channel settings beyond the coordinate roles** — `UNITS`,
+  `LABEL`, `FORMULA`, the `_PJ_*` projection fields, and whatever else a
+  real file happens to have written — are decoded the same way, by
+  reading the `"REG "` object's flat key/value framing directly
+  (`provenance/notes.md` §6.8c) rather than searching for one specific
+  marker. **[CONFIRMED]** for the framing (245 of 245 clean instances
+  match exactly, §6.8c); covers only the flat key/value content form, not
+  a cached numeric array or a nested tagged sub-object (also real, not
+  yet decoded). Implemented as `pygdb.registry.find_channel_settings` /
+  `GDB.channel_settings`.
 
 **Correction — actually [CONFIRMED] universal across all 22 real files,
 not the patterned absence previously documented here.** An earlier
