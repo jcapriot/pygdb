@@ -3434,3 +3434,59 @@ decoded structure now, superseding "no decoded byte-exact structure, just
 plain string search"). No code changed -- this is investigation only, kept
 out of `pygdb/registry.py` pending a decision on whether a real decoder is
 worth building on top of a structure this partially understood.
+
+## Session 8 -- the IPJ coordinate-system record's fixed byte offsets (2026-09-28)
+
+Prompted by: "Can we push on the Coordinate system meta data?" -- a direct
+follow-up once Session 7's `"REG "` framing made it worth checking whether
+`IPJ` blobs share the same preamble.
+
+1. Dumped a real `IPJ`-tagged blob (`AG106386_...Conductivity.gdb`) and
+   confirmed it shares Session 7's exact 128-byte preamble (the `0xff 0x00
+   0xe1 0x1e` constant, the `0x00 0x1a 0xcc 0xff` separator, at the identical
+   offsets). A second nested tag was found at +112, after the already-known
+   `" JPI"` name marker at +96 -- a 4-byte FourCC abbreviation of the grid
+   system (`" UTM"`, `"MGA "`), not decoded further.
+2. Field-by-field dumped the content past +128 and searched every real IPJ
+   blob (>=640 bytes) across 5 files/3 agencies for each file's own
+   independently-known real geodetic constants' exact float64 bit patterns.
+   All landed at **the same absolute byte offset in every instance**: datum
+   name +180, ellipsoid name +244, semi-major axis +308, eccentricity +316,
+   central meridian +596, scale +620, false easting +628, false northing
+   +636 -- 30 of 30 real instances, GSQ/Ontario/USGS all agreeing, replacing
+   the previous "consecutive small byte deltas" description with exact
+   offsets (NOTES.md section 6.7b).
+3. Two more float64 slots (+604, +612) sit between central meridian and
+   scale; every one of the 30 instances reads exactly the vendor's `rDUMMY`
+   sentinel (-1e32) there -- real fields, never seen populated.
+4. What first looked like the offset hypothesis failing on `MLMAG.gdb`'s and
+   `Magnetic_Data.gdb`'s minor IPJ objects (ellipsoid-only, no projection)
+   turned out to be the same dummy-value convention correctly marking "no
+   projection defined" at +596 onward -- a confirmation, not a gap.
+5. The datum-transformation name (`"GDA94 to WGS 84 (1)"` etc.) at first
+   appeared to sit at +332 on 11 of 11 GSQ instances but not on the
+   Ontario/USGS files checked -- looked like a real agency difference and
+   was briefly written up as one.
+6. Reinforced (not newly found) the existing note on serialized in-memory
+   pointers: +136..+176 reads as classic Windows x64 pointer shapes
+   (0x00007ffd...) on more than one real instance dumped this round.
+7. Kept pushing (user: "sure keep pushing"). Checked +604/+612 across the
+   *whole* 22-file corpus, not just 5 files: 63 of 63 real instances, still
+   always the dummy -- a stronger negative result, not a new one.
+8. **Caught and fixed a real mistake from step 5.** Dumped the raw bytes at
+   +332 directly on the exact Ontario/USGS blobs step 5 said didn't have it
+   there -- they did: `"NAD83 to WGS 84 (1)"` right at +332, byte for byte.
+   Step 5's test had aggregated hits from 3 files into one counter and
+   silently lost the Ontario/USGS ones, a script bug, not a format
+   difference. Re-verified properly (explicit per-blob check, whole
+   corpus): 36 of 36 real instances that define a transform have it at
+   +332, all 3 agencies, zero exceptions. Corrected NOTES.md section 6.7b
+   and docs/spec.md section 8 rather than leaving the wrong claim standing.
+
+**What it changes.** `docs/spec.md` section 8: the vague "consecutive small
+byte deltas" description is replaced with an exact offset table, all
+[CONFIRMED] (including +332, corpus-wide, after the step-8 correction)
+except +604/+612 (structure confirmed on the whole corpus, meaning still
+open). No code changed -- investigation only, same
+disposition as section 6.8c: not wired into `pygdb/registry.py` pending a
+decision on whether a decoder is worth building on it.

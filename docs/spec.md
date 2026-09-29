@@ -746,8 +746,10 @@ actually compressed with it.
 
 ## 8. Coordinate-system (IPJ) metadata
 
-**[CONFIRMED]** located; **[UNKNOWN]** for the full record format.
-`provenance/notes.md` §6.7.
+**[CONFIRMED]** located, and — since this session's `"REG "` framing
+work carried over directly — **[CONFIRMED]** for the fixed geodetic
+parameter and name offsets too, on 3 independent agencies. `provenance/
+notes.md` §6.7, §6.7b.
 
 Per-database map-projection metadata is **not** a separate structure —
 it lives inside the same "reserved/administrative blob" mechanism
@@ -756,6 +758,59 @@ addressed with an out-of-range `line_slot` (values in the low
 thousands — `1000`–`1002` and `2000` seen in real files) that acts as
 a namespace for non-survey-data metadata rather than real per-line
 data.
+
+**An `IPJ` blob shares the exact same 128-byte preamble as a `REG` blob
+(§9)** — the `0xff 0x00 0xe1 0x1e` constant, the `0x00 0x1a 0xcc 0xff`
+separator, all at the identical offsets — confirmed on every `IPJ`
+instance checked. Where `REG`'s first nested tag is `"REG "`, `IPJ`'s is
+the already-known `" JPI"` name marker; a **second** nested tag follows
+it at `+112`, a 4-byte, space-padded, FourCC-style abbreviation of the
+projection's grid system (`" UTM"`, `"MGA "`, and truncated/rotated
+fragments of both seen the same alignment-boundary way as the `"REG"`/
+`"IPJ"` names themselves) — **[LIKELY]**, not decoded further.
+
+**The object's content past the 128-byte preamble is a fixed-offset
+binary record, not the flat key/value form `REG` mostly uses.** Real
+geodetic parameters and names sit at the same absolute byte offset
+(relative to the blob's own start) in every instance checked — first
+confirmed on 30 of 30 real `IPJ` objects across 5 files/3 agencies, then
+verified corpus-wide (63 of 63 real instances, all 22 real files):
+
+| Offset | Field | Confidence |
+|---|---|---|
+| `+180` | Datum name (NUL-terminated ASCII) — `"GDA2020"`, `"WGS 84"`, `"NAD83"`, `"NAD83(CSRS)"` seen | **[CONFIRMED]** |
+| `+244` | Ellipsoid name (NUL-terminated ASCII) — `"GRS 1980"`, `"WGS 84"` seen | **[CONFIRMED]** |
+| `+308` | Semi-major axis, float64 | **[CONFIRMED]** — `6378137.0` exactly, every instance |
+| `+316` | Eccentricity, float64 | **[CONFIRMED]** — matches the ellipsoid at `+244` exactly |
+| `+332` | Datum-transformation name (NUL-terminated ASCII) — `"GDA94 to WGS 84 (1)"`, `"NAD83 to WGS 84 (1)"`, `"NAD83(CSRS98) to WGS 84 (1)"` seen | **[CONFIRMED]** on all 36 of 36 real instances corpus-wide that define one (a datum already stated in WGS 84 has nothing here to name); every one of the 3 agencies agrees |
+| `+596` | Central meridian, float64 | **[CONFIRMED]** |
+| `+604` | Unknown parameter, float64 | **[UNKNOWN]** — the vendor's own `rDUMMY` sentinel (`-1.0e32`, §4) in all 63 of 63 real instances corpus-wide; never seen populated |
+| `+612` | Unknown parameter, float64 | **[UNKNOWN]**, same as `+604` |
+| `+620` | Scale factor, float64 | **[CONFIRMED]** |
+| `+628` | False easting, float64 | **[CONFIRMED]** |
+| `+636` | False northing, float64 | **[CONFIRMED]** |
+
+**A clean, self-consistent confirmation, not a gap:** an `IPJ` object
+that defines only a datum/ellipsoid (no projection) reads the real
+`rDUMMY` sentinel at `+596` onward instead of a real number — the same
+documented dummy-value convention used throughout this format (§4),
+here correctly marking "not a projected system" rather than being
+undecoded garbage.
+
+**Independent ground truth, exactly as before, now pinned to exact
+offsets instead of "consecutive small deltas":** in `AG106386`, the six
+float64 values implied by the paired ASEG-GDF2 `.prj` sidecar's declared
+projection match verbatim at `+308`/`+316`/`+596`/`+620`/`+628`/`+636`.
+The same check against each file's own real, independently-known datum
+holds on Ontario (`MLMAG.gdb`: `NAD83`/`GRS 1980`, central meridian
+`-81`, false northing `0` — the northern-hemisphere UTM convention) and
+USGS (`Magnetic_Data.gdb`: `WGS 84`, central meridian `-117`).
+
+**Real, likely serialized in-memory pointers, seen again in this
+session's dump:** bytes in the `+136..+176` range read as classic
+Windows x64 user-mode pointer shapes (e.g. `0x00007ffd...`) on more than
+one real instance — reinforces, not newly discovers, the existing note
+below.
 
 **Confirmed on 3 independent agencies**, each geographically correct
 for its real survey location:
@@ -771,23 +826,18 @@ tag `" JPI"` (a space plus what's plausibly the tail of the literal
 string `"IPJ"` read across an alignment boundary) followed by an
 `int32` (`1` in every instance seen) and then a NUL-terminated name
 string. **[CONFIRMED]** directly on the working projected-CRS name in
-every file checked; other names in the same blob (ellipsoid,
-datum-transformation) are not individually marked this way.
-
-**Real numeric geodetic parameters, verified against independent
-ground truth, not just plausible magnitudes.** In `AG106386`, the
-exact six float64 values implied by the paired ASEG-GDF2 `.prj`
-sidecar's declared projection (semi-major axis `6378137`, eccentricity
-`0.0818191910428158`, central meridian `141`, scale factor `0.9996`,
-false easting `500000`, false northing `10000000`) were all found
-verbatim, in a sane record shape (central meridian/scale/easting/
-northing at consecutive small byte deltas).
+every file checked.
 
 **What's still open, deliberately not force-completed:**
-- The full byte-for-byte record layout beyond the "JPI+count+name"
-  marker.
-- How multiple sub-objects (projection, ellipsoid, datum
-  transformation) are delimited within one record.
+- What `+604`/`+612` are for — real fields, never once seen populated in
+  63 of 63 real corpus-wide instances (every real projection here is a
+  standard Transverse Mercator/UTM, which doesn't need whatever these
+  hold — plausibly a latitude-of-origin/false-origin pair only a
+  non-UTM projection would populate; untested since none exists in this
+  corpus).
+- What the second nested tag at `+112` (the grid-system abbreviation)
+  is for beyond a display hint, and the exact meaning of the
+  `+136..+176` region.
 - Some byte regions look like raw serialized in-memory pointers
   (Windows x64-pointer-shaped 8-byte values) — plausibly artifacts of
   live-object serialization, not portable data.

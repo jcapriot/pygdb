@@ -2447,6 +2447,93 @@ blobs for the literal string `b'IPJ'`) is straightforward to reproduce
 and is recorded here rather than in a standalone script, since it
 didn't reach a stable, reusable API worth committing.
 
+### 6.7b The IPJ record's fixed byte offsets — [CONFIRMED] on 3 agencies, 63 of 63 real corpus-wide instances
+
+*(Prompted by: "Can we push on the Coordinate system meta data?" -- a direct
+follow-up once section 6.8c's `"REG "` framing work made it obvious to check
+whether `IPJ` blobs share it too.)*
+
+**They do, exactly.** Dumping a real `IPJ`-tagged blob
+(`AG106386_...Conductivity.gdb`) byte for byte shows the identical
+128-byte preamble section 6.8c already found for `REG`: the same
+`0xff 0x00 0xe1 0x1e` constant at `+60`, the same `0x00 0x1a 0xcc 0xff`
+separator at `+92`/`+108`. Where `REG`'s first nested tag is `"REG "`,
+`IPJ`'s is the already-known `" JPI"` name marker -- but there's a
+**second** nested tag at `+112`, not previously noticed: a 4-byte,
+space-padded FourCC abbreviation of the grid system (`" UTM"`, `"MGA "`,
+and fragments like `"/ MG"` read across the same alignment boundary the
+`"REG"`/`"IPJ"` names themselves are). Not decoded further this round.
+
+**The content past the 128-byte mark is a fixed-offset binary record --
+not `REG`'s flat key/value slots.** Searched every real `IPJ` blob
+(`>= 640` bytes, so the projection fields would fit) across 5 files, 3
+agencies, for the exact float64 bit patterns of each file's own
+independently-known real geodetic constants, and for the datum/ellipsoid
+name strings, at every byte offset:
+
+| Offset | Field | Evidence |
+|---|---|---|
+| `+180` | datum name (NUL-terminated ASCII) | `"GDA2020"` (6), `"WGS 84"` (7), `"GDA94"` (1), `"NAD83"` (14), `"NAD83(CSRS)"` (2) -- all real, all correct for their file |
+| `+244` | ellipsoid name (NUL-terminated ASCII) | `"GRS 1980"` (23), `"WGS 84"` (7) |
+| `+308` | semi-major axis, float64 | `6378137.0` exactly, every real instance with a projection or ellipsoid defined |
+| `+316` | eccentricity, float64 | matches the named ellipsoid exactly (`0.0818191910428158` for GRS80-flavoured datums, `0.0818191908426215` for WGS84) |
+| `+332` | datum-transformation name (NUL-terminated ASCII) | `"GDA94 to WGS 84 (1)"`, `"NAD83 to WGS 84 (1)"`, `"NAD83(CSRS98) to WGS 84 (1)"` -- **36 of 36** real instances corpus-wide that define one (a datum already stated in WGS 84, e.g. one `Magnetic_Data.gdb` instance, has no transform to name and reads something else there instead -- see the correction below) |
+| `+596` | central meridian, float64 | `141.0` (GSQ, UTM zone 54), `-81.0` (`MLMAG.gdb`, zone 17N), `-117.0` (`Magnetic_Data.gdb`) -- all real, all independently correct for the stated zone |
+| `+604` | unknown, float64 | the vendor's `rDUMMY` sentinel `-1.0e32` (section 2, docs/spec.md section 4) on **63 of 63** real instances corpus-wide -- a real field, never once seen populated |
+| `+612` | unknown, float64 | same as `+604`, 63 of 63 |
+| `+620` | scale factor, float64 | `0.9996` on every real instance that defines a projection |
+| `+628` | false easting, float64 | `500000.0` on every real instance that defines a projection |
+| `+636` | false northing, float64 | `10000000.0` (GSQ, southern hemisphere), `0.0` (Ontario/USGS, northern hemisphere) -- the correct UTM convention each time |
+
+**The "failures" are a confirmation, not a gap.** An `IPJ` object that
+defines only a datum/ellipsoid (no projection) reads the real `rDUMMY`
+sentinel at `+596`/`+620`/`+628`/`+636` instead of plausible-looking
+garbage -- exactly the documented dummy-value convention this project has
+relied on elsewhere (section 2's `iDUMMY`/`rDUMMY`), here correctly
+marking "not a projected system." This is what first looked like the
+byte-offset hypothesis failing on `MLMAG.gdb`/`Magnetic_Data.gdb`'s minor
+IPJ objects before the dummy pattern was recognized.
+
+**A real self-correction: the first `+332` check had a bug, not a real
+per-agency difference.** An early per-file test (only 3 files, aggregated
+into one counter across all of them) appeared to show `+332` holding the
+transform name on 11 of 11 GSQ instances but zero times on Ontario/USGS --
+looked like a genuine agency difference and was briefly written up as one.
+Dumping the raw bytes at `+332` on those exact Ontario/USGS blobs directly
+showed the transform name sitting there after all (`"NAD83 to WGS 84 (1)"`,
+confirmed byte for byte); the aggregation in the first test had silently
+absorbed the Ontario/USGS hits into the same counter key without them
+actually being counted separately, an artifact of the test script, not the
+file format. Re-verified properly, corpus-wide, with an explicit per-blob
+check rather than an aggregate one: **36 of 36** real instances that define
+a transform have it at exactly `+332`, on all 3 agencies, zero exceptions.
+Recorded here so the mistake -- and the fix -- are both on the record, not
+just the corrected number.
+
+**This replaces the earlier, vaguer description** ("central meridian/
+scale/easting/northing at consecutive small byte deltas") with exact
+absolute offsets, all relative to the blob's own start (the `CC CC 00 FF`
+magic), confirmed identically across USGS, GSQ, and Ontario -- the same
+generalization pattern section 6.8's REG framing already showed.
+
+**Also reinforces, rather than newly discovers,** the existing note
+about raw serialized in-memory pointers: bytes at `+136..+176` read as
+classic Windows x64 user-mode pointer shapes (e.g. `0x00007ffd...`) on
+more than one real instance dumped this round.
+
+**Still open:** what `+604`/`+612` are for (63 of 63 real instances
+corpus-wide are the dummy sentinel; every real projection in this
+corpus is a standard Transverse Mercator/UTM, which doesn't need
+whatever these would hold -- plausibly a latitude-of-origin/false-origin
+pair a non-UTM projection would populate, untested since none exists
+here); the meaning of the second nested tag at `+112` beyond a display
+hint; the exact contents of `+136..+176`.
+
+**Not wired into a reader function.** Same disposition as section 6.8c --
+investigation only, kept out of `pygdb/registry.py` pending a decision
+on whether a real decoder (e.g. a `find_projection_parameters`
+alongside `find_channel_settings`) is worth building on this.
+
 ### 6.8 The `"REG "` blobs: Geosoft Desktop's own settings/processing-history registry — [CONFIRMED] rich real content, [UNKNOWN] exact binary framing
 
 *(Session 3, continued. Direct follow-up to §6.7's honest loose end:
