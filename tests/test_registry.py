@@ -502,6 +502,9 @@ def _inject_ipj_blob_full(
     scale_factor: float = None,
     false_easting: float = None,
     false_northing: float = None,
+    latitude_of_origin: float = 0.0,
+    method: int = None,
+    slots: list = None,
     gate_tag: bytes = b" JPI",
 ) -> bytes:
     """
@@ -509,12 +512,25 @@ def _inject_ipj_blob_full(
     the plain 48-byte blob header with `b"IPJ\\x00"` at its own type-code
     field (+44), the `" JPI"` name marker at +96 (`" JPI"` + int32(1) +
     name + NUL -- the same position real files were found to use it at),
-    then the fixed-offset geodetic fields at +180/+244/+308/+316/+332/
-    +596/+620/+628/+636. A projection field left `None` is written as the
-    real vendor `rDUMMY` sentinel, exactly as a real ellipsoid/datum-only
-    object does -- not omitted.
+    the projection-method code at +168, the geodetic fields at +180/+244/
+    +308/+316/+332, and eight float64 parameter slots at +588..+651.
+
+    By default a Transverse Mercator object (method 11) is built from the
+    named keywords, laid out in that method's slots; with no
+    `central_meridian` it is a datum-only object (method 1, every slot
+    unset). `method`/`slots` override this to build any other method.
+    An unset slot is written as the real vendor `rDUMMY` sentinel, as a
+    real object does -- not omitted.
     """
-    n_pages = max(1, math.ceil(644 / page_size))
+    if slots is None:
+        if central_meridian is not None:
+            method = 11 if method is None else method
+            slots = [latitude_of_origin, central_meridian, None, None,
+                     scale_factor, false_easting, false_northing, None]
+        else:
+            method = 1 if method is None else method
+            slots = [None] * 8
+    n_pages = max(1, math.ceil(652 / page_size))
     blob = bytearray(n_pages * page_size)
     blob[0:4] = BLOB_MAGIC
     struct.pack_into("<i", blob, 4, n_pages)
@@ -523,6 +539,7 @@ def _inject_ipj_blob_full(
     blob[44:48] = b"IPJ\x00"
     marker = gate_tag + (1).to_bytes(4, "little") + name.encode("ascii") + b"\x00"
     blob[96:96 + len(marker)] = marker
+    struct.pack_into("<i", blob, 168, method)
 
     def write_cstr(offset, s):
         enc = s.encode("ascii") + b"\x00"
@@ -534,12 +551,7 @@ def _inject_ipj_blob_full(
         write_cstr(332, datum_transform_name)
     struct.pack_into("<d", blob, 308, semi_major_axis)
     struct.pack_into("<d", blob, 316, eccentricity)
-    struct.pack_into("<d", blob, 596, central_meridian if central_meridian is not None else _IPJ_DUMMY)
-    struct.pack_into("<d", blob, 604, _IPJ_DUMMY)
-    struct.pack_into("<d", blob, 612, _IPJ_DUMMY)
-    struct.pack_into("<d", blob, 620, scale_factor if scale_factor is not None else _IPJ_DUMMY)
-    struct.pack_into("<d", blob, 628, false_easting if false_easting is not None else _IPJ_DUMMY)
-    struct.pack_into("<d", blob, 636, false_northing if false_northing is not None else _IPJ_DUMMY)
+    struct.pack_into("<8d", blob, 588, *[_IPJ_DUMMY if v is None else v for v in slots])
     return bytes(data) + bytes(blob)
 
 
@@ -563,8 +575,86 @@ def test_find_projection_parameters_extracts_a_full_projection(tmp_path):
             name="WGS 84 / UTM zone 54S", datum_name="WGS 84", ellipsoid_name="WGS 84",
             datum_transform_name=None, semi_major_axis=6378137.0, eccentricity=0.0818191908426215,
             central_meridian=141.0, scale_factor=0.9996, false_easting=500000.0, false_northing=10000000.0,
+            method_code=11, latitude_of_origin=0.0,
+            parameters=(0.0, 141.0, None, None, 0.9996, 500000.0, 10000000.0, None),
         )
     }
+
+
+def test_find_projection_parameters_reads_a_nonzero_latitude_of_origin(tmp_path):
+    """Real (USGS OFR 2006-1204 `afgrav.gdb`, docs/spec.md section 8):
+    a Transverse Mercator system with base latitude 34 N stores 34 in
+    slot 0 (+588)."""
+    page_size = 1024
+    data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
+    fields = dict(_UTM54S, name="WGS 84 / *tm_afghan", central_meridian=66.0,
+                  false_easting=0.0, false_northing=0.0, latitude_of_origin=34.0)
+    data = _inject_ipj_blob_full(data, 50, page_size, **fields)
+    path = tmp_path / "ipj.gdb"
+    path.write_bytes(data)
+
+    params = find_projection_parameters(str(path))["WGS 84 / *tm_afghan"]
+    assert (params.latitude_of_origin, params.central_meridian) == (34.0, 66.0)
+
+
+def test_find_projection_parameters_reads_lambert_slots_by_method(tmp_path):
+    """
+    Regression for a real bug (docs/spec.md section 8): parameter slots are
+    method-specific. The real Lambert Conic Conformal (2SP) object in
+    `afgrav.gdb` (method 3) stores standard parallels 30/38, latitude of
+    origin 0 and central meridian 66 in slots 0-3; reading Transverse
+    Mercator positions reported `central_meridian=38`.
+    """
+    page_size = 1024
+    data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
+    fields = dict(_UTM54S, name="WGS 84 / *lcc_afghan")
+    data = _inject_ipj_blob_full(
+        data, 50, page_size, method=3, slots=[30.0, 38.0, 0.0, 66.0, None, 0.0, 0.0, None], **fields,
+    )
+    path = tmp_path / "ipj.gdb"
+    path.write_bytes(data)
+
+    params = find_projection_parameters(str(path))["WGS 84 / *lcc_afghan"]
+    assert params.method_code == 3
+    assert (params.standard_parallel_1, params.standard_parallel_2) == (30.0, 38.0)
+    assert (params.latitude_of_origin, params.central_meridian) == (0.0, 66.0)
+    assert params.scale_factor is None
+    assert (params.false_easting, params.false_northing) == (0.0, 0.0)
+
+
+def test_find_projection_parameters_reads_polar_stereographic_slots(tmp_path):
+    """Real (British Antarctic Survey `Brunt_mag_2017.gdb`, docs/spec.md
+    section 8): method 14, registry text `"Polar Stereographic",-71,0,
+    0.994,0,2082760.109`, in the same slots as Transverse Mercator."""
+    page_size = 1024
+    data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
+    fields = dict(_UTM54S, name="WGS 84 / *bas_polar")
+    data = _inject_ipj_blob_full(
+        data, 50, page_size, method=14, slots=[-71.0, 0.0, None, None, 0.994, 0.0, 2082760.109, None], **fields,
+    )
+    path = tmp_path / "ipj.gdb"
+    path.write_bytes(data)
+
+    params = find_projection_parameters(str(path))["WGS 84 / *bas_polar"]
+    assert (params.method_code, params.latitude_of_origin, params.central_meridian) == (14, -71.0, 0.0)
+    assert (params.scale_factor, params.false_easting, params.false_northing) == (0.994, 0.0, 2082760.109)
+
+
+def test_find_projection_parameters_names_nothing_for_an_unknown_method(tmp_path):
+    """A method code this reader has no slot layout for must not be
+    guessed at: the named fields stay None, and the raw slots are still
+    available in `parameters`."""
+    page_size = 1024
+    data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
+    slots = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, None]
+    data = _inject_ipj_blob_full(data, 50, page_size, method=99, slots=slots, **_UTM54S)
+    path = tmp_path / "ipj.gdb"
+    path.write_bytes(data)
+
+    params = find_projection_parameters(str(path))["WGS 84 / UTM zone 54S"]
+    assert params.method_code == 99
+    assert params.central_meridian is None and params.false_easting is None
+    assert params.parameters == tuple(slots)
 
 
 def test_find_projection_parameters_ellipsoid_only_object_gives_none_projection_fields(tmp_path):

@@ -27,6 +27,7 @@ from .gdb_reader import (
     GS_TYPE_DUMMY_VALUE,
     GS_TYPE_NUMPY_DTYPE,
     LineRecord,
+    blob_region_start,
     check_magic,
     header_fields,
     iter_blobs,
@@ -290,8 +291,8 @@ class GDB:
         {"UNITS": "nT"}, ...}`. Only a channel with at least one
         populated registry key is present; most real files have none for
         most channels -- see `pygdb.registry.find_channel_settings` for
-        what is and isn't decoded (the flat key/value registry form
-        only, not a cached numeric array or a nested tagged sub-object).
+        what is and isn't decoded (the registry's key/value entries, not
+        its nested `MAKER` records).
         """
         if self._channel_settings is None:
             self._channel_settings = find_channel_settings(self.path, channels=self.channels)
@@ -576,7 +577,13 @@ class GDB:
                     f"against the line's other channels, this is the likely cause (see issue #2)"
                 )
             return
-        first_offset = min(by_offset)
+        # Directory start pages count from the blob region's start (header
+        # word 108), not from the first blob walked: a real file can hold a
+        # page there that is not a blob (docs/spec.md section 6.2).
+        with open(self.path, "rb") as f:
+            first_offset = blob_region_start(f.read(128))
+        if first_offset is None:
+            first_offset = min(by_offset)
         skipped: List[Tuple[int, int]] = []
         invalid: List[Tuple[int, int]] = []
         for key in copies:

@@ -3808,3 +3808,239 @@ new tests cover the real leftover shapes. Corpus effect on
   the change, projection keys appear only on real coordinate pairs. That
   resolves the Session 11 "orphaned handle" caveat as leftover slots, and
   independently supports reading the dropped bytes as stale.
+
+**Follow-up: working through the remaining open questions ("keep trying
+to tackle the remaining questions in the order you see fit").** Scripts
+`lineobj*.py`, `numeric.py`, `blobhdr*.py`, `dirflag*.py`, `freelist*.py`,
+`admintags.py`.
+
+1. **Line-handle REG objects.** All 744 declare zero entries, and each
+   handle is a real line slot (line 0 in most files; 417/631 and 283/631
+   lines in the two USGS files). Tested the idea that these are channel
+   objects shifted by a table resize -- no constant offset fits, so it is
+   refuted. Reading: always-empty per-line registries whose surviving
+   bytes are leftovers. Notes section 6.2d.
+2. **Binary `+124 = 0` content: numeric array or leftover?** 48 of 117
+   probe runs recur elsewhere in the same file, mostly in other registry
+   objects -- inconclusive, stays open.
+3. **Blob-header `+20` is a blob class.** 100 admin, 200 plain data, 202
+   compressed data (10,429/10,429 vs 106,681/106,681). `+16` is a write
+   timestamp set on whole imported channels (Magnetic_Data: 9 channels x
+   631 lines on 2020-03-25, the line date), sentinel otherwise.
+   Notes section 6.1e.
+4. **The "cache" directory slots are a free list, and header word 116 is
+   the lost-page count.** No free-list entry points at a referenced blob
+   (0 of 117,450). In 20 files every orphaned blob is listed and word 116
+   is 0. In the two files with a full list, word 116 equals the unlisted
+   orphans' pages exactly (26,966 and 26), and the supplied file agrees.
+   This corrects this session's first-round "refutation" of word 116,
+   which counted listed orphans too. It also explains the unlisted data
+   blobs as freed. The `0x4` flag bit is still unexplained. Notes section
+   6.1d.
+5. **Every administrative blob is identified by its symbol name.** The
+   `+44` tag follows the name exactly (REG, IPJ, EXT, META, `ff ff ff ff`
+   for Line Selection, a varying int for Display List, plain text for
+   `OE.DB_ACTIVITY_LOG` / `OE32.View`). The unidentified GSQ "third tag"
+   is `OE.DB_ACTIVITY_LOG`. Display List holds channel name + handle
+   pairs. Notes section 6.2d.
+6. **Channel-record census: leftover records read as channels (reader
+   fix).** 16 records in `DB_AGG_1213`, `DB_Mag_1213` and `DB_Mag_1212`
+   passed `looks_sane` although they have array width 0, dtype 0 and no
+   blobs. Their names are second copies of real channel names, fill
+   patterns, and projection-catalog names. `GDB.channel_names` listed
+   them. `looks_sane` now also requires array width >= 1; there is a
+   synthetic and a corpus regression test, and the three files now list
+   16 unique channels each. Genuine channels all read `+108 = 1.0` and
+   `+116 = 5` (535 of 535, meaning unknown). The freed-slot bit reading
+   does not transfer to channels: 53 genuine channels share the int32
+   `0x10000` at `+84`.
+7. **`OE.DB_ACTIVITY_LOG` is a creation record.** It appears only in the
+   four Melinda Downs files. It holds the source path, a `Created:`
+   timestamp (2008-05-08), and `Lines:`/`Channels:` equal to the file's
+   own `lines_max`/`chans_max`. The blob header overwrites the start of
+   the text. It does not cover the 1991 files whose declared Speed mode
+   was never used, so that question stays open.
+8. **Compressed-chunk `reserved` tracks the subtype.** It is 0 on all
+   7,015 LZRW1 chunk headers and 1 on all 3,529 zlib ones, `.gdb` and
+   `.grd` alike. The five largest `.gdb` files were skipped for memory.
+   The two stray values are the magic occurring inside data.
+9. **`Line Selection` is one byte per line slot, and blob `+24` looks
+   like a payload length from `+28`.** Every live `Line Selection`
+   object holds exactly `lines_max` rounded up to 4 bytes of `ff` from
+   `+28`, and `+24` equals that count. Tested on registries: empty ones
+   end at `+132` (874/874), and flat ones end 4 bytes past their last
+   slot (678/860). The rest are unexplained, so this is recorded as
+   [LIKELY], partial.
+10. **The registry grammar ("keep going on anything that doesn't
+    require new files").** The 182 flat registries that missed the `+24`
+    rule each have an int32 `1` after their slots, then a nested `MAKER`
+    object. The payload ends on that object's `0x1A` byte. The 678 hits
+    have a `0` there. So every registry is: `n` entries (`+124`), an
+    int32 count `m`, then `m` nested objects. Every frame length (`+32`,
+    `+64`, the nested frame's) counts from 28 bytes after itself and ends
+    where `+24` says.
+
+    Over 1,820 `REG` objects (corpus plus supplied file): frames
+    1,820/1,820; `m = 0` 1,600/1,601; `m = 1` 219/219. The "nested",
+    "empty", "numeric array" and "dirty slot 0" shapes are all this
+    grammar with `n = 0`, and the last two lie outside the declared
+    payload, so they are leftovers. That also settles the
+    "numeric-array-or-leftover" question.
+
+    The one exception is a supplied-file registry with an
+    `ASSOCIATED.DB_TABLE$$$` entry whose table follows as an extra
+    `"REG "` block. Reader comments and docstrings updated to the grammar
+    (no behaviour change).
+11. **Frame markers and the IPJ member chain.** `ff 00 f0 0f` and
+    `ff 00 e1 1e` are the only self-complementary markers in any
+    administrative object. Each is followed by a length that counts from
+    28 bytes after itself, and `f00f` frames enclose `e11e` frames. So
+    they read as object / member, which explains the preamble
+    "constants".
+
+    IPJ objects hold a chain of 2-6 members that lands exactly on the
+    payload end (63/63). Member 0 is the known projection record;
+    member 1 is an unused `-1e32` array; members 2-3 are zero. East_Isa's
+    extra member 4 carries `EPSG` + 28354, the EPSG code of its own name
+    "GDA94 / MGA zone 54" (one instance, [LIKELY] authority code).
+12. **IPJ projection parameters are an 8-slot vector at `+588`.** Comparing
+    member 0's float64 run with the `_PJ_PROJECTION` text: the text's
+    five Transverse Mercator parameters fill slots 0, 1, 4, 5, 6, in
+    text order. `+588` (slot 0) is the latitude of origin, always `0`
+    here -- a new field. `+604`/`+612`/`+644` are the unused slots 2, 3
+    and 7, and the vector ends exactly at member 0's end (`+652`).
+13. **IPJ name field and type word.** The name at `+104` sits in a
+    64-byte field (all 63 fit), and the "pointer-shaped" `+136..+176`
+    bytes are uninitialized memory after its NUL. The old "`+112`
+    grid-system tag" was name text and is withdrawn. `+168` is `11` on
+    all 48 projected objects and `1` on all 15 datum-only ones. It does
+    not match `IPJ_TYPE_*`, and its meaning is unknown.
+14. **User-record path: layout and truncation rule.** The path is UTF-16LE
+    from `+8`, overwritten at its start by the ASCII user name, and at
+    most 32 characters long (to `+71`). It holds on 11 of 22 files, each
+    ending in its own file name. Shorter strings are NUL-terminated (7);
+    longer ones are cut at 32 characters with no terminator (4). This
+    corrects the old "32-byte field at `+40`, 13 of 22" (the USGS
+    fragments are not paths) and the "32-byte name field" inference.
+15. **The directory `0x4` bit flips on every rewrite.** Pairing each live
+    entry with the freed copy of the same blob index: opposite bits in
+    696 of 696 pairs (404 live `0xC`/freed `0x8`, 292 live `0x8`/freed
+    `0xC`), and objects with two freed copies have one of each. Never
+    rewritten entries are `0x8`. Magnetic_Data's 26 unpaired live `0xC`
+    entries match its 26 lost pages. So this reads as a write-generation
+    parity bit ([LIKELY]); the purpose is still open.
+16. **The `f0f0f0f0` header variant is at bytes 4-7, not 8-11.** A direct
+    header dump of both files shows the variant in header word 4;
+    Session 2's note and the spec had the offset wrong. The Elaine header
+    differs from its same-delivery sibling `DB_Mag_MountGordon_1003`
+    only in that word and the page count, so nothing else in the header
+    explains it. The meaning remains unknown. Corrected in spec section
+    2, notes section 6.1, and `check_magic`'s docstring.
+
+## Session 12 -- new public samples; the first non-Transverse-Mercator projection (2026-09-29)
+
+Prompted by: "let's try to find more gdb files online, I don't think we need
+reference files anymore though do we?" Paired reference exports are no
+longer needed for the value decoding. What the open questions need is
+structural variety: other projections, several users, other line types,
+channels with non-default settings.
+
+1. **Search.** Web search for public Geosoft databases turned up USGS OFR
+   2006-1204 (Afghanistan gravity), which ships `afgrav.gdb` directly
+   (435,200 bytes, `pubs.usgs.gov/of/2006/1204/Gravity/`; the
+   `pubsdata.usgs.gov` host named on the page does not resolve). Its
+   readme states a Transverse Mercator projection with "Base latitude =
+   34 degrees N". Downloaded with the readme into
+   `samples/usgs_afghanistan_2006/` (gitignored).
+2. **IPJ `+588` confirmed as latitude of origin.** The Transverse
+   Mercator object reads 34.0 there, as the readme predicts.
+3. **First non-TM projection: Lambert Conic Conformal (2SP)**, method
+   code `+168 = 3`. Its eight parameter slots follow the registry text
+   `"Lambert Conic Conformal (2SP)",30,38,0,66,0,0` in order (slots 0-3,
+   5, 6), where Transverse Mercator uses 0, 1, 4, 5, 6. So `+168` is a
+   projection-method code (1 geographic, 11 TM, 3 LCC), and the slot
+   meanings depend on it.
+4. **Reader defect:** `find_projection_parameters` reads TM slot
+   positions for every object, and reports `central_meridian=38` (a
+   standard parallel) for the Lambert system. Reported, not fixed yet.
+5. **Line type 6 (`RANDOM`)** on line `D0`, and **empty user slots read
+   `0x10000`**, like the other symbol tables.
+
+Docs updated: spec sections 3.2 and 8; notes section 1 (S16), section 5,
+and 6.7b.
+6. **More files from `pubs.usgs.gov` directory listings.** OFR 2004-1096
+   (Long Valley) has a browsable `downloads/geosoft_gdb/` directory with
+   `long_valley_ed.gdb` (4.6 MB). OFR 2011-1270's `report/` directory
+   holds six small databases of Afghanistan ground data digitized from
+   Soviet maps. All were downloaded into `samples/` (gitignored); the
+   corpus is now 30 public files plus the supplied one.
+7. **Re-check with a survey script.** `survey.py` re-tests every decoded
+   rule on a file. All eight new files pass all of them.
+   `long_valley_ed.gdb` gives a third non-zero header word 116 (1,148),
+   equal to the unlisted orphans' pages, as predicted from the free list.
+8. **Group lines carry a group class.** All 110 lines of the six OFR
+   2011-1270 files are category 200 (group), with freeform names. Their
+   date/number positions hold the NUL-terminated class name `DB_Table`.
+   Vendor S4 `set_group_class` documents exactly this ("the Class name
+   for a group line"; group lines of one class share associated
+   channels). The associated-channel list is `__dbreg`'s
+   `ASSOCIATED.DB_TABLE` key, a comma-separated channel list. It is
+   present only in these six files, and its `$$$` twin is an ordinary
+   empty entry.
+9. **Freed user slots carry `0x10000`** in every new file, including
+   slots holding leftover names (`SPF_1`, `SPF_250`).
+10. **Two reader bugs from the new files, fixed.** `Kalay_nk.gdb` has
+    the corpus's first live *data* directory entry with the rewrite bit
+    (`0xC`). It points at the earlier of two copies, and the later copy
+    is on the free list. The reader accepted only `0x8`, so it warned and
+    fell back to the later (freed) copy. Here the two decode to identical
+    values (they differ only in padding after one record's NUL), but the
+    logic was wrong. `BlobDirectory.resolve` now accepts any entry with
+    the live bit and masks the page with 30 bits.
+
+    The same channel (`string[255]`) exposed a native-backend crash on a
+    string blob whose records are all empty (`<U0` dtype). It now returns
+    empty strings like the Python path. Both fixes have regression tests.
+    The integration tests were generalized: unlisted blobs must be freed
+    (on the free list or counted by word 116), word 116 is checked on
+    every file, and "has REG/IPJ" accepts a `__dbreg` registry
+    (`Kalay_nk`/`Kalay_pk` have no coordinate system).
+11. **Projection reader fixed ("fix the projection reader, then keep
+    searching").** `find_projection_parameters` now reads the method code
+    at `+168` and maps parameter slots per method: Transverse Mercator
+    0/1/4/5/6, Lambert Conic Conformal (2SP) 0/1/2/3/5/6. It no longer
+    names fields for unknown methods.
+    `ProjectionParameters` gained `method_code`, `latitude_of_origin`,
+    `standard_parallel_1`, `standard_parallel_2` and the raw `parameters`
+    tuple. On `afgrav.gdb` the Lambert system now reads parallels 30/38,
+    origin 0, central meridian 66 (was `central_meridian=38`). Synthetic
+    tests cover TM with non-zero origin, Lambert and an unknown method,
+    and an integration test uses the real file.
+12. **Alaska DGGS GPR 2015-4 (Fortymile).** The survey's Geosoft-database
+    zip (115 MB) is a direct download from `dggs.alaska.gov/webpubs/data/`.
+    `fortymile_linedata.gdb` (173 MB, `DB_COMP_SPEED`, NAD27 / UTM zone 7N)
+    passes every rule. It contributes the corpus's first non-WGS84
+    ellipsoid: Clarke 1866, semi-major axis 6,378,206.4 m, eccentricity
+    0.08227185, read correctly at `+308`/`+316`.
+14. **Session resumed after a usage-limit reset ("keep on chugging").**
+    Finished the BAS doc edits. The shell's safety check was briefly
+    timing out, so they went in through the editor.
+15. **More files.**
+    - OFR 2006-1204's `German_mag/GDR_clmag.gdb` (41 MB) adds the
+      International 1924 ellipsoid (Herat North datum).
+    - OFR 99-527 (Wisconsin) has only ASCII/binary line files.
+    - NRCan's portal fails TLS certificate verification. Not bypassed;
+      skipped.
+    - Alberta's IAM-013 links to grids only.
+    - OpenEI GDR 1682 (BRIDGE, CC-BY 4.0) packages `.gdb` files inside
+      multi-GB zips. A range-request zip reader (`remotezip.py`) listed
+      the members and extracted the 12 Bell Flat databases (2024)
+      without downloading the whole archive.
+16. **Findings from them.**
+    - Every rule holds.
+    - `Line Selection` rounds `lines_max` up to a multiple of 8. It has
+      no tag at `+44`: its `ff` bytes run through there, and a short
+      payload leaves leftovers there.
+    - The `f0f0f0f0` header variant is on all 11 BRIDGE ground-gravity
+      databases, 13 of 45 files in all. It follows no tested file
+      feature, so it stays unknown.

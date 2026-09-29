@@ -330,12 +330,24 @@ class ChannelRecord:
             printable name (observed for real in DB_Mag_833.gdb -- see
             docs/provenance/notes.md). Real records seen so far always
             have dtype either a known GS_* code (0-13) or a small
-            negative string width, and a format code in the known
-            DB_CHAN_FORMAT_* range (0-6).
+            negative string width, a format code in the known
+            DB_CHAN_FORMAT_* range (0-6), and an array width of at least
+            1 (elements per fiducial).
+
+        Notes
+        -----
+        The array-width test catches leftover records that pass the
+        other two: 16 records in three real GSQ files (`DB_AGG_1213`,
+        `DB_Mag_1213`, `DB_Mag_1212`) hold clean names -- fill-pattern
+        names, projection-catalog names, second copies of real channel
+        names -- with dtype 0 and array width 0 (or garbage), and own no
+        data blob at all. Every genuine channel in the corpus has width
+        1 or more (docs/provenance/notes.md section 6.2d).
         """
         dtype_ok = self.dtype_code in GS_TYPE_NAMES or -256 <= self.dtype_code < 0
         format_ok = self.format_code in DB_CHAN_FORMAT_NAMES
-        return dtype_ok and format_ok
+        width_ok = self.array_width >= 1
+        return dtype_ok and format_ok and width_ok
 
 
 def _read_name(raw: bytes, offset: int, max_len: int = 64):
@@ -400,7 +412,7 @@ def check_magic(data: bytes) -> bool:
     The full 16-byte `HEADER_SIGNATURE` is only **[LIKELY]** -- it
     matched exactly in 8/9 real files, but one real file
     (DB_Mag_Elaine_1003.gdb, from GSQ's Mount Gordon delivery) has
-    `f0 f0 f0 f0` at bytes 8-11 instead of the usual `00 00 00 00`.
+    `f0 f0 f0 f0` at bytes 4-7 instead of the usual `00 00 00 00`.
     That file is otherwise structurally normal
     (chans_max/users_max/page_size all decode sanely), so this looks
     like a real, if rare, variation in that sub-block rather than a
@@ -1189,12 +1201,32 @@ def blob_region_start(data: bytes) -> Optional[int]:
     return start_page * page_size
 
 
+def _next_blob_page(f: BinaryIO, start: int, page_size: int, size: int) -> Optional[int]:
+    """Offset of the first page boundary at or after `start` whose first
+    bytes are the blob magic, or `None` if there is none before `size`
+    minus one header. Reads in large chunks rather than seeking per page."""
+    chunk_pages = max(1, (1 << 20) // page_size)
+    pos = start
+    while pos + BLOB_HEADER_SIZE <= size:
+        f.seek(pos)
+        buf = f.read(chunk_pages * page_size)
+        if not buf:
+            return None
+        for i in range(0, len(buf), page_size):
+            if buf[i:i + 4] == BLOB_MAGIC and pos + i + BLOB_HEADER_SIZE <= size:
+                return pos + i
+        pos += len(buf)
+    return None
+
+
 def iter_blobs(path: str, max_blobs: Optional[int] = None):
     """
     Walk the self-describing blob chain.
 
     Walks from the start of the blob region to end of file (or
-    `max_blobs`, or the first framing anomaly).
+    `max_blobs`, or a framing anomaly it cannot step past). A page that
+    does not start a blob is skipped: the walk resumes at the next page
+    that does.
 
     Parameters
     ----------
@@ -1212,7 +1244,9 @@ def iter_blobs(path: str, max_blobs: Optional[int] = None):
     -----
     GDBParseWarning
         Reaching the file's true end cleanly is silent (the expected,
-        common case), but a magic mismatch, a non-positive `n_pages`,
+        common case). Pages skipped because they do not start a blob get
+        one summary warning (count and offsets). A magic mismatch with no
+        later blob page, a non-positive `n_pages`,
         a file that ends mid-header, or landing short of true EOF by
         less than one full header (i.e. real leftover bytes, not
         enough to be read at all) are all real anomalies and each gets
@@ -1230,7 +1264,12 @@ def iter_blobs(path: str, max_blobs: Optional[int] = None):
     on the true file size) on 20 real files spanning all 3 agencies
     this project has files from and all three `DB_COMP_*` compression
     modes, 2MB to 1.93GB -- see docs/provenance/notes.md section
-    6.6b/6.6d/6.9.
+    6.6b/6.6d/6.9. One later real file (OpenEI BRIDGE
+    `GP_Master_Gravity_11082023.gdb`, 2023) has pages between blobs
+    that are not blobs: one page of leftover data at the region start
+    and a run of 96 all-zero pages. Its blobs are still contiguous
+    around those gaps, and the resynchronizing walk lands exactly on
+    the file's end.
 
     As a generator, this already "returns partial results" in the most
     natural way possible: whatever's been yielded before a problem is
@@ -1261,6 +1300,7 @@ def iter_blobs(path: str, max_blobs: Optional[int] = None):
             return
         f.seek(off)
         n = 0
+        skipped_runs = []  # [(first offset, page count)] of pages that are not blobs
         while off + BLOB_HEADER_SIZE <= size:
             if max_blobs is not None and n >= max_blobs:
                 return
@@ -1275,17 +1315,25 @@ def iter_blobs(path: str, max_blobs: Optional[int] = None):
                         f"walked -- file is likely truncated; returning the "
                         f"{n} blob(s) already yielded"
                     )
-                else:
+                    return
+                # A page that is not a blob header. Real files can hold
+                # such pages between blobs -- leftover data or never-written
+                # zero pages (docs/spec.md section 6.2) -- so resynchronize on
+                # the next page that starts with the blob magic.
+                resume = _next_blob_page(f, off + page_size, page_size, size)
+                if resume is None:
                     _warn(
                         f"{path}: blob magic mismatch at offset {off} "
                         f"(got {raw[:4].hex()}, expected {BLOB_MAGIC.hex()}) "
-                        f"after {n} blob(s) successfully walked -- stopping "
-                        f"the chain walk here and returning the {n} blob(s) "
-                        f"already yielded; this may be a real structural "
-                        f"anomaly or an administrative-blob variant not yet "
-                        f"understood (docs/provenance/notes.md section 6.4/6.9)"
+                        f"after {n} blob(s) successfully walked, and no later "
+                        f"page starts a blob -- stopping the chain walk here "
+                        f"and returning the {n} blob(s) already yielded"
                     )
-                return
+                    return
+                skipped_runs.append((off, (resume - off) // page_size))
+                off = resume
+                f.seek(off)
+                continue
             if blob.n_pages <= 0:
                 _warn(
                     f"{path}: blob at offset {off} (blob_index={blob.blob_index}) "
@@ -1312,6 +1360,15 @@ def iter_blobs(path: str, max_blobs: Optional[int] = None):
             f.seek(skip, 1)
             off += blob.n_pages * page_size
             n += 1
+        if skipped_runs:
+            pages = sum(count for _start, count in skipped_runs)
+            runs = ", ".join(f"{count} at offset {start}" for start, count in skipped_runs[:5])
+            more = f" and {len(skipped_runs) - 5} more run(s)" if len(skipped_runs) > 5 else ""
+            _warn(
+                f"{path}: skipped {pages} page(s) of the blob region that do not "
+                f"start a blob ({runs}{more}) and resumed the chain walk after "
+                f"each -- leftover or never-written pages between blobs"
+            )
         if n > 0 and off > size:
             # The last blob successfully parsed claimed a page count that
             # implies more data than the file actually contains -- off
@@ -1403,7 +1460,11 @@ def find_blob(path: str, line_slot: int, channel_slot: int, chans_max: Optional[
 
 DIRECTORY_OFFSET = 280  # [CONFIRMED] first blob-directory slot -- docs/spec.md section 2.2
 _DIRECTORY_SLOT_DTYPE = np.dtype([("word", "<u4"), ("n_pages", "<u2")])  # 6 bytes, unaligned
-_DIRECTORY_LIVE_FLAG = 0x8  # top nibble of a live (line, channel) entry's 32-bit word
+# A live entry's 32-bit word has the 0x80000000 bit set; the 0x40000000
+# bit flips each time the blob is rewritten (docs/spec.md section 2.2), so
+# the top nibble is 0x8 or 0xC. The remaining 30 bits are the start page.
+_DIRECTORY_LIVE_BIT = 0x80000000
+_DIRECTORY_PAGE_MASK = 0x3FFFFFFF
 
 DIRECTORY_LIVE = "live"
 DIRECTORY_ABSENT = "absent"
@@ -1433,7 +1494,11 @@ class BlobDirectory:
     The directory is an array of 6-byte slots starting at file offset
     280. A live entry is `(0x80000000 | start page, n_pages)` where
     the start page is relative to the first blob (`(offset - blob
-    region start) / page_size`). Across the real corpus it addressed
+    region start) / page_size`), optionally with the `0x40000000` bit,
+    which flips each time the blob is rewritten. (Every data entry in
+    the first 22 corpus files read `0x8`; the first data entry with
+    `0xC`, in USGS OFR 2011-1270 `Kalay_nk.gdb`, is the live copy -- the
+    other copy is on the free list.) Across the real corpus it addressed
     100% of the real (line, channel) blobs of 20 of 22 files, and for
     every duplicated pair with an independent oracle (13 of 13) it
     pointed at the correct copy. A slot that is all-zero belongs to a
@@ -1477,9 +1542,9 @@ class BlobDirectory:
         if entry is None:
             return DIRECTORY_ABSENT, None
         word, n_pages = entry
-        if word >> 28 != _DIRECTORY_LIVE_FLAG:
+        if not word & _DIRECTORY_LIVE_BIT:
             return DIRECTORY_INVALID, None
-        blob = blobs_by_offset.get(first_offset + (word & 0x7FFFFFFF) * page_size)
+        blob = blobs_by_offset.get(first_offset + (word & _DIRECTORY_PAGE_MASK) * page_size)
         if blob is None or blob.blob_index != blob_index or blob.n_pages != n_pages:
             return DIRECTORY_INVALID, None
         return DIRECTORY_LIVE, blob
@@ -1808,7 +1873,13 @@ def _decode_numeric_or_string(raw: bytes, channel: ChannelRecord, row_count: Opt
     if channel.is_string:
         if _native_ext is not None:
             max_len, ucs4 = _native_ext.decode_fixed_width_strings_ucs4(raw, width, n)
-            arr = np.frombuffer(ucs4, dtype=f"<U{max_len}")
+            if max_len == 0:
+                # Every record is empty: there is no zero-width numpy string
+                # dtype to view the (empty) buffer as. `np.array(..., "<U0")`
+                # in the fallback below becomes `<U1` the same way.
+                arr = np.zeros(n, dtype="<U1")
+            else:
+                arr = np.frombuffer(ucs4, dtype=f"<U{max_len}")
         else:
             values = [
                 raw[i * width : (i + 1) * width].split(b"\x00")[0].decode("ascii", errors="replace")

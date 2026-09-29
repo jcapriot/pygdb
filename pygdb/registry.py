@@ -29,7 +29,7 @@ import re
 import struct
 import warnings
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .gdb_reader import (
     ChannelRecord,
@@ -280,22 +280,20 @@ def find_channel_roles(
 # The REG object's own binary framing (docs/provenance/notes.md section
 # 6.8c): a fixed 128-byte preamble (48-byte blob header with the object's
 # own name -- "REG\0" here -- in place of a GS_* type code, then 80 more
-# bytes of nested-tag framing), after which the content is one of three
-# forms, selected by the entry count at +124. This decodes only the
-# best-validated one: a flat `KEY\0value\0` pair per 256-byte-aligned slot,
-# `+124` of them. A numeric cached float64 array and a second level of the
-# same recursive tagged-object framing are real too but are not decoded
-# here -- see the module/function docstrings below.
+# bytes of nested-tag framing). From +128 the content is `+124` entries, one
+# `KEY\0value\0` pair per 256-byte slot, then an int32 count of nested
+# objects and those objects (in practice a `MAKER` record naming the GX
+# that made the channel) -- docs/spec.md section 9. This decodes the
+# entries only. Bytes past the object's declared payload (blob `+24`) are
+# leftovers of an earlier version of the object and are never read.
 _REG_OBJECT_NAME = b"REG\x00"
 _REG_PREAMBLE_SIZE = 128
 _REG_ENTRY_COUNT_OFFSET = 124
 _REG_FLAT_KV_SLOT_SIZE = 256
 _REG_FLAT_KV_KEY_RE = re.compile(rb"^([A-Z_][A-Z0-9_.]{1,30})\x00")
-# A VV object recurses into a second, named tagged object (docs/provenance/
-# notes.md section 6.8c, the "MAKER" -> "MAKE" example) instead of holding
-# flat slots; its content starts with this same shape as the outer object's
-# own header. Recognizing it here is just so it isn't mistaken for the flat
-# form -- its own content isn't decoded.
+# An object with no entries and one nested object: the int32 count 1 at
+# +128, then the nested object's own frame marker (docs/spec.md section 9,
+# the "MAKER" -> "MAKE" example). Its content isn't decoded.
 _REG_NESTED_VV_MARKER = b"\x01\x00\x00\x00" + bytes.fromhex("ff00f00f")
 # A per-symbol REG object's blob-symbol name: "__" plus the owning
 # symbol's global handle (docs/provenance/notes.md section 6.2d).
@@ -394,8 +392,8 @@ def find_channel_settings(
         `{channel_name: {key: value, ...}, ...}` -- only for a channel
         with at least one populated key found in its own REG entries; a
         channel with none (no REG entry at all, or entries that are all
-        bare placeholders, or a numeric-array/nested-object entry -- see
-        Notes) is simply absent, not mapped to `{}`. Also `{}` for a
+        bare placeholders, or objects holding only a nested `MAKER`
+        record -- see Notes) is simply absent, not mapped to `{}`. Also `{}` for a
         file with no readable blob-symbol table
         (`gdb_reader.read_blob_symbols` returns `None`), since nothing
         then says which channel an object belongs to.
@@ -413,14 +411,12 @@ def find_channel_settings(
 
     Notes
     -----
-    **Only the flat `KEY\\0value\\0` form is decoded** (see
-    `_decode_reg_flat_keyvalues`) -- a channel whose only REG content is
-    a cached numeric array or a second level of nested tagged objects
-    (both real, confirmed forms, docs/provenance/notes.md section 6.8c)
-    contributes nothing here, not because it truly has no settings but
-    because that form isn't decoded yet. Which keys are meaningful for a
-    given channel is not itself decoded from anything -- only the keys a
-    real file happens to have written are returned.
+    **Only an object's `KEY\\0value\\0` entries are decoded** (see
+    `_decode_reg_flat_keyvalues`). Its nested objects -- in practice a
+    `MAKER` record naming the GX that made the channel (docs/spec.md
+    section 9) -- are not. Which keys are meaningful for a given channel
+    is not itself decoded from anything -- only the keys a real file
+    happens to have written are returned.
 
     **Which channel an object belongs to** comes from its blob symbol
     (docs/spec.md section 2.1, docs/provenance/notes.md section 6.2d):
@@ -518,16 +514,41 @@ def find_channel_settings(
 # magic) and was confirmed identically on 63 of 63 real IPJ objects across
 # all three agencies this project has files from.
 _IPJ_GATE_TAG = b" JPI"
-_IPJ_MIN_LENGTH = 644  # the highest fixed offset used (+636) plus 8 bytes
+_IPJ_METHOD_OFFSET = 168
 _IPJ_DATUM_NAME_OFFSET = 180
 _IPJ_ELLIPSOID_NAME_OFFSET = 244
 _IPJ_SEMI_MAJOR_AXIS_OFFSET = 308
 _IPJ_ECCENTRICITY_OFFSET = 316
 _IPJ_DATUM_TRANSFORM_NAME_OFFSET = 332
-_IPJ_CENTRAL_MERIDIAN_OFFSET = 596
-_IPJ_SCALE_FACTOR_OFFSET = 620
-_IPJ_FALSE_EASTING_OFFSET = 628
-_IPJ_FALSE_NORTHING_OFFSET = 636
+# Eight float64 projection parameters at +588..+651; which slot holds which
+# parameter depends on the projection method at +168 (docs/spec.md section
+# 8, confirmed for the three methods below).
+_IPJ_PARAMETERS_OFFSET = 588
+_IPJ_PARAMETER_COUNT = 8
+_IPJ_MIN_LENGTH = _IPJ_PARAMETERS_OFFSET + 8 * _IPJ_PARAMETER_COUNT
+_IPJ_METHOD_GEOGRAPHIC = 1
+_IPJ_METHOD_TRANSVERSE_MERCATOR = 11
+_IPJ_METHOD_LAMBERT_CONIC_2SP = 3
+_IPJ_METHOD_POLAR_STEREOGRAPHIC = 14
+# {method code: {field name: parameter slot}}
+_IPJ_SLOTS = {
+    _IPJ_METHOD_GEOGRAPHIC: {},
+    _IPJ_METHOD_TRANSVERSE_MERCATOR: {
+        "latitude_of_origin": 0, "central_meridian": 1, "scale_factor": 4,
+        "false_easting": 5, "false_northing": 6,
+    },
+    _IPJ_METHOD_LAMBERT_CONIC_2SP: {
+        "standard_parallel_1": 0, "standard_parallel_2": 1,
+        "latitude_of_origin": 2, "central_meridian": 3,
+        "false_easting": 5, "false_northing": 6,
+    },
+    # Same slots as Transverse Mercator; slot 0 is what the source survey's
+    # own metadata calls the standard parallel (docs/spec.md section 8).
+    _IPJ_METHOD_POLAR_STEREOGRAPHIC: {
+        "latitude_of_origin": 0, "central_meridian": 1, "scale_factor": 4,
+        "false_easting": 5, "false_northing": 6,
+    },
+}
 # The vendor's own float64 "not set" sentinel (docs/spec.md section 4),
 # read here at the four projection-parameter offsets on every real
 # ellipsoid/datum-only IPJ object (one that defines no projection) -- a
@@ -568,22 +589,36 @@ class ProjectionParameters:
     eccentricity : float
         The ellipsoid's eccentricity.
     central_meridian, scale_factor, false_easting, false_northing : float or None
-        The projection's own parameters. `None` on an object that defines
-        only a datum/ellipsoid, no projection (see Notes).
+        The projection's own parameters. `None` when the object defines
+        only a datum/ellipsoid, when the projection method does not use
+        that parameter (Lambert has no scale factor), or when the method
+        is not one this reader knows (see Notes).
+    method_code : int or None
+        The projection-method code at `+168`: `1` geographic (datum
+        only), `11` Transverse Mercator, `3` Lambert Conic Conformal
+        (2SP), `14` Polar Stereographic. Other values are real but not
+        decoded.
+    latitude_of_origin : float or None
+        Transverse Mercator or Lambert latitude of origin; for Polar
+        Stereographic, the latitude in the same slot, which the source
+        survey's own metadata calls the standard parallel.
+    standard_parallel_1, standard_parallel_2 : float or None
+        Lambert Conic Conformal (2SP) standard parallels.
+    parameters : tuple of (float or None)
+        All eight raw parameter slots (`+588..+651`) in order, `rDUMMY`
+        mapped to `None` -- the only way to reach the values of a method
+        this reader does not name.
 
     Notes
     -----
-    **[CONFIRMED]** structure and every field except the `None`-mapping
-    convention itself, which is this reader's own choice: the real,
-    on-disk value for an undefined projection field is the vendor's own
-    float64 `rDUMMY` sentinel (`-1.0e32`, docs/spec.md section 4), mapped
-    to `None` here rather than returned as a raw dummy a caller could
-    mistake for a real coordinate. See docs/spec.md section 8 and
-    docs/provenance/notes.md section 6.7b for the full derivation and
-    per-field evidence. Two real fields at fixed offsets in every object
-    (`+604`, `+612`) are not exposed here at all -- never once seen
-    populated in this project's real corpus, so there is nothing
-    confirmed to name them.
+    **[CONFIRMED]** structure and slot positions for the method codes
+    above (docs/spec.md section 8, docs/provenance/notes.md section
+    6.7b), each against the file's own `_PJ_PROJECTION` text; the Lambert
+    and Polar Stereographic slot *names* are **[LIKELY]**. The on-disk value of an
+    unset parameter is the vendor's float64 `rDUMMY` sentinel
+    (`-1.0e32`, docs/spec.md section 4), mapped to `None` here rather
+    than returned as a raw dummy a caller could mistake for a real
+    coordinate -- this reader's own convention.
     """
 
     name: str
@@ -596,6 +631,11 @@ class ProjectionParameters:
     scale_factor: Optional[float]
     false_easting: Optional[float]
     false_northing: Optional[float]
+    method_code: Optional[int] = None
+    latitude_of_origin: Optional[float] = None
+    standard_parallel_1: Optional[float] = None
+    standard_parallel_2: Optional[float] = None
+    parameters: Tuple[Optional[float], ...] = ()
 
 
 def find_projection_parameters(
@@ -642,7 +682,7 @@ def find_projection_parameters(
     -----
     A candidate blob is only decoded if it has the confirmed `IPJ`
     object shape: the type-code field reading `b"IPJ\\x00"`, at least
-    644 bytes (enough for every fixed offset used), and the `" JPI"`
+    652 bytes (through the last parameter slot), and the `" JPI"`
     marker's own tag also present at its fixed `+96` position -- a
     structural gate before trusting the fixed-offset fields, matching
     the validation `find_channel_settings` applies to `REG` objects.
@@ -692,9 +732,11 @@ def find_projection_parameters(
             if transform_name is not None and " to " not in transform_name:
                 transform_name = None  # the datum's own name repeated, not a real transform
 
-            def _param(offset: int) -> Optional[float]:
-                value = struct.unpack_from("<d", chunk, offset)[0]
-                return None if value == _IPJ_DUMMY_FLOAT else value
+            raw = struct.unpack_from(f"<{_IPJ_PARAMETER_COUNT}d", chunk, _IPJ_PARAMETERS_OFFSET)
+            slots = tuple(None if v == _IPJ_DUMMY_FLOAT else v for v in raw)
+            method = struct.unpack_from("<i", chunk, _IPJ_METHOD_OFFSET)[0]
+            layout = _IPJ_SLOTS.get(method, {})
+            named = {field: slots[slot] for field, slot in layout.items()}
 
             params = ProjectionParameters(
                 name=name,
@@ -703,10 +745,15 @@ def find_projection_parameters(
                 datum_transform_name=transform_name,
                 semi_major_axis=struct.unpack_from("<d", chunk, _IPJ_SEMI_MAJOR_AXIS_OFFSET)[0],
                 eccentricity=struct.unpack_from("<d", chunk, _IPJ_ECCENTRICITY_OFFSET)[0],
-                central_meridian=_param(_IPJ_CENTRAL_MERIDIAN_OFFSET),
-                scale_factor=_param(_IPJ_SCALE_FACTOR_OFFSET),
-                false_easting=_param(_IPJ_FALSE_EASTING_OFFSET),
-                false_northing=_param(_IPJ_FALSE_NORTHING_OFFSET),
+                central_meridian=named.get("central_meridian"),
+                scale_factor=named.get("scale_factor"),
+                false_easting=named.get("false_easting"),
+                false_northing=named.get("false_northing"),
+                method_code=method,
+                latitude_of_origin=named.get("latitude_of_origin"),
+                standard_parallel_1=named.get("standard_parallel_1"),
+                standard_parallel_2=named.get("standard_parallel_2"),
+                parameters=slots,
             )
             candidates.setdefault(name, []).append(params)
 

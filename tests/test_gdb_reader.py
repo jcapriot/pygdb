@@ -169,6 +169,28 @@ def test_channel_table_rejects_insane_dtype_code(tmp_path):
     assert "Fiducial" not in {c.name for c in channels}
 
 
+def test_channel_table_rejects_a_leftover_record_with_zero_array_width(tmp_path):
+    """
+    Regression test for a real finding (docs/provenance/notes.md section
+    6.2d): three real GSQ files hold 16 leftover records in unused
+    channel-table capacity with clean names (e.g. a second "RADAR", "UTM
+    zone 45N"), a valid dtype (0) and format (0), but array width 0 --
+    and no data. They were returned as channels. A real channel always
+    stores at least one element per fiducial.
+    """
+    data = bytearray(build_gdb_bytes(SIMPLE_CHANNELS, SIMPLE_LINES))
+    channel_table_start = 256  # matches build_gdb_bytes's own layout
+    first = channel_table_start
+    struct.pack_into("<h", data, first + 84, 0)    # GS_BYTE, a valid code
+    struct.pack_into("<h", data, first + 118, 0)   # zero elements per fiducial
+    path = tmp_path / "leftover_record.gdb"
+    path.write_bytes(bytes(data))
+
+    names = {c.name for c in read_channels(str(path))}
+    assert "Fiducial" not in names
+    assert "Easting" in names
+
+
 # -- line table -----------------------------------------------------------------
 
 def test_read_lines_happy_path(tmp_path):
@@ -334,6 +356,22 @@ def test_decode_string_channel_edge_cases(tmp_path, backend):
     npt.assert_array_equal(values, ["abc", "exactly8", "��"])
 
 
+def test_decode_string_channel_all_empty_records(tmp_path, backend):
+    """
+    Regression for a real file (USGS OFR 2011-1270 `Kalay_nk.gdb`, a
+    `string[255]` coordinate channel): when every record is empty the
+    native backend reported a maximum length of 0, and `np.frombuffer`
+    cannot view a buffer as the zero-width dtype `<U0`. Both backends
+    must return empty strings with the same dtype.
+    """
+    path = tmp_path / "test.gdb"
+    path.write_bytes(build_gdb_bytes(SIMPLE_CHANNELS, SIMPLE_LINES))
+    channel = read_channels(str(path))[2]  # LineName, string_width=8
+    values = _decode_numeric_or_string(bytes(8 * 3), channel, row_count=3)
+    npt.assert_array_equal(values, ["", "", ""])
+    assert values.dtype == np.dtype("<U1")
+
+
 def test_decode_string_arrays_are_writable(tmp_path, backend):
     """
     String decode results are independent, writable arrays -- not
@@ -389,6 +427,28 @@ def test_iter_blobs_truncated_file_warns_and_returns_partial(tmp_path):
     with pytest.warns(GDBParseWarning):
         blobs = list(iter_blobs(str(path)))
     assert len(blobs) > 0  # everything before the truncation point is still returned
+
+
+def test_iter_blobs_resumes_after_a_page_that_is_not_a_blob(tmp_path):
+    """
+    Regression for a real file (docs/spec.md section 6.2): pages between
+    blobs that are not blobs (leftover data, never-written zero pages).
+    The walk used to stop at the first one; it must resume at the next
+    page that starts a blob and warn once.
+    """
+    page_size = 64
+    full = build_gdb_bytes(SIMPLE_CHANNELS, SIMPLE_LINES, page_size=page_size)
+    blob_start = struct.unpack_from("<i", full, 108)[0] * page_size
+    first_blob_pages = struct.unpack_from("<i", full, blob_start + 4)[0]
+    cut = blob_start + first_blob_pages * page_size
+    data = full[:cut] + bytes(page_size) + bytes(page_size) + full[cut:]  # two zero pages
+    path = tmp_path / "gap.gdb"
+    path.write_bytes(data)
+
+    with pytest.warns(GDBParseWarning, match=r"skipped 2 page\(s\)"):
+        blobs = list(iter_blobs(str(path)))
+    expected = list(iter_blobs(_write(tmp_path, "full.gdb", full)))
+    assert [b.blob_index for b in blobs] == [b.blob_index for b in expected]
 
 
 # -- blob chain: compressed (standalone fragments, no symbol table needed) ------

@@ -10,6 +10,29 @@ from there.
 
 ## [Unreleased]
 
+### Fixed
+
+- A file with pages between blobs that are not blobs (leftover data or
+  never-written zero pages, seen in a 2023 contractor database) now
+  reads: the blob-chain walk skips such pages, with one summary warning,
+  instead of stopping at the first one and returning no data.
+- Blob-directory start pages are now measured from the blob region's
+  start (header word 108), not from the first blob found. The two differ
+  when the region begins with a page that is not a blob; every entry
+  then failed validation.
+- A blob-directory entry with its rewrite bit set (top nibble `0xC`) is
+  now accepted as live. It was treated as invalid, so the reader warned
+  and fell back to the last copy in the chain, which can be the stale
+  one; first seen in a USGS file (OFR 2011-1270).
+- A string channel whose records are all empty no longer raises
+  `ValueError` with the compiled extension; it returns empty strings, as
+  the pure-Python path already did.
+- Leftover records in unused channel-table capacity are no longer
+  reported as channels. Three real files listed extra "channels" with
+  names copied from real channels (a second `RADAR`, `RAWMAG`, ...) or
+  from the projection catalog (`UTM zone 45N`); they have zero elements
+  per fiducial and no data, and are now skipped.
+
 ### Added
 
 - `pygdb.registry.find_channel_settings` / `GDB.channel_settings`: real
@@ -33,9 +56,14 @@ from there.
   real geodetic parameters (datum, ellipsoid, datum-transformation name,
   central meridian, scale factor, false easting/northing) decoded from a
   file's own IPJ registry, keyed by the same coordinate-system name
-  `coordinate_systems` already returns. Where a coordinate system defines
-  no projection (a datum/ellipsoid-only entry), the projection fields are
-  `None` rather than the on-disk dummy sentinel.
+  `coordinate_systems` already returns. Parameters are read by projection
+  method (`method_code`): Transverse Mercator, Lambert Conic Conformal
+  (2SP) and Polar Stereographic are named, including `latitude_of_origin` and the Lambert
+  `standard_parallel_1`/`standard_parallel_2`; the eight raw parameter
+  slots are always available as `parameters`. Where a coordinate system
+  defines no projection (a datum/ellipsoid-only entry), or the method is
+  not one the reader names, the named fields are `None` rather than the
+  on-disk dummy sentinel.
 
 ## [0.3.0] - 2026-09-26
 
