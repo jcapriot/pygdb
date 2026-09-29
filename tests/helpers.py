@@ -228,14 +228,24 @@ def build_real_layout_gdb_bytes(
     stale_copies: Sequence[tuple] = (),
     unlisted: Sequence[tuple] = (),
     corrupt_entries: Optional[dict] = None,
+    blob_symbols: Optional[dict] = None,
+    blobs_max: int = 4,
+    admin_blobs: Sequence[bytes] = (),
+    leading_junk_pages: int = 0,
 ) -> bytes:
     """
     Like `build_gdb_bytes`, but laid out the way real files are
     (docs/spec.md section 2.1/2.2): header, 24 bytes, blob directory at
     offset 280, blob-symbol table, line table (`lines_max` slots),
-    24-byte gap, channel table, user table, page padding, blob chain --
-    with the header words (`lines_max`, `blobs_max`, the directory slot
-    counts, ...) the reader now relies on.
+    channel table, user table, page padding, blob chain -- with the
+    header words (`lines_max`, `blobs_max`, the directory slot counts,
+    the running symbol totals, ...) the reader now relies on.
+
+    Records are placed at their true boundaries (docs/spec.md section
+    2.1): each begins with its name, so the directory ends exactly where
+    the blob-symbol table begins, and the line table's legacy start
+    (32 bytes before its first name) overlaps the last blob symbol's
+    zero tail.
 
     Parameters
     ----------
@@ -255,19 +265,35 @@ def build_real_layout_gdb_bytes(
         one of `"bad_page"` (start page is not a blob header),
         `"wrong_index"` (points at another pair's blob),
         `"wrong_pages"` (right start, wrong page count) or
-        `"bad_flag"` (top nibble is not 0x8).
+        `"bad_flag"` (top nibble 0x4: the live bit is not set). The
+        valid kind `"rewritten"` sets the 0x40000000 rewrite bit on an
+        otherwise correct entry (top nibble 0xC, docs/spec.md section
+        2.2).
+    blob_symbols : dict of {int : str or (str, int)}, optional
+        Blob-symbol records by slot: a name (a live symbol, category 0)
+        or `(name, category)`, e.g. a freed slot's `0x10000`.
+    blobs_max : int, default 4
+        Blob-symbol table capacity.
+    admin_blobs : sequence of bytes
+        Complete, page-padded administrative blobs appended to the chain
+        after the data blobs.
+    leading_junk_pages : int, default 0
+        Pages of non-blob bytes at the start of the blob region, before
+        the first blob -- a real file was found with one (docs/spec.md
+        section 6.2). Directory start pages still count from the region
+        start.
     """
     corrupt_entries = corrupt_entries or {}
     chans_max = len(channels)
     phantom = len(line_table_prefix) // SYMBOL_RECORD_SIZE
     lines_max = phantom + len(lines) + spare_line_slots
-    blobs_max, cache = 4, 4
+    cache = 4
     data_slots = lines_max * chans_max
     index_slots = data_slots + blobs_max + users_max + cache
 
     dir_start = 280
     blob_symbol_start = dir_start + 6 * index_slots
-    line_table_start = blob_symbol_start + blobs_max * SYMBOL_RECORD_SIZE
+    line_table_start = blob_symbol_start + blobs_max * SYMBOL_RECORD_SIZE - 32
     channel_table_start = line_table_start + lines_max * SYMBOL_RECORD_SIZE + 24
     user_table_start = channel_table_start + chans_max * SYMBOL_RECORD_SIZE
     index_size = user_table_start + users_max * SYMBOL_RECORD_SIZE + 8
@@ -296,7 +322,9 @@ def build_real_layout_gdb_bytes(
             chain.append((key, True, blob_for(*key, l.data[c.name])))
             chain += [(key, False, blob_for(*key, v)) for v in after]
 
-    offsets, position = [], 0
+    chain += [(None, False, bytes(raw)) for raw in admin_blobs]
+
+    offsets, position = [], leading_junk_pages * page_size
     for _key, _live, raw in chain:
         offsets.append(position)
         position += len(raw)
@@ -309,7 +337,8 @@ def build_real_layout_gdb_bytes(
         (24, chans_max), (28, blobs_max), (32, cache), (36, lines_max), (40, users_max),
         (44, index_slots), (48, data_slots), (52, data_slots + blobs_max),
         (56, data_slots + blobs_max + users_max), (60, data_slots + blobs_max + users_max),
-        (64, index_slots), (100, page_size), (104, index_size), (108, blob_start // page_size),
+        (64, blobs_max + lines_max + chans_max + users_max), (72, blobs_max),
+        (76, blobs_max + lines_max), (80, blobs_max + lines_max + chans_max), (100, page_size), (104, index_size), (108, blob_start // page_size),
         (120, comp_level),
     ):
         struct.pack_into("<i", buf, offset, value)
@@ -332,10 +361,19 @@ def build_real_layout_gdb_bytes(
                 count += 1
             elif kind == "bad_flag":
                 word = 0x40000000 | (offset // page_size)
+            elif kind == "rewritten":
+                word = 0xC0000000 | (offset // page_size)
             struct.pack_into("<IH", buf, dir_start + 6 * slot, word, count)
 
     line_table = line_table_prefix + b"".join(pack_line_record(l.name) for l in lines)
     buf[line_table_start:line_table_start + len(line_table)] = line_table
+    for slot, symbol in (blob_symbols or {}).items():
+        name, category = (symbol, 0) if isinstance(symbol, str) else symbol
+        rec = bytearray(SYMBOL_RECORD_SIZE)
+        rec[0:64] = pad_name(name, 64)
+        struct.pack_into("<i", rec, 76, category)
+        start = blob_symbol_start + slot * SYMBOL_RECORD_SIZE
+        buf[start:start + SYMBOL_RECORD_SIZE] = rec
     channel_table = b"".join(
         pack_channel_record(c.name, c.dtype_code, format_code=c.format_code, array_width=c.array_width)
         for c in channels
@@ -345,6 +383,8 @@ def build_real_layout_gdb_bytes(
     buf[user_table_start:user_table_start + len(user_table)] = user_table
     for (_key, _live, raw), offset in zip(chain, offsets):
         buf[blob_start + offset:blob_start + offset + len(raw)] = raw
+    for i in range(leading_junk_pages * page_size):
+        buf[blob_start + i] = 0x70 + (i % 7)  # never the blob magic
     return bytes(buf)
 
 

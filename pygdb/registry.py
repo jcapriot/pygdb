@@ -1,6 +1,7 @@
 """
-Best-effort extraction of coordinate-system (map projection) names from a
-`.gdb` file's REG/IPJ "reserved/administrative" blob region.
+Best-effort extraction of coordinate-system names, channel coordinate
+roles, and per-channel registry settings from a `.gdb` file's REG/IPJ
+"reserved/administrative" blob region.
 
 [CONFIRMED] present and real on every one of 3 independent agencies this
 project has files from; [UNKNOWN] full binary framing beyond the specific
@@ -25,14 +26,20 @@ tied to one corpus's line-numbering conventions.
 from __future__ import annotations
 
 import re
+import struct
 import warnings
-from typing import Dict, Iterable, List, Optional
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .gdb_reader import (
+    DIRECTORY_OFFSET,
+    ChannelRecord,
     GDBParseWarning,
+    blob_region_start,
     check_magic,
     header_fields,
     iter_blobs,
+    read_blob_symbols,
     read_channels,
     read_lines,
 )
@@ -270,3 +277,828 @@ def find_channel_roles(
         else:
             roles[role] = next(iter(valid), None)
     return roles
+
+
+# The REG object's own binary framing (docs/provenance/notes.md section
+# 6.8c): a fixed 128-byte preamble (48-byte blob header with the object's
+# own name -- "REG\0" here -- in place of a GS_* type code, then 80 more
+# bytes of nested-tag framing). From +128 the content is `+124` entries, one
+# `KEY\0value\0` pair per 256-byte slot, then an int32 count of nested
+# objects and those objects (in practice a `MAKER` record naming the GX
+# that made the channel) -- docs/spec.md section 9. This decodes the
+# entries only. Bytes past the object's declared payload (blob `+24`) are
+# leftovers of an earlier version of the object and are never read.
+_REG_OBJECT_NAME = b"REG\x00"
+_REG_PREAMBLE_SIZE = 128
+_REG_ENTRY_COUNT_OFFSET = 124
+_REG_FLAT_KV_SLOT_SIZE = 256
+_REG_FLAT_KV_KEY_RE = re.compile(rb"^([A-Z_][A-Z0-9_.]{1,30})\x00")
+# An object with no entries and one nested object: the int32 count 1 at
+# +128, then the nested object's own frame marker (docs/spec.md section 9,
+# the "MAKER" -> "MAKE" example). Its content isn't decoded.
+_REG_NESTED_VV_MARKER = b"\x01\x00\x00\x00" + bytes.fromhex("ff00f00f")
+# A per-symbol REG object's blob-symbol name: "__" plus the owning
+# symbol's global handle (docs/provenance/notes.md section 6.2d).
+_CHANNEL_OBJECT_NAME_RE = re.compile(r"__(\d+)")
+
+
+def _decode_reg_flat_keyvalues(blob_bytes: bytes) -> Optional[Dict[str, str]]:
+    """
+    Decode one administrative blob's flat `KEY\\0value\\0` registry entries.
+
+    Parameters
+    ----------
+    blob_bytes : bytes
+        The blob's own bytes, starting at its `CC CC 00 FF` magic.
+
+    Returns
+    -------
+    dict of {str : str} or None
+        `None` if this isn't a `REG` object at all, or is too short for
+        the 128-byte preamble, or its content recurses into a second
+        tagged object instead of holding flat slots (see Notes) -- the
+        caller should not treat these as "no settings", just "not this
+        form". Otherwise, `{key: value}` for each of the object's
+        declared entries (see Notes) whose value is non-empty. `{}` is a
+        real result: an object with no entries (`+124` is 0), or one
+        whose every key is still a bare placeholder (confirmed real for
+        some keys, e.g. `CLASS`).
+
+    Notes
+    -----
+    The preamble's int32 at `+124` is the number of flat entries, which
+    occupy the first that many 256-byte slots from byte 128
+    (**[CONFIRMED]**: equal to the count of consecutive key slots from
+    slot 0 on 860 of 860 corpus objects; `docs/provenance/notes.md`
+    section 6.8c). Only those slots are read. Key-shaped bytes past
+    them, or in an object whose count is 0, are **[LIKELY]** leftovers of
+    an earlier version of the object. The case seen is a slot 0 whose
+    key has its first 4 bytes zeroed and later slots that still hold
+    old keys. They are not returned.
+    """
+    if blob_bytes[44:48] != _REG_OBJECT_NAME:
+        return None
+    if len(blob_bytes) < _REG_PREAMBLE_SIZE:
+        return None
+    rest = blob_bytes[_REG_PREAMBLE_SIZE:]
+    if rest[:8] == _REG_NESTED_VV_MARKER:
+        return None
+    n_entries = struct.unpack_from("<i", blob_bytes, _REG_ENTRY_COUNT_OFFSET)[0]
+    result: Dict[str, str] = {}
+    for i in range(0, min(max(n_entries, 0) * _REG_FLAT_KV_SLOT_SIZE, len(rest)), _REG_FLAT_KV_SLOT_SIZE):
+        slot = rest[i:i + _REG_FLAT_KV_SLOT_SIZE]
+        m = _REG_FLAT_KV_KEY_RE.match(slot)
+        if not m:
+            continue
+        value_start = m.end()
+        end = slot.find(b"\x00", value_start)
+        if end == -1:
+            continue  # truncated read -- the value ran past the slot
+        value = slot[value_start:end].decode("ascii", errors="replace")
+        if value:
+            result[m.group(1).decode("ascii")] = value
+    return result
+
+
+def find_channel_settings(
+    path: str,
+    channels: Optional[Iterable[ChannelRecord]] = None,
+) -> Dict[str, Dict[str, str]]:
+    """
+    Scan `path` for real per-channel settings recorded in its REG registry.
+
+    Reads the same "REG "-tagged administrative-blob content
+    `find_coordinate_systems`/`find_channel_roles` already scan, but
+    decodes its flat key/value framing directly (docs/provenance/notes.md
+    section 6.8c) instead of searching for one specific marker -- so this
+    surfaces whatever real settings a channel's REG entries happen to
+    carry: real per-channel display units (`UNITS`), real user-entered
+    processing labels (`LABEL`), real processing formulas (`FORMULA`),
+    among others (docs/spec.md section 9 has the cross-validated evidence
+    for what these keys mean in practice).
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file to scan.
+    channels : iterable of ChannelRecord, optional
+        The file's own real channel table, used to resolve the channel
+        slot an object's symbol name points at to a real channel name
+        (see Notes). If not given, this calls `read_channels(path)`
+        itself (an extra table scan) -- pass `db.channels` if the caller
+        already has it.
+
+    Returns
+    -------
+    dict of {str : dict of {str : str}}
+        `{channel_name: {key: value, ...}, ...}` -- only for a channel
+        with at least one populated key found in its own REG entries; a
+        channel with none (no REG entry at all, or entries that are all
+        bare placeholders, or objects holding only a nested `MAKER`
+        record -- see Notes) is simply absent, not mapped to `{}`. Also `{}` for a
+        file with no readable blob-symbol table
+        (`gdb_reader.read_blob_symbols` returns `None`), since nothing
+        then says which channel an object belongs to.
+
+    Warns
+    -----
+    GDBParseWarning
+        If `path` doesn't start with the expected magic, or its header
+        is too short to read `chans_max`/`page_size` -- fails gracefully
+        like the sibling functions, returning `{}` rather than raising.
+        Also raised, once per `(channel, key)` pair, if two or more of a
+        channel's REG entries give *different* non-empty values for the
+        same key -- the last one in blob-chain order is kept, but this is
+        never decided silently.
+
+    Notes
+    -----
+    **Only an object's `KEY\\0value\\0` entries are decoded** (see
+    `_decode_reg_flat_keyvalues`). Its nested objects -- in practice a
+    `MAKER` record naming the GX that made the channel (docs/spec.md
+    section 9) -- are not. Which keys are meaningful for a given channel
+    is not itself decoded from anything -- only the keys a real file
+    happens to have written are returned.
+
+    **Which channel an object belongs to** comes from its blob symbol
+    (docs/spec.md section 2.1, docs/provenance/notes.md section 6.2d):
+    the administrative blob at `blob_index = data_slots + k` is named by
+    blob-symbol slot `k`, and a per-channel REG object is named
+    `"__<n>"`, where `n` is the channel's global symbol handle,
+    `blobs_max + lines_max + channel_slot`. **[CONFIRMED]**: where an
+    object's `LABEL` equals a real channel's name, this mapping names
+    that channel on 218 corpus objects. The blob index's own remainder
+    (`blob_index % chans_max`), which an earlier version of this
+    function used, named it on none. An object whose handle is not a
+    channel's -- a line handle (real, 744 corpus objects, meaning
+    **[UNKNOWN]**) or any other name -- is skipped.
+
+    This format's append-only storage can leave stale, differing copies
+    of the same object (the same phenomenon `find_channel_roles` handles
+    for `DB_CHAN_X/Y/Z` and issue #2's data blobs) -- every occurrence
+    found is collapsed per key, last one in blob-chain order wins, with
+    a warning only when two real occurrences actually disagree.
+    """
+    with open(path, "rb") as f:
+        header = f.read(128)
+    if not check_magic(header):
+        _warn(f"{path}: does not start with the expected '!CBD' magic -- "
+              f"no channel settings")
+        return {}
+    fields = header_fields(header)
+    page_size = fields["page_size"]
+    if None in (fields["chans_max"], fields["blobs_max"], fields["lines_max"],
+                fields["data_slots"]) or not page_size:
+        _warn(f"{path}: header too short to read the table sizes/page_size -- "
+              f"no channel settings")
+        return {}
+    data_slots = fields["data_slots"]
+    channel_handle_base = fields["blobs_max"] + fields["lines_max"]
+
+    symbols = read_blob_symbols(path)
+    if symbols is None:
+        return {}
+
+    if channels is None:
+        channels = read_channels(path)
+    channel_names = {c.index: c.name for c in channels}
+
+    # {channel_slot: {key: [value, ...]}}, in blob-chain order.
+    candidates: Dict[int, Dict[str, List[str]]] = {}
+    with open(path, "rb") as f:
+        for blob in iter_blobs(path):
+            if blob.blob_index < data_slots:
+                continue  # a real survey line's data, not administrative metadata
+            m = _CHANNEL_OBJECT_NAME_RE.fullmatch(symbols.get(blob.blob_index - data_slots, ""))
+            if not m:
+                continue  # not a per-symbol REG object
+            channel_slot = int(m.group(1)) - channel_handle_base
+            if channel_slot not in channel_names:
+                continue  # not a real, current channel's handle -- nothing to attach this to
+            f.seek(blob.offset)
+            # Same "read the blob's own full declared extent, capped" approach
+            # as find_channel_roles, for the same reason: a real key has been
+            # found tens of kilobytes into a real blob, well past any small
+            # fixed-size probe.
+            blob_size = min(blob.n_pages * page_size, 50_000_000)
+            chunk = f.read(blob_size)
+            kv = _decode_reg_flat_keyvalues(chunk)
+            if not kv:
+                continue
+            by_key = candidates.setdefault(channel_slot, {})
+            for key, value in kv.items():
+                by_key.setdefault(key, []).append(value)
+
+    settings: Dict[str, Dict[str, str]] = {}
+    for channel_slot, by_key in candidates.items():
+        name = channel_names[channel_slot]
+        resolved: Dict[str, str] = {}
+        for key, values in by_key.items():
+            distinct = set(values)
+            if len(distinct) > 1:
+                _warn(
+                    f"{path}: channel {name!r} has {len(distinct)} different "
+                    f"values for registry key {key!r} across stale/duplicate "
+                    f"entries ({sorted(distinct)!r}) -- using the last one in "
+                    f"blob-chain order"
+                )
+            resolved[key] = values[-1]
+        if resolved:
+            settings[name] = resolved
+    return settings
+
+
+# The IPJ object's own binary framing (docs/spec.md section 8,
+# docs/provenance/notes.md section 6.7b): the same 128-byte preamble as a
+# REG object (section 6.8c), but where REG's content is mostly the flat
+# key/value form, an IPJ object's content is a fixed-offset binary record.
+# Every offset below is relative to the blob's own start (its `CC CC 00 FF`
+# magic) and was confirmed identically on 63 of 63 real IPJ objects across
+# all three agencies this project has files from.
+_IPJ_GATE_TAG = b" JPI"
+_IPJ_METHOD_OFFSET = 168
+_IPJ_DATUM_NAME_OFFSET = 180
+_IPJ_ELLIPSOID_NAME_OFFSET = 244
+_IPJ_SEMI_MAJOR_AXIS_OFFSET = 308
+_IPJ_ECCENTRICITY_OFFSET = 316
+_IPJ_DATUM_TRANSFORM_NAME_OFFSET = 332
+# Eight float64 projection parameters at +588..+651; which slot holds which
+# parameter depends on the projection method at +168 (docs/spec.md section
+# 8, confirmed for the three methods below).
+_IPJ_PARAMETERS_OFFSET = 588
+_IPJ_PARAMETER_COUNT = 8
+_IPJ_MIN_LENGTH = _IPJ_PARAMETERS_OFFSET + 8 * _IPJ_PARAMETER_COUNT
+_IPJ_METHOD_GEOGRAPHIC = 1
+_IPJ_METHOD_TRANSVERSE_MERCATOR = 11
+_IPJ_METHOD_LAMBERT_CONIC_2SP = 3
+_IPJ_METHOD_POLAR_STEREOGRAPHIC = 14
+# {method code: {field name: parameter slot}}
+_IPJ_SLOTS = {
+    _IPJ_METHOD_GEOGRAPHIC: {},
+    _IPJ_METHOD_TRANSVERSE_MERCATOR: {
+        "latitude_of_origin": 0, "central_meridian": 1, "scale_factor": 4,
+        "false_easting": 5, "false_northing": 6,
+    },
+    _IPJ_METHOD_LAMBERT_CONIC_2SP: {
+        "standard_parallel_1": 0, "standard_parallel_2": 1,
+        "latitude_of_origin": 2, "central_meridian": 3,
+        "false_easting": 5, "false_northing": 6,
+    },
+    # Same slots as Transverse Mercator; slot 0 is what the source survey's
+    # own metadata calls the standard parallel (docs/spec.md section 8).
+    _IPJ_METHOD_POLAR_STEREOGRAPHIC: {
+        "latitude_of_origin": 0, "central_meridian": 1, "scale_factor": 4,
+        "false_easting": 5, "false_northing": 6,
+    },
+}
+# The vendor's own float64 "not set" sentinel (docs/spec.md section 4),
+# read here at the four projection-parameter offsets on every real
+# ellipsoid/datum-only IPJ object (one that defines no projection) -- a
+# real, confirmed marker, not undecoded garbage.
+_IPJ_DUMMY_FLOAT = -1.0e32
+
+
+def _read_ascii_cstr(buf: bytes, offset: int, max_len: int = 64) -> Optional[str]:
+    """NUL-terminated ASCII string at `buf[offset:offset+max_len]`, or
+    `None` if `buf` is too short or no terminating NUL is found in range
+    (a truncated read, not a real empty string)."""
+    window = buf[offset:offset + max_len]
+    end = window.find(b"\x00")
+    if end == -1:
+        return None
+    return window[:end].decode("ascii", errors="replace")
+
+
+@dataclass(eq=True)
+class ProjectionParameters:
+    """
+    Real geodetic parameters decoded from one `IPJ` registry object.
+
+    Attributes
+    ----------
+    name : str
+        The working coordinate-system name (the same string
+        `find_coordinate_systems` returns for this object).
+    datum_name : str
+        E.g. `"NAD83"`, `"GDA2020"`, `"WGS 84"`.
+    ellipsoid_name : str
+        E.g. `"GRS 1980"`, `"WGS 84"`.
+    datum_transform_name : str or None
+        E.g. `"NAD83 to WGS 84 (1)"`. `None` when this object's datum is
+        already WGS 84 -- nothing to transform, not a decode failure.
+    semi_major_axis : float
+        The ellipsoid's semi-major axis, in metres.
+    eccentricity : float
+        The ellipsoid's eccentricity.
+    central_meridian, scale_factor, false_easting, false_northing : float or None
+        The projection's own parameters. `None` when the object defines
+        only a datum/ellipsoid, when the projection method does not use
+        that parameter (Lambert has no scale factor), or when the method
+        is not one this reader knows (see Notes).
+    method_code : int or None
+        The projection-method code at `+168`: `1` geographic (datum
+        only), `11` Transverse Mercator, `3` Lambert Conic Conformal
+        (2SP), `14` Polar Stereographic. Other values are real but not
+        decoded.
+    latitude_of_origin : float or None
+        Transverse Mercator or Lambert latitude of origin; for Polar
+        Stereographic, the latitude in the same slot, which the source
+        survey's own metadata calls the standard parallel.
+    standard_parallel_1, standard_parallel_2 : float or None
+        Lambert Conic Conformal (2SP) standard parallels.
+    parameters : tuple of (float or None)
+        All eight raw parameter slots (`+588..+651`) in order, `rDUMMY`
+        mapped to `None` -- the only way to reach the values of a method
+        this reader does not name.
+
+    Notes
+    -----
+    **[CONFIRMED]** structure and slot positions for the method codes
+    above (docs/spec.md section 8, docs/provenance/notes.md section
+    6.7b), each against the file's own `_PJ_PROJECTION` text; the Lambert
+    and Polar Stereographic slot *names* are **[LIKELY]**. The on-disk value of an
+    unset parameter is the vendor's float64 `rDUMMY` sentinel
+    (`-1.0e32`, docs/spec.md section 4), mapped to `None` here rather
+    than returned as a raw dummy a caller could mistake for a real
+    coordinate -- this reader's own convention.
+    """
+
+    name: str
+    datum_name: str
+    ellipsoid_name: str
+    datum_transform_name: Optional[str]
+    semi_major_axis: float
+    eccentricity: float
+    central_meridian: Optional[float]
+    scale_factor: Optional[float]
+    false_easting: Optional[float]
+    false_northing: Optional[float]
+    method_code: Optional[int] = None
+    latitude_of_origin: Optional[float] = None
+    standard_parallel_1: Optional[float] = None
+    standard_parallel_2: Optional[float] = None
+    parameters: Tuple[Optional[float], ...] = ()
+
+
+def find_projection_parameters(
+    path: str, max_real_line_slot: Optional[int] = None,
+) -> Dict[str, ProjectionParameters]:
+    """
+    Scan `path` for real geodetic parameters recorded in its IPJ registry.
+
+    Reads the same `IPJ`-tagged administrative-blob content
+    `find_coordinate_systems` already scans for a name, but decodes the
+    object's fixed-offset binary record directly (docs/provenance/
+    notes.md section 6.7b) instead of stopping at the name -- real datum,
+    ellipsoid, and projection parameters, cross-validated against
+    independent ground truth on real files (docs/spec.md section 8).
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file to scan.
+    max_real_line_slot : int, optional
+        See `find_coordinate_systems` -- same meaning and same
+        "pass it if you already have it" reasoning.
+
+    Returns
+    -------
+    dict of {str : ProjectionParameters}
+        Keyed by the same working coordinate-system name
+        `find_coordinate_systems` returns; a real file with no `IPJ`
+        content at all (docs/spec.md section 9) gives `{}`, which is
+        expected and normal, not a sign of a problem.
+
+    Warns
+    -----
+    GDBParseWarning
+        If `path` doesn't start with the expected magic, or its header
+        is too short to read `chans_max` -- fails gracefully like the
+        sibling functions, returning `{}` rather than raising. Also
+        raised, once per name, if two of a coordinate system's `IPJ`
+        entries decode to genuinely *different* parameter sets -- the
+        last one in blob-chain order is kept, but this is never decided
+        silently (the same convention `find_channel_settings` uses).
+
+    Notes
+    -----
+    A candidate blob is only decoded if it has the confirmed `IPJ`
+    object shape: the type-code field reading `b"IPJ\\x00"`, at least
+    652 bytes (through the last parameter slot), and the `" JPI"`
+    marker's own tag also present at its fixed `+96` position -- a
+    structural gate before trusting the fixed-offset fields, matching
+    the validation `find_channel_settings` applies to `REG` objects.
+    Anything else is silently skipped, not warned about.
+    """
+    with open(path, "rb") as f:
+        header = f.read(128)
+    if not check_magic(header):
+        _warn(f"{path}: does not start with the expected '!CBD' magic -- "
+              f"no projection parameters")
+        return {}
+    fields = header_fields(header)
+    chans_max = fields["chans_max"]
+    page_size = fields["page_size"]
+    if chans_max is None or not page_size:
+        _warn(f"{path}: header too short to read chans_max/page_size -- "
+              f"no projection parameters")
+        return {}
+
+    if max_real_line_slot is None:
+        lines = read_lines(path)
+        max_real_line_slot = max((line.index for line in lines), default=-1)
+
+    candidates: Dict[str, List[ProjectionParameters]] = {}
+    with open(path, "rb") as f:
+        for blob in iter_blobs(path):
+            line_slot, _channel_slot = blob.line_channel(chans_max)
+            if line_slot <= max_real_line_slot:
+                continue  # a real survey line's data, not administrative metadata
+            f.seek(blob.offset)
+            blob_size = min(blob.n_pages * page_size, 50_000_000)
+            chunk = f.read(blob_size)
+            if (
+                len(chunk) < _IPJ_MIN_LENGTH
+                or chunk[96:100] != _IPJ_GATE_TAG
+            ):
+                continue
+            m = _IPJ_NAME_RE.search(chunk)
+            if not m:
+                continue
+            name = m.group(1).decode("ascii", errors="replace")
+            datum_name = _read_ascii_cstr(chunk, _IPJ_DATUM_NAME_OFFSET)
+            ellipsoid_name = _read_ascii_cstr(chunk, _IPJ_ELLIPSOID_NAME_OFFSET)
+            if datum_name is None or ellipsoid_name is None:
+                continue  # truncated read -- a name ran past what was read
+            transform_name = _read_ascii_cstr(chunk, _IPJ_DATUM_TRANSFORM_NAME_OFFSET)
+            if transform_name is not None and " to " not in transform_name:
+                transform_name = None  # the datum's own name repeated, not a real transform
+
+            raw = struct.unpack_from(f"<{_IPJ_PARAMETER_COUNT}d", chunk, _IPJ_PARAMETERS_OFFSET)
+            slots = tuple(None if v == _IPJ_DUMMY_FLOAT else v for v in raw)
+            method = struct.unpack_from("<i", chunk, _IPJ_METHOD_OFFSET)[0]
+            layout = _IPJ_SLOTS.get(method, {})
+            named = {field: slots[slot] for field, slot in layout.items()}
+
+            params = ProjectionParameters(
+                name=name,
+                datum_name=datum_name,
+                ellipsoid_name=ellipsoid_name,
+                datum_transform_name=transform_name,
+                semi_major_axis=struct.unpack_from("<d", chunk, _IPJ_SEMI_MAJOR_AXIS_OFFSET)[0],
+                eccentricity=struct.unpack_from("<d", chunk, _IPJ_ECCENTRICITY_OFFSET)[0],
+                central_meridian=named.get("central_meridian"),
+                scale_factor=named.get("scale_factor"),
+                false_easting=named.get("false_easting"),
+                false_northing=named.get("false_northing"),
+                method_code=method,
+                latitude_of_origin=named.get("latitude_of_origin"),
+                standard_parallel_1=named.get("standard_parallel_1"),
+                standard_parallel_2=named.get("standard_parallel_2"),
+                parameters=slots,
+            )
+            candidates.setdefault(name, []).append(params)
+
+    result: Dict[str, ProjectionParameters] = {}
+    for name, params_list in candidates.items():
+        distinct = []
+        for p in params_list:
+            if p not in distinct:
+                distinct.append(p)
+        if len(distinct) > 1:
+            _warn(
+                f"{path}: coordinate system {name!r} has {len(distinct)} "
+                f"different sets of projection parameters across "
+                f"stale/duplicate IPJ entries -- using the last one in "
+                f"blob-chain order"
+            )
+        result[name] = params_list[-1]
+    return result
+
+
+# -- Channel creation records (MAKER) and display lists ------------------------
+#
+# docs/spec.md section 9: a registry object's nested object is a `MAKER`
+# record -- the tool that made the channel and the parameters it ran with --
+# and the `Display List` administrative object is a VV of fixed-width
+# `name\0handle\0` records.
+_OBJECT_FRAME = b"\xff\x00\xf0\x0f"
+_MEMBER_FRAME = b"\xff\x00\xe1\x1e"
+_TAG_BLOCK = b"\x00\x1a\xcc\xff"
+_VV_TAG_BLOCK = _TAG_BLOCK + b"VV  "
+_MAKER_PARAM_RE = re.compile(r'([^=\r\n]+)="(.*)"')
+_DISPLAY_LIST_NAME = "Display List"
+
+
+@dataclass(eq=True)
+class ChannelMaker:
+    """
+    How a channel was made: one `MAKER` record from the file's registry.
+
+    Attributes
+    ----------
+    tool : str
+        The tool that created the channel, as the file records it -- a GX
+        name (`"newchan.gx"`, `"gx\\\\copy.gx"`) or a .NET entry point
+        (`"geogxnet.dll(Geosoft.GX.MathExpressionBuilder...;RunChannel)"`).
+    label : str
+        The tool's human-readable name (`"New channel"`, `"Copy channel"`).
+    parameters : dict of {str : str}
+        The tool's parameters, `{"TOOL.KEY": "value"}` in file order --
+        e.g. `{"NEWCHAN.DISPWIDTH": "10", ...}` or the formula of a math
+        expression. Empty when the tool recorded none.
+
+    Notes
+    -----
+    **[CONFIRMED]** layout on all 305 corpus records (docs/spec.md section 9,
+    docs/provenance/notes.md section 6.8c). Values are returned as the text
+    the file stores; their meaning is the tool's, not decoded here.
+    """
+
+    tool: str
+    label: str
+    parameters: Dict[str, str]
+
+
+@dataclass(eq=True)
+class DisplayListEntry:
+    """
+    One entry of a `Display List` object.
+
+    Attributes
+    ----------
+    label : str
+        The channel name stored in the list. A cached label: a channel
+        renamed after it was added keeps its old name here.
+    handle : int
+        The channel's global symbol handle, which identifies it.
+    channel : str or None
+        The channel's current name, resolved from `handle` through the
+        channel table; `None` if no current channel has that handle.
+    """
+
+    label: str
+    handle: int
+    channel: Optional[str]
+
+
+def _live_admin_objects(path: str) -> Dict[int, bytes]:
+    """
+    `{blob-symbol slot: object bytes}` for every live administrative object.
+
+    The live copy is the one the blob directory lists at slot `data_slots +
+    k` (docs/spec.md section 2.2); a slot with no usable entry falls back to
+    the last copy in chain order. Each value is cut to the object's declared
+    payload (blob `+24`), so leftover bytes after it are never returned.
+    """
+    with open(path, "rb") as f:
+        header = f.read(4096)
+    fields = header_fields(header)
+    data_slots, page_size, blobs_max = fields["data_slots"], fields["page_size"], fields["blobs_max"]
+    first = blob_region_start(header)
+    if None in (data_slots, page_size, blobs_max, first) or not page_size:
+        return {}
+    by_offset = {}
+    last_by_slot = {}
+    for blob in iter_blobs(path):
+        if blob.blob_index >= data_slots:
+            by_offset[blob.offset] = blob
+            last_by_slot[blob.blob_index - data_slots] = blob
+    chosen = dict(last_by_slot)
+    with open(path, "rb") as f:
+        f.seek(DIRECTORY_OFFSET + 6 * data_slots)
+        raw = f.read(6 * blobs_max)
+        for slot in range(len(raw) // 6):
+            word, n_pages = struct.unpack_from("<IH", raw, 6 * slot)
+            if not word & 0x80000000:
+                continue
+            blob = by_offset.get(first + (word & 0x3FFFFFFF) * page_size)
+            if blob is not None and blob.blob_index == data_slots + slot and blob.n_pages == n_pages:
+                chosen[slot] = blob
+        objects = {}
+        for slot, blob in chosen.items():
+            f.seek(blob.offset)
+            data = f.read(min(blob.n_pages * page_size, 50_000_000))
+            if len(data) < 28:
+                continue
+            end = 28 + struct.unpack_from("<i", data, 24)[0]
+            objects[slot] = data[:max(28, min(end, len(data)))]
+    return objects
+
+
+def _decode_maker(nested: bytes) -> Optional[ChannelMaker]:
+    """A `MAKER` nested object (docs/spec.md section 9), or `None` if
+    `nested` does not have that shape."""
+    if (
+        len(nested) < 84 or nested[:4] != _OBJECT_FRAME or nested[16:21] != b"MAKER"
+        or nested[32:36] != _MEMBER_FRAME or nested[64:72] != _TAG_BLOCK + b"MAKE"
+    ):
+        return None
+    try:
+        pos = 76  # after the tag block and its int32 (1)
+        tool_len = struct.unpack_from("<i", nested, pos)[0]
+        tool = nested[pos + 4:pos + 4 + tool_len].split(b"\x00")[0].decode("latin-1")
+        pos += 4 + tool_len + 2  # the tool string is followed by a 2-byte field
+        label_len = struct.unpack_from("<i", nested, pos)[0]
+        label = nested[pos + 4:pos + 4 + label_len].split(b"\x00")[0].decode("latin-1")
+        pos += 4 + label_len
+    except struct.error:
+        return None
+    text = nested[pos:]
+    if text.startswith(b"\xef\xbb\xbf"):
+        text = text[3:]
+    body = text.split(b"\x1a")[0].decode("utf-8", errors="replace")
+    parameters = {}
+    for line in body.split("\r\n"):
+        m = _MAKER_PARAM_RE.fullmatch(line)
+        if m:
+            parameters[m.group(1)] = m.group(2)
+    return ChannelMaker(tool=tool, label=label, parameters=parameters)
+
+
+def _decode_reg_maker(blob_bytes: bytes) -> Optional[ChannelMaker]:
+    """The `MAKER` record of one registry object, if it has one: after the
+    object's `+124` entries comes an int32 count of nested objects, and a
+    count of 1 is followed by the record (docs/spec.md section 9)."""
+    if blob_bytes[44:48] != _REG_OBJECT_NAME or len(blob_bytes) < _REG_PREAMBLE_SIZE + 4:
+        return None
+    n_entries = max(struct.unpack_from("<i", blob_bytes, _REG_ENTRY_COUNT_OFFSET)[0], 0)
+    count_at = _REG_PREAMBLE_SIZE + n_entries * _REG_FLAT_KV_SLOT_SIZE
+    if count_at + 8 > len(blob_bytes) or struct.unpack_from("<i", blob_bytes, count_at)[0] != 1:
+        return None
+    return _decode_maker(blob_bytes[count_at + 4:])
+
+
+def _channel_handles(path: str, channels: Optional[Iterable[ChannelRecord]]):
+    """`(names by channel slot, channel handle base)`, or `None` when the
+    file has no readable header."""
+    with open(path, "rb") as f:
+        header = f.read(128)
+    if not check_magic(header):
+        return None
+    fields = header_fields(header)
+    if None in (fields["blobs_max"], fields["lines_max"], fields["data_slots"]):
+        return None
+    if channels is None:
+        channels = read_channels(path)
+    return {c.index: c.name for c in channels}, fields["blobs_max"] + fields["lines_max"]
+
+
+def find_channel_makers(
+    path: str,
+    channels: Optional[Iterable[ChannelRecord]] = None,
+) -> Dict[str, ChannelMaker]:
+    """
+    Scan `path` for how each channel was made.
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file to scan.
+    channels : iterable of ChannelRecord, optional
+        The file's channel table, used to resolve each record's owning
+        channel handle to a name. If not given, this calls
+        `read_channels(path)` itself -- pass `db.channels` if the caller
+        already has it.
+
+    Returns
+    -------
+    dict of {str : ChannelMaker}
+        `{channel name: ChannelMaker}` for every channel whose registry
+        object holds a `MAKER` record. A channel with none -- imported
+        rather than made by a tool, or a file whose writer kept no record
+        -- is absent. `{}` for a file with no readable blob-symbol table.
+
+    Warns
+    -----
+    GDBParseWarning
+        If `path` doesn't start with the expected magic. Also raised, once
+        per channel, if stale copies of its registry object hold different
+        `MAKER` records -- the last one in blob-chain order is kept.
+
+    Notes
+    -----
+    Attribution follows `find_channel_settings`: the record is owned by
+    the channel named by its object's blob-symbol handle (docs/spec.md
+    section 2.1). Every copy of the object in the chain is read, since a
+    rewritten object can leave its `MAKER` record only in an older copy
+    of itself; differing copies are warned about, never merged.
+    """
+    resolved = _channel_handles(path, channels)
+    if resolved is None:
+        _warn(f"{path}: not a readable .gdb header -- no channel creation records")
+        return {}
+    channel_names, handle_base = resolved
+    with open(path, "rb") as f:
+        fields = header_fields(f.read(128))
+    data_slots, page_size = fields["data_slots"], fields["page_size"]
+    symbols = read_blob_symbols(path)
+    if symbols is None or not page_size:
+        return {}
+    candidates: Dict[int, List[ChannelMaker]] = {}
+    with open(path, "rb") as f:
+        for blob in iter_blobs(path):
+            if blob.blob_index < data_slots:
+                continue
+            m = _CHANNEL_OBJECT_NAME_RE.fullmatch(symbols.get(blob.blob_index - data_slots, ""))
+            if not m:
+                continue
+            channel_slot = int(m.group(1)) - handle_base
+            if channel_slot not in channel_names:
+                continue
+            f.seek(blob.offset)
+            data = f.read(min(blob.n_pages * page_size, 50_000_000))
+            if len(data) < 28:
+                continue
+            end = 28 + struct.unpack_from("<i", data, 24)[0]
+            maker = _decode_reg_maker(data[:end])
+            if maker is not None:
+                candidates.setdefault(channel_slot, []).append(maker)
+    result: Dict[str, ChannelMaker] = {}
+    for channel_slot, makers in candidates.items():
+        name = channel_names[channel_slot]
+        distinct = []
+        for mk in makers:
+            if mk not in distinct:
+                distinct.append(mk)
+        if len(distinct) > 1:
+            _warn(
+                f"{path}: channel {name!r} has {len(distinct)} different creation "
+                f"records across stale/duplicate registry entries -- using the "
+                f"last one in blob-chain order"
+            )
+        result[name] = makers[-1]
+    return result
+
+
+def find_display_lists(
+    path: str,
+    channels: Optional[Iterable[ChannelRecord]] = None,
+) -> List[List[DisplayListEntry]]:
+    """
+    Read the file's `Display List` objects.
+
+    Parameters
+    ----------
+    path : str
+        Path to the `.gdb` file to scan.
+    channels : iterable of ChannelRecord, optional
+        The file's channel table, used to resolve each entry's handle to
+        the channel's current name. If not given, this calls
+        `read_channels(path)` itself.
+
+    Returns
+    -------
+    list of list of DisplayListEntry
+        One list per live `Display List` object, in blob-symbol slot order,
+        each in stored order. `[]` for a file with none, or with no
+        readable blob-symbol table.
+
+    Warns
+    -----
+    GDBParseWarning
+        If `path` doesn't start with the expected magic.
+
+    Notes
+    -----
+    **[CONFIRMED]** layout on all 48 corpus instances (docs/spec.md
+    section 9): a VV of fixed-width strings (82 or 130 bytes), each
+    `name\\0handle\\0`. **[LIKELY]** meaning: the channels shown in the
+    database's spreadsheet view. The live copy of each object comes from
+    the blob directory (docs/spec.md section 2.2).
+    """
+    resolved = _channel_handles(path, channels)
+    if resolved is None:
+        _warn(f"{path}: not a readable .gdb header -- no display lists")
+        return []
+    channel_names, handle_base = resolved
+    symbols = read_blob_symbols(path)
+    if symbols is None:
+        return []
+    objects = _live_admin_objects(path)
+    lists: List[List[DisplayListEntry]] = []
+    for slot in sorted(k for k, name in symbols.items() if name == _DISPLAY_LIST_NAME):
+        data = objects.get(slot)
+        if data is None:
+            continue
+        at = data.find(_VV_TAG_BLOCK)
+        if at == -1 or at + 20 > len(data):
+            continue
+        _zero, element_type, count = struct.unpack_from("<iii", data, at + 8)
+        width = -element_type
+        start = at + 20
+        if width <= 0 or count < 0 or start + count * width > len(data):
+            continue
+        entries = []
+        for i in range(count):
+            parts = data[start + i * width:start + (i + 1) * width].split(b"\x00")
+            label = parts[0].decode("latin-1")
+            handle_text = parts[1].decode("latin-1") if len(parts) > 1 else ""
+            if not handle_text.isdigit():
+                continue
+            handle = int(handle_text)
+            entries.append(DisplayListEntry(
+                label=label, handle=handle, channel=channel_names.get(handle - handle_base),
+            ))
+        lists.append(entries)
+    return lists

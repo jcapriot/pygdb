@@ -8,6 +8,72 @@ minor releases may change behavior, patch releases fix bugs).
 The version number lives in `rust/Cargo.toml`; `pyproject.toml` reads it
 from there.
 
+## [Unreleased]
+
+### Fixed
+
+- A file with pages between blobs that are not blobs (leftover data or
+  never-written zero pages, seen in a 2023 contractor database) now
+  reads: the blob-chain walk skips such pages, with one summary warning,
+  instead of stopping at the first one and returning no data.
+- Blob-directory start pages are now measured from the blob region's
+  start (header word 108), not from the first blob found. The two differ
+  when the region begins with a page that is not a blob; every entry
+  then failed validation.
+- A blob-directory entry with its rewrite bit set (top nibble `0xC`) is
+  now accepted as live. It was treated as invalid, so the reader warned
+  and fell back to the last copy in the chain, which can be the stale
+  one; first seen in a USGS file (OFR 2011-1270).
+- A string channel whose records are all empty no longer raises
+  `ValueError` with the compiled extension; it returns empty strings, as
+  the pure-Python path already did.
+- Leftover records in unused channel-table capacity are no longer
+  reported as channels. Three real files listed extra "channels" with
+  names copied from real channels (a second `RADAR`, `RAWMAG`, ...) or
+  from the projection catalog (`UTM zone 45N`); they have zero elements
+  per fiducial and no data, and are now skipped.
+
+### Added
+
+- `pygdb.find_channel_makers` / `GDB.channel_makers`: how each channel was
+  made, from the `MAKER` records in the file's registry -- the tool
+  (`newchan.gx`, the math expression builder, `newxy.gx`, ...), its label,
+  and the parameters it ran with (a derived channel's formula, source
+  database, display settings). Returned as `ChannelMaker` records keyed by
+  channel name.
+- `pygdb.find_display_lists` / `GDB.display_lists`: the file's `Display List`
+  objects, each entry a `DisplayListEntry` with the stored label, the
+  channel handle, and the channel's current name resolved from that handle.
+- `pygdb.registry.find_channel_settings` / `GDB.channel_settings`: real
+  per-channel settings recorded in a file's own REG registry -- units,
+  labels, processing formulas, and whatever else a real file happens to
+  have written -- decoded from the registry's flat key/value binary
+  framing rather than searched for by marker. Covers that one framing
+  form only (a cached numeric array or a nested tagged sub-object, both
+  real, are not decoded yet). Each registry object is attributed to its
+  channel through the object's own name in the blob-symbol table, which
+  carries the channel's symbol handle. Objects that belong to a line
+  handle, or to nothing recognisable, are left out. Only the entries an
+  object declares (its entry count) are read, so leftover bytes from an
+  earlier version of the object are not reported as settings.
+- `pygdb.read_blob_symbols`: the names of a file's live administrative
+  objects (`__dbreg`, `Display List`, projection and per-channel registry
+  objects), read from the blob-symbol table after the blob directory.
+- `pygdb.find_channel_roles` is now re-exported at the top level (it was
+  previously only reachable via `pygdb.registry.find_channel_roles`).
+- `pygdb.registry.find_projection_parameters` / `GDB.projection_parameters`:
+  real geodetic parameters (datum, ellipsoid, datum-transformation name,
+  central meridian, scale factor, false easting/northing) decoded from a
+  file's own IPJ registry, keyed by the same coordinate-system name
+  `coordinate_systems` already returns. Parameters are read by projection
+  method (`method_code`): Transverse Mercator, Lambert Conic Conformal
+  (2SP) and Polar Stereographic are named, including `latitude_of_origin` and the Lambert
+  `standard_parallel_1`/`standard_parallel_2`; the eight raw parameter
+  slots are always available as `parameters`. Where a coordinate system
+  defines no projection (a datum/ellipsoid-only entry), or the method is
+  not one the reader names, the named fields are `None` rather than the
+  on-disk dummy sentinel.
+
 ## [0.3.0] - 2026-09-26
 
 ### Changed

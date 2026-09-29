@@ -4,6 +4,8 @@ Unit tests for the pygdb.GDB high-level facade.
 
 from __future__ import annotations
 
+import struct
+
 import numpy as np
 import numpy.testing as npt
 import pytest
@@ -11,8 +13,8 @@ import pytest
 from pygdb import GDB
 
 from helpers import (
-    ChannelSpec, LineSpec, build_gdb_bytes, build_real_layout_gdb_bytes, pack_line_record,
-    pack_plain_blob,
+    BLOB_MAGIC, ChannelSpec, LineSpec, build_gdb_bytes, build_real_layout_gdb_bytes,
+    pack_line_record, pack_plain_blob,
 )
 
 CHANNELS = [
@@ -94,6 +96,87 @@ def test_gdb_coordinate_channels_all_none_when_no_registry_present(db):
     contract as `coordinate_systems`.
     """
     assert db.coordinate_channels == {"X": None, "Y": None, "Z": None}
+
+
+def test_gdb_channel_settings_empty_when_no_registry_present(db):
+    assert db.channel_settings == {}
+
+
+def _reg_flat_kv_blob(blob_index: int, key: str, value: str, page_size: int) -> bytes:
+    """A REG object's flat key/value form (docs/provenance/notes.md
+    section 6.8c), minimal single-key version for GDB-level tests -- see
+    tests/test_registry.py's own fuller helper for the byte layout."""
+    n_pages = max(1, -(-384 // page_size))  # 128-byte preamble + one 256-byte slot
+    blob = bytearray(n_pages * page_size)
+    blob[0:4] = BLOB_MAGIC
+    struct.pack_into("<i", blob, 4, n_pages)
+    struct.pack_into("<i", blob, 8, n_pages)
+    struct.pack_into("<i", blob, 12, blob_index)
+    blob[44:48] = b"REG\x00"
+    struct.pack_into("<i", blob, 124, 1)  # the entry count
+    slot = key.encode("ascii") + b"\x00" + value.encode("ascii") + b"\x00"
+    blob[128:128 + len(slot)] = slot
+    return bytes(blob)
+
+
+def test_gdb_channel_settings_reflects_real_registry_content_and_is_cached(tmp_path):
+    page_size = 512
+    lines_max = len(LINES) + 1  # build_real_layout_gdb_bytes: one spare line slot
+    blobs_max = 4
+    data_slots = lines_max * len(CHANNELS)
+    easting_handle = blobs_max + lines_max + 1  # channel slot 1 = Easting
+    data = build_real_layout_gdb_bytes(
+        CHANNELS, LINES, page_size=page_size, blobs_max=blobs_max,
+        blob_symbols={0: f"__{easting_handle}"},
+        admin_blobs=[_reg_flat_kv_blob(data_slots + 0, "UNITS", "m", page_size)],
+    )
+    path = tmp_path / "settings.gdb"
+    path.write_bytes(data)
+    db = GDB(str(path))
+
+    first = db.channel_settings
+    assert first == {"Easting": {"UNITS": "m"}}
+    assert db.channel_settings is first  # cached, not recomputed
+
+
+def test_gdb_projection_parameters_empty_when_no_registry_present(db):
+    assert db.projection_parameters == {}
+
+
+def _inject_ipj_blob(data: bytes, blob_index: int, page_size: int) -> bytes:
+    """A minimal, real-shaped IPJ registry object (docs/spec.md section 8)
+    for GDB-level tests -- see tests/test_registry.py's own fuller helper
+    for the byte layout and every field's meaning."""
+    n_pages = max(1, -(-652 // page_size))
+    blob = bytearray(n_pages * page_size)
+    blob[0:4] = BLOB_MAGIC
+    struct.pack_into("<i", blob, 4, n_pages)
+    struct.pack_into("<i", blob, 8, n_pages)
+    struct.pack_into("<i", blob, 12, blob_index)
+    blob[44:48] = b"IPJ\x00"
+    marker = b" JPI" + (1).to_bytes(4, "little") + b"WGS 84 / UTM zone 54S\x00"
+    blob[96:96 + len(marker)] = marker
+    blob[180:187] = b"WGS 84\x00"
+    blob[244:251] = b"WGS 84\x00"
+    struct.pack_into("<d", blob, 308, 6378137.0)
+    struct.pack_into("<d", blob, 316, 0.0818191908426215)
+    struct.pack_into("<i", blob, 168, 11)  # Transverse Mercator
+    # parameter slots 0..7: latitude of origin, central meridian, -, -, scale, FE, FN, -
+    struct.pack_into("<8d", blob, 588, 0.0, 141.0, -1.0e32, -1.0e32, 0.9996, 500000.0, 10000000.0, -1.0e32)
+    return bytes(data) + bytes(blob)
+
+
+def test_gdb_projection_parameters_reflects_real_registry_content_and_is_cached(tmp_path):
+    page_size = 1024
+    data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
+    data = _inject_ipj_blob(data, 50 * len(CHANNELS), page_size)
+    path = tmp_path / "ipj.gdb"
+    path.write_bytes(data)
+    db = GDB(str(path))
+
+    first = db.projection_parameters
+    assert first["WGS 84 / UTM zone 54S"].central_meridian == 141.0
+    assert db.projection_parameters is first  # cached, not recomputed
 
 
 def test_gdb_channels_on_line_reflects_sparse_grid(db):
@@ -1388,6 +1471,41 @@ def test_a_directory_entry_that_fails_validation_falls_back_to_last_and_warns(tm
     with pytest.warns(GDBParseWarning, match=r"blob-directory entry.*'L100'.*'Value'"):
         values = GDB(path).read("L100", "Value")
     npt.assert_array_equal(values, [1.0, 2.0, 3.0])  # last in chain order is the live one here
+
+
+def test_a_rewritten_directory_entry_selects_its_copy_even_when_earlier(tmp_path):
+    """
+    Regression for a real file (USGS OFR 2011-1270 `Kalay_nk.gdb`): a live
+    data entry can carry the rewrite bit (top nibble 0xC, docs/spec.md
+    section 2.2). There it pointed at the *earlier* of two copies, the
+    later one being on the free list. The reader treated 0xC as invalid
+    and fell back to the last copy -- the stale one.
+    """
+    import warnings
+
+    path = _write(
+        tmp_path, stale_copies=[("L100", "Value", [9.0, 8.0, 7.0], "after")],
+        corrupt_entries={("L100", "Value"): "rewritten"},
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        npt.assert_array_equal(GDB(path).read("L100", "Value"), [1.0, 2.0, 3.0])
+
+
+def test_directory_pages_count_from_the_region_start_not_the_first_blob(tmp_path):
+    """
+    Regression for a real file (docs/spec.md section 6.2): with a page
+    that is not a blob at the start of the blob region, directory start
+    pages must still be measured from the region start (header word 108).
+    Measuring from the first blob walked made every entry invalid.
+    """
+    from pygdb import GDBParseWarning
+
+    path = _write(tmp_path, leading_junk_pages=1)
+    with pytest.warns(GDBParseWarning, match=r"skipped 1 page") as caught:
+        values = GDB(path).read("L100", "Value")
+    npt.assert_array_equal(values, [1.0, 2.0, 3.0])
+    assert not any("does not point at a blob" in str(w.message) for w in caught)
 
 
 def test_blobs_the_directory_does_not_list_are_skipped_with_a_warning(tmp_path):

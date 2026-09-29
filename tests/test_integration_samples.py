@@ -11,8 +11,10 @@ regression coverage; everyone else just doesn't run these tests.
 
 from __future__ import annotations
 
+import glob
 import os
 import struct
+import warnings
 import zlib
 
 import numpy as np
@@ -55,19 +57,231 @@ def test_every_real_file_parses_without_exception(all_gdb_sample_paths):
     assert not failures, "\n".join(failures)
 
 
+def test_channel_settings_runs_cleanly_on_every_real_file(all_gdb_sample_paths):
+    """
+    `find_channel_settings` (docs/provenance/notes.md section 6.8c) is
+    the newest, least-tested-in-the-wild registry function -- sweep the
+    whole corpus to catch anything the synthetic fixtures in
+    tests/test_registry.py can't (an unexpected real byte layout).
+    """
+    failures = []
+    for path in all_gdb_sample_paths:
+        try:
+            GDB(path).channel_settings
+        except Exception as e:  # noqa: BLE001 -- deliberately broad, this is a corpus sweep
+            failures.append(f"{_basename(path)}: {e!r}")
+    assert not failures, "\n".join(failures)
+
+
+def test_channel_settings_matches_known_real_values(samples_dir):
+    """
+    Values whose owning channel is evident from the value itself
+    (docs/provenance/notes.md section 6.2d). An earlier version of this
+    test asserted `ch_11`/`base` values on `Magnetic_Data.gdb` that came
+    from the old `blob_index % chans_max` attribution, which named the
+    wrong channel: `ch_11`'s formula object carries a line handle, and
+    the label pinned on `base` belongs to `time`.
+    """
+    cases = {
+        "DB_Mag_1141.gdb": {("Line", "LABEL"): "Line number", ("Date", "UNITS"): "YYYYMMDD",
+                            ("Longitude", "LABEL"): "WGS84 Longitude"},
+        "DB_EM_MountGordon_1003.gdb": {("FLIGHT", "LABEL"): "FLIGHT"},
+    }
+    found = {os.path.basename(p): p for p in glob.glob(os.path.join(samples_dir, "**", "*.gdb"), recursive=True)}
+    checked = 0
+    for name, expected in cases.items():
+        if name not in found:
+            continue
+        settings = GDB(found[name]).channel_settings
+        for (channel, key), value in expected.items():
+            assert settings[channel][key] == value
+        checked += 1
+    if not checked:
+        pytest.skip("none of the known-value files present locally")
+
+
+def test_leftover_channel_records_are_not_channels(all_gdb_sample_paths):
+    """
+    Regression for docs/provenance/notes.md section 6.2d: three GSQ files
+    hold leftover records in unused channel-table capacity (second copies
+    of real names such as "RADAR", projection-catalog names such as "UTM
+    zone 45N") with array width 0 and no data. They used to appear as
+    channels, duplicating real names.
+    """
+    wanted = {"DB_AGG_1213.gdb", "DB_Mag_1213.gdb", "DB_Mag_1212.gdb"}
+    checked = 0
+    for path in all_gdb_sample_paths:
+        if _basename(path) not in wanted:
+            continue
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            names = GDB(path).channel_names
+        assert len(names) == len(set(names)) == 16, _basename(path)
+        assert not any("UTM zone" in n for n in names)
+        checked += 1
+    if not checked:
+        pytest.skip("none of the affected files present locally")
+
+
+def test_channel_settings_labels_name_their_own_channel(all_gdb_sample_paths):
+    """
+    Corpus-wide regression for docs/provenance/notes.md section 6.2d:
+    where a channel's `LABEL` is itself the name of a real channel, it
+    should almost always be that channel's own name. The exceptions are
+    derived channels whose label was copied from their source (e.g.
+    `MGA_East` labelled `EASTING`). Under the old modulo attribution
+    this held for 0 objects.
+    """
+    own = other = 0
+    for path in all_gdb_sample_paths:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            db = GDB(path)
+            settings = db.channel_settings
+        names = set(db.channel_names)
+        for channel, keys in settings.items():
+            label = keys.get("LABEL")
+            if label in names:
+                if label == channel:
+                    own += 1
+                else:
+                    other += 1
+    if own + other == 0:
+        pytest.skip("no checkable labels in the local corpus")
+    assert own / (own + other) >= 0.9
+
+
+def test_channel_makers_and_display_lists_run_cleanly_on_every_real_file(all_gdb_sample_paths):
+    """Corpus sweep for `find_channel_makers` / `find_display_lists`
+    (docs/spec.md section 9): no exceptions, and every display-list entry
+    carries a handle."""
+    failures = []
+    for path in all_gdb_sample_paths:
+        try:
+            db = GDB(path)
+            db.channel_makers
+            for entries in db.display_lists:
+                assert all(isinstance(e.handle, int) for e in entries)
+        except Exception as e:  # noqa: BLE001 -- deliberately broad, this is a corpus sweep
+            failures.append(f"{_basename(path)}: {e!r}")
+    assert not failures, "\n".join(failures)
+
+
+def test_channel_makers_and_display_lists_known_real_values(samples_dir):
+    """
+    `AG106386`'s `Date` channel was made by the math expression builder
+    with a date formula; `Kalay_nk.gdb`'s display list still names two
+    channels by their pre-rename labels (`Afghan_X` for `AfghanTM_X`).
+    """
+    checked = 0
+    ag = os.path.join(samples_dir, "GSQ_Data", "AG106386_Northern Georgetown_Conductivity.gdb")
+    if os.path.exists(ag):
+        maker = GDB(ag).channel_makers["Date"]
+        assert "MathExpressionBuilder" in maker.tool
+        assert maker.parameters["MATHEXPRESSIONBUILDER.CHANNELINPUTBOX"].startswith("C0 = date_year(C1)")
+        checked += 1
+    kalay = os.path.join(samples_dir, "usgs_afghanistan_2011", "Kalay_nk.gdb")
+    if os.path.exists(kalay):
+        (entries,) = GDB(kalay).display_lists
+        assert [(e.label, e.channel) for e in entries][2:4] == [("Afghan_X", "AfghanTM_X"), ("Afghan_Y", "AfghanTM_Y")]
+        checked += 1
+    if not checked:
+        pytest.skip("neither known-value file present locally")
+
+
+def test_projection_parameters_runs_cleanly_on_every_real_file(all_gdb_sample_paths):
+    """
+    `find_projection_parameters` (docs/spec.md section 8, docs/provenance/
+    notes.md section 6.7b) is the newest, least-tested-in-the-wild
+    registry function -- sweep the whole corpus to catch anything the
+    synthetic fixtures in tests/test_registry.py can't.
+    """
+    failures = []
+    for path in all_gdb_sample_paths:
+        try:
+            GDB(path).projection_parameters
+        except Exception as e:  # noqa: BLE001 -- deliberately broad, this is a corpus sweep
+            failures.append(f"{_basename(path)}: {e!r}")
+    assert not failures, "\n".join(failures)
+
+
+def test_projection_parameters_matches_known_real_values(samples_dir):
+    """
+    Cross-checked against this session's own by-hand decode
+    (docs/spec.md section 8, docs/provenance/notes.md section 6.7b):
+    `AG106386`'s working CRS parameters match the paired ASEG-GDF2
+    `.prj` sidecar exactly, digit for digit, independently of
+    `find_projection_parameters`.
+    """
+    path = os.path.join(samples_dir, "GSQ_Data", "AG106386_Northern Georgetown_Conductivity.gdb")
+    if not os.path.exists(path):
+        pytest.skip("AG106386_Northern Georgetown_Conductivity.gdb not present locally")
+    params = GDB(path).projection_parameters["WGS 84 / UTM zone 54S"]
+    assert params.datum_name == "WGS 84"
+    assert params.semi_major_axis == 6378137.0
+    assert params.eccentricity == pytest.approx(0.0818191908426215)
+    assert params.central_meridian == 141.0
+    assert params.scale_factor == 0.9996
+    assert params.false_easting == 500000.0
+    assert params.false_northing == 10000000.0
+
+
+def test_projection_parameters_by_method_on_a_lambert_file(samples_dir):
+    """
+    USGS OFR 2006-1204 `afgrav.gdb` (docs/spec.md section 8): its readme
+    states a Transverse Mercator projection with base latitude 34 N and
+    central meridian 66 E; the file also holds a Lambert Conic Conformal
+    (2SP) system whose registry text reads `30,38,0,66,0,0`.
+    """
+    path = os.path.join(samples_dir, "usgs_afghanistan_2006", "afgrav.gdb")
+    if not os.path.exists(path):
+        pytest.skip("afgrav.gdb not present locally")
+    params = GDB(path).projection_parameters
+    tm = params["WGS 84 / *tm_afghan"]
+    assert (tm.method_code, tm.latitude_of_origin, tm.central_meridian, tm.scale_factor) == (11, 34.0, 66.0, 0.9996)
+    lcc = params["WGS 84 / *lcc_afghan"]
+    assert lcc.method_code == 3
+    assert (lcc.standard_parallel_1, lcc.standard_parallel_2) == (30.0, 38.0)
+    assert (lcc.latitude_of_origin, lcc.central_meridian, lcc.scale_factor) == (0.0, 66.0, None)
+
+
+def test_projection_parameters_polar_stereographic_and_second_lambert(samples_dir):
+    """
+    British Antarctic Survey `Brunt_mag_2017.gdb` (docs/spec.md section 8):
+    a Polar Stereographic system (method 14) whose registry text reads
+    `"Polar Stereographic",-71,0,0.994,0,2082760.109` and whose survey
+    metadata states "Standard parallel -71", plus an independent Lambert
+    system.
+    """
+    path = os.path.join(samples_dir, "bas_brunt_2017", "Brunt_mag_2017.gdb")
+    if not os.path.exists(path):
+        pytest.skip("Brunt_mag_2017.gdb not present locally")
+    params = GDB(path).projection_parameters
+    ps = params["WGS 84 / *bas_polar"]
+    assert (ps.method_code, ps.latitude_of_origin, ps.central_meridian) == (14, -71.0, 0.0)
+    assert (ps.scale_factor, ps.false_easting, ps.false_northing) == (0.994, 0.0, 2082760.109)
+    lcc = params["WGS 84 / *Weddel_lamb"]
+    assert lcc.method_code == 3
+    assert (lcc.standard_parallel_1, lcc.standard_parallel_2) == (-82.0, -78.0)
+    assert (lcc.latitude_of_origin, lcc.central_meridian) == (-80.0, -81.0)
+
+
 def test_every_real_file_has_reg_or_ipj_content(all_gdb_sample_paths):
     """
     Regression test for the correction in docs/spec.md section 9: an
     earlier hardcoded line_slot>700 threshold silently missed real
     administrative-blob content in several files, wrongly concluding
-    they had none. With the per-file threshold GDB actually uses (every
-    line-table slot beyond that file's own highest real line index),
-    every file in this corpus has been confirmed to have some.
+    they had none. Every file in the corpus has at least its database
+    registry (`__dbreg`, docs/spec.md section 2.1). A coordinate system
+    is not universal: two OFR 2011-1270 profile databases (resistivity,
+    chargeability) have registries but no IPJ object.
     """
+    from pygdb import read_blob_symbols
+
     empty = []
     for path in all_gdb_sample_paths:
-        db = GDB(path)
-        if not db.coordinate_systems:
+        symbols = read_blob_symbols(path) or {}
+        if "__dbreg" not in symbols.values() and not GDB(path).coordinate_systems:
             empty.append(_basename(path))
     assert not empty, f"expected REG/IPJ content in every real file, found none in: {empty}"
 
@@ -466,13 +680,59 @@ def test_exact_line_table_matches_the_heuristic_plus_calibration_on_every_real_f
         assert [(l.name, l.index) for l in db.lines] == [(l.name, l.index) for l in lines]
 
 
+def _unlisted_blobs_are_freed(path):
+    """
+    docs/spec.md section 2.2: every chain blob that no data or registry
+    directory slot references is on the free list (the `cache` slots),
+    and the pages of any that are not add up to header word 116.
+    Returns `(orphan count, free-listed count, unlisted pages, word 116)`.
+    """
+    with open(path, "rb") as f:
+        header = f.read(4096)
+    fields = header_fields(header)
+    page_size, index_slots = fields["page_size"], fields["index_slots"]
+    free_start = struct.unpack_from("<i", header, 60)[0]
+    word116 = struct.unpack_from("<i", header, 116)[0]
+    with open(path, "rb") as f:
+        f.seek(280)
+        raw = f.read(6 * index_slots)
+    words = [struct.unpack_from("<IH", raw, 6 * s) for s in range(index_slots)]
+    live = {w & 0x0FFFFFFF for w, _n in words[:free_start] if w >> 28 in (0x8, 0xC)}
+    free = {w & 0x0FFFFFFF for w, _n in words[free_start:] if w >> 28 in (0x8, 0xC)}
+    first = struct.unpack_from("<i", header, 108)[0] * page_size
+    orphans = [b for b in iter_blobs(path) if (b.offset - first) // page_size not in live]
+    listed = [b for b in orphans if (b.offset - first) // page_size in free]
+    unlisted_pages = sum(b.n_pages for b in orphans if (b.offset - first) // page_size not in free)
+    return len(orphans), len(listed), unlisted_pages, word116
+
+
+def _was_resized(path):
+    """
+    docs/spec.md section 2.2: a database whose tables were resized keeps
+    its old administrative objects (blob class 100, docs/spec.md section
+    6.3) at blob indexes inside the *new* data range, and leaves blobs
+    that neither the directory nor the free list references. Such a file
+    is exempt from the free-list / word-116 bookkeeping rules.
+    """
+    with open(path, "rb") as f:
+        header = f.read(4096)
+        data_slots = header_fields(header)["data_slots"]
+        for blob in iter_blobs(path):
+            if blob.blob_index < data_slots:
+                f.seek(blob.offset + 20)
+                if struct.unpack("<i", f.read(4))[0] == 100:
+                    return True
+    return False
+
+
 def test_blob_directory_lists_every_real_blob_except_known_unlisted_channels(all_gdb_sample_paths):
     """
-    Where a file has a blob directory, it lists a live blob for every real
-    (line, channel) except whole channels the file does not list -- in the
-    corpus, the two 'GSC level' channels of one Ontario file. Every entry
-    that exists passes the strict check, and no duplicated pair is left
-    unresolved.
+    Where a file has a blob directory, every entry that exists passes the
+    strict check and no duplicated pair is left unresolved. Blobs the
+    directory does not list (two whole channels of `SAMAGEM_CDI`, 13
+    single-line channels of `afgrav.gdb`) are freed blobs: they are on the
+    free list, or counted by header word 116 when the list is full
+    (docs/spec.md section 2.2) -- except in a resized database.
     """
     import warnings
 
@@ -486,8 +746,56 @@ def test_blob_directory_lists_every_real_blob_except_known_unlisted_channels(all
         messages = [str(w.message) for w in caught if issubclass(w.category, GDBParseWarning)]
         assert not any("does not point at a blob" in m for m in messages), f"{_basename(path)}: {messages}"
         assert not any("no blob directory" in m for m in messages), f"{_basename(path)}: {messages}"
-        skipped = [m for m in messages if "skipped" in m]
+        skipped = [m for m in messages if "(line, channel) blob(s)" in m and "skipped" in m]
         if _basename(path) == "SAMAGEM_CDI.gdb":
             assert len(skipped) == 1 and "'CVG_GSCLevel' (291)" in skipped[0] and "'mag_gsclevel' (291)" in skipped[0]
-        else:
-            assert not skipped, f"{_basename(path)}: {skipped}"
+        if skipped and not _was_resized(path):
+            orphans, listed, unlisted_pages, word116 = _unlisted_blobs_are_freed(path)
+            assert listed == orphans or unlisted_pages == word116, (
+                f"{_basename(path)}: {orphans} orphaned blob(s), {listed} on the free list, "
+                f"{unlisted_pages} unlisted page(s) vs word 116 = {word116}"
+            )
+
+
+def test_header_word_116_counts_orphans_missing_from_the_free_list(all_gdb_sample_paths):
+    """
+    Regression for docs/spec.md section 2 (word 116, `DB_INFO_LOST_SIZE`):
+    exact on every corpus file that was not resized, including five with a
+    full free list (`SAMAGEM_CDI` 26,966, `Magnetic_Data` 26,
+    `long_valley_ed` 1,148, `Brunt_mag_2017` 354). The one resized file
+    (OpenEI BRIDGE `GP_Master_Gravity_11082023.gdb`) keeps unreferenced
+    leftovers the counter does not include.
+    """
+    resized = []
+    for path in all_gdb_sample_paths:
+        if _was_resized(path):
+            resized.append(_basename(path))
+            continue
+        _orphans, _listed, unlisted_pages, word116 = _unlisted_blobs_are_freed(path)
+        assert unlisted_pages == word116, f"{_basename(path)}: {unlisted_pages} vs {word116}"
+    assert set(resized) <= {"GP_Master_Gravity_11082023.gdb"}, resized
+
+
+def test_a_file_with_non_blob_pages_in_the_blob_region_reads(samples_dir):
+    """
+    OpenEI BRIDGE `GP_Master_Gravity_11082023.gdb` (docs/spec.md section
+    6.2): one page of leftover data at the start of the blob region and 96
+    all-zero pages later. The chain walk used to stop at the first page and
+    return no blobs, and the directory lookup measured start pages from the
+    first blob walked instead of the region start.
+    """
+    import warnings
+
+    path = os.path.join(samples_dir, "openei_bridge_2024", "GP_Master_Gravity_11082023.gdb")
+    if not os.path.exists(path):
+        pytest.skip("GP_Master_Gravity_11082023.gdb not present locally")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        db = GDB(path)
+        line = db.line_names[0]
+        channels = db.channels_on_line(line)
+        rows = len(db.read(line, channels[0]))
+    messages = [str(w.message) for w in caught]
+    assert len(channels) == 72 and rows == 124
+    assert any("skipped 97 page(s)" in m for m in messages)
+    assert not any("does not point at a blob" in m for m in messages)

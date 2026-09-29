@@ -44,6 +44,8 @@ them.
 
 ::: pygdb.read_blob_directory
 
+::: pygdb.read_blob_symbols
+
 ::: pygdb.read_blob_values
 
 ## `.grd` reader
@@ -52,9 +54,25 @@ them.
 
 ::: pygdb.GrdHeader
 
-## Coordinate-system registry
+## Registry
 
 ::: pygdb.find_coordinate_systems
+
+::: pygdb.find_channel_roles
+
+::: pygdb.find_channel_settings
+
+::: pygdb.find_projection_parameters
+
+::: pygdb.ProjectionParameters
+
+::: pygdb.find_channel_makers
+
+::: pygdb.ChannelMaker
+
+::: pygdb.find_display_lists
+
+::: pygdb.DisplayListEntry
 
 ## Warnings and errors
 
