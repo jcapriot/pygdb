@@ -149,6 +149,41 @@ def _open(path):
     return g
 
 
+def test_ipj_tagged_object_without_the_gate_marker_is_not_decoded(tmp_path):
+    """Regression: a real Golden Triangle (Geoscience BC) file has an
+    `IPJ\\0`-tagged object of the right minimum length but without the
+    `" JPI"` marker at +96 -- some other object sharing the class name,
+    not a real projection record. Decoding it anyway read method code 0
+    and an all-unset parameter vector as if it were a genuine unseen
+    projection method. The check must skip it exactly as
+    `find_projection_parameters` does."""
+    def make(blob_index):
+        blob = _blob(blob_index, b"IPJ\x00", b"", 700)
+        blob[96:100] = b"\x00\x00\x00\x00"  # not " JPI"
+        return bytes(blob)
+    path = _write(tmp_path, admin=[(0, make)])
+    assert _notices(lambda: _open(path)) == []
+
+
+def test_ipj_object_without_a_decodable_name_is_not_decoded(tmp_path):
+    """Regression: a real Geoscience BC Golden Triangle file has dozens of
+    `IPJ\\0`-tagged, gated objects named `?|IPJ_<channel>:<channel>` --
+    real, common per-channel-pair placeholders, not named coordinate
+    systems -- whose content has no embedded `" JPI"`+name marker
+    anywhere and always reads method code 0. Checking them the same way
+    as a real coordinate system's IPJ object read every one of them as an
+    unseen projection method. `find_projection_parameters` already skips
+    an object with no decodable name; this check must too."""
+    def make(blob_index):
+        blob = _blob(blob_index, b"IPJ\x00", b"", 700)
+        blob[92:100] = b"\x00\x1a\xcc\xff JPI"  # the gate tag, no name pattern after it
+        struct.pack_into("<i", blob, 168, 0)
+        struct.pack_into("<8d", blob, 588, *([RDUMMY] * 8))
+        return bytes(blob)
+    path = _write(tmp_path, admin=[(0, make)], symbols={0: "?|IPJ_x:y"})
+    assert _notices(lambda: _open(path)) == []
+
+
 def test_no_notice_on_a_file_shaped_like_the_real_ones(tmp_path):
     path = _write(tmp_path, admin=[(0, _ipj()), (1, _reg_maker(0)), (2, _ext(80))],
                   symbols={0: "?|IPJ", 1: "__12", 2: "Database Extension Objects"})

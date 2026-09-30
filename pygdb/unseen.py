@@ -280,9 +280,17 @@ def _ipj_members(obj: bytes):
 
 
 def _find_ipj(obj: bytes, texts: Dict[str, str]) -> List[Finding]:
+    """Findings for one gated IPJ object, or `[]` if it has no decodable
+    name -- the same "not a real coordinate-system entry" case
+    `find_projection_parameters` skips (docs/spec.md section 8). These are
+    real and common (docs/provenance/notes.md section 6.2e): a per
+    (channel, channel) pair placeholder object, always method code 0,
+    unrelated to the working coordinate system's own named IPJ object."""
     from . import registry
     m = registry._IPJ_NAME_RE.search(obj)
-    name = m.group(1).decode("ascii", errors="replace") if m else "?"
+    if not m:
+        return []
+    name = m.group(1).decode("ascii", errors="replace")
     method = struct.unpack_from("<i", obj, registry._IPJ_METHOD_OFFSET)[0]
     raw = struct.unpack_from(f"<{registry._IPJ_PARAMETER_COUNT}d", obj, registry._IPJ_PARAMETERS_OFFSET)
     slots = ", ".join("unset" if v == -1.0e32 else repr(v) for v in raw)
@@ -355,7 +363,10 @@ def check_admin_objects(path: str) -> None:
     maker_fields = []
     for slot, obj in objects.items():
         tag = obj[44:48]
-        if tag == b"IPJ\x00" and len(obj) >= registry._IPJ_MIN_LENGTH:
+        if (
+            tag == b"IPJ\x00" and len(obj) >= registry._IPJ_MIN_LENGTH
+            and obj[96:100] == registry._IPJ_GATE_TAG
+        ):
             findings += _find_ipj(obj, texts)
         elif tag == b"EXT\x00" and symbols.get(slot) == "Database Extension Objects":
             length = struct.unpack_from("<i", obj, 24)[0]

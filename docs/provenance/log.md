@@ -4191,3 +4191,63 @@ notes.md section 6.2e.
 6. **Nothing in the corpus trips any check**: 0 notices over all 49 files
    with channels, lines, projections and makers read. This is now an
    integration test.
+
+## Session 16 -- four new samples surface a real bug in the unseen-feature checks (2026-09-30)
+
+Prompted by: "Can you search for more gdb files online, for us to test
+against?" and "after downloading them, first run them through our new
+helper function to see if they trigger any of the warninigs."
+
+1. **New source: Geoscience BC's Golden Triangle compilation** (project
+   2018-056, report GBCR2021-15, `cdn.geosciencebc.com`). Ten legacy
+   contractor surveys (2013-2020), each area's zip a few hundred MB to a
+   few GB, `accept-ranges: bytes` supported. Used `remotezip.py` (as for
+   the OpenEI BRIDGE zips, Session 12) to list and extract single small
+   `.gdb` members without downloading a whole zip. Added
+   `samples/geosciencebc_golden_triangle/`: `Area_I1_airborne_MAG_2020`
+   (39 MB), `Area_H1_MAG_2020` (50 MB), `Area_G1_MAG_VTEM_2013` (81 MB),
+   `Area_F1_MAG_2017` (104 MB).
+2. **Dead ends, not pursued further:** the Ontario GeologyOntario hub
+   domain no longer resolves at all (DNS failure, was merely
+   JS-blocked before); GeosoftInc/gxpy's own `test_free_gdb.py` fixture
+   is explicitly out of scope (Session 1.12: engine-generated binary
+   output, even in a public repo, is not a clean-room source); modern
+   USGS EarthMRI ScienceBase items now bundle everything (report, grids,
+   database) into one multi-GB zip, no smaller Geosoft-only sub-item;
+   South Africa's Council for Geoscience and Brazil's CPRM have no
+   direct `.gdb` downloads found.
+3. **`Area_F1_MAG_2017.gdb` immediately surfaced a real bug** in
+   `pygdb.unseen`, per the new "run the report on every new file"
+   instruction: a `projection method code 0` notice, with an empty
+   coordinate-system name (`'?'`) and every parameter slot unset.
+4. **Not a new format discovery.** `_live_admin_objects` (which
+   `unseen.check_admin_objects` scans) surfaces every live `IPJ`-tagged,
+   gated object -- including a kind `find_projection_parameters` already
+   silently skips: an object with no decodable embedded name. Checking
+   the corpus (`_live_admin_objects` + the gate check, 46 of 49 files)
+   found 133 such gated objects. All 118 with a decodable name have one
+   of the four known method codes (68 TM, 43 geographic, 5 PS, 2 LCC);
+   all 15 without one read method code 0 -- a clean split, not a
+   coincidence. Their blob-symbol names are `?|IPJ_<channel>:<channel>`
+   (e.g. `?|IPJ_x:y`, `?|IPJ_Longitude:Latitude`), one per (channel,
+   channel) pairing -- real, common objects (46 of 49 files, so present
+   in the corpus all along, just never scanned by symbol name before),
+   evidently a per-channel-pair placeholder distinct from the named
+   working-coordinate-system object, not a genuinely novel projection
+   method.
+5. **Fixed:** `unseen._find_ipj` now skips an object with no decodable
+   name, exactly like `find_projection_parameters`. Also tightened the
+   gate `unseen.check_admin_objects` applies before trusting an
+   `IPJ`-tagged object's fixed offsets at all, to require the `" JPI"`
+   marker at `+96` (matching `find_projection_parameters`'s own gate) --
+   not the cause of this particular false notice (the real objects do
+   carry the marker), but a latent gap the same investigation surfaced.
+   Two regression tests added (`tests/test_unseen.py`): a gated object
+   with no name (must not fire), and a same-shaped, ungated object
+   (must not fire either). Full suite re-run clean on all 285 tests,
+   including the corpus-wide "no notice on any real file" test now
+   covering the four new samples too.
+6. **All four new files otherwise pass every existing rule.**
+   `Area_G1_MAG_VTEM_2013.gdb` has one already-known, already-handled
+   `GDBParseWarning` (a channel's creation record has two differing
+   stale copies) -- not a new finding.

@@ -3596,6 +3596,31 @@ investigation only, kept out of `pygdb/registry.py` pending a decision
 on whether a real decoder (e.g. a `find_projection_parameters`
 alongside `find_channel_settings`) is worth building on this.
 
+### 6.7c Per-(channel, channel) `IPJ` objects — [CONFIRMED] real and common; [UNKNOWN] purpose
+
+Session 16, prompted by a false unseen-feature notice on a newly added
+sample (`pygdb.unseen`, method code 0). `_live_admin_objects` surfaces
+every live `IPJ\0`-tagged, `" JPI"`-gated object, not just the one or two
+per file that name a working coordinate system. Across 46 of 49 corpus
+files, most `IPJ` objects are a second kind: blob-symbol name
+`?|IPJ_<channel>:<channel>` (e.g. `?|IPJ_x:y`, `?|IPJ_Longitude:Latitude`,
+`?|IPJ_radar:Temp99`), one per pairing of two real channels. 133 gated
+`IPJ` objects total, corpus-wide:
+
+| | Count | Method code (`+168`) |
+|---|---|---|
+| Has a decodable `" JPI"`+name marker (section 6.7b) | 118 | 68 Transverse Mercator, 43 geographic, 5 Polar Stereographic, 2 Lambert (2SP) |
+| No decodable name | 15 | 0, every time |
+
+The split is exact: every named object has one of the four known method
+codes, and every one of the 15 nameless objects reads method code 0. Not
+itself a projection method -- `find_projection_parameters` already skips
+an object it can't find a name in, unaffected by this. Plausibly one
+placeholder per coordinate-role pairing a channel can appear in (X:Y,
+lat:lon, ...), but this is **[UNKNOWN]**: not traced to any specific
+mechanism, and the rest of the object's content past `+168` wasn't
+compared against the named form's layout.
+
 ### 6.8 The `"REG "` blobs: Geosoft Desktop's own settings/processing-history registry — [CONFIRMED] rich real content, [UNKNOWN] exact binary framing
 
 *(Session 3, continued. Direct follow-up to §6.7's honest loose end:
