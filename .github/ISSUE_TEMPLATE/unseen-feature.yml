@@ -1,0 +1,71 @@
+name: Unseen format feature
+description: Report a notice from pygdb saying a file has a feature it hasn't seen before.
+title: "Unseen format feature: "
+labels: ["unseen-feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this. pygdb issued a `GDBUnseenFeatureWarning`
+        because your file does something none of the project's sample files
+        do. That's exactly what's needed to settle the format's remaining
+        open questions (issue #11).
+
+        pygdb never sends anything automatically; this report is the only
+        way the notice reaches us. **Please don't attach the file unless it
+        is public.**
+
+        Instead, run
+
+        ```python
+        import pygdb
+        print(pygdb.unseen_feature_report("your_file.gdb"))
+        ```
+
+        or `python -m pygdb.report your_file.gdb`, and paste what it prints
+        below. It says nothing about the data in your file, only about how
+        the file is laid out, and it doesn't include the file's name. But
+        don't take our word for it: check
+        [the source code](https://github.com/jcapriot/pygdb/blob/main/pygdb/unseen.py)
+        for yourself, and read the report before posting it.
+
+        To turn the notices off: `warnings.simplefilter("ignore",
+        pygdb.GDBUnseenFeatureWarning)`, or set the environment variable
+        `PYGDB_UNSEEN_FEATURE_NOTICES=0`.
+  - type: textarea
+    id: report
+    attributes:
+      label: Report output
+      description: The full output of `pygdb.unseen_feature_report(...)` or `python -m pygdb.report ...`. (If you can't run it, fill in the next box instead.)
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: notice
+    attributes:
+      label: The notice, if you couldn't run the report
+      description: Paste the warning message, but remove the file path at its start.
+      render: text
+    validations:
+      required: false
+  - type: input
+    id: writer
+    attributes:
+      label: Software that wrote the file
+      description: If you know it, e.g. the Geosoft Oasis montaj version, or the contractor's processing system.
+    validations:
+      required: false
+  - type: input
+    id: public
+    attributes:
+      label: Public link
+      description: If the file is publicly available, where to download it.
+    validations:
+      required: false
+  - type: checkboxes
+    id: private
+    attributes:
+      label: Privacy
+      options:
+        - label: I have not attached or linked a file that isn't public.
+          required: true

@@ -4108,3 +4108,146 @@ before; this session only strengthens the "independent constant"
 framing with an explicit non-`GS_DOUBLE` cross-check, since the
 existing "535 of 535" figure did not previously call out that it spans
 every real dtype in the corpus, not just `GS_DOUBLE`.
+
+## Session 14 -- the coordinate-system definition, from vendor documentation (2026-09-29)
+
+Prompted by: "On the coordinate systems, I see there's a Coordinate_system
+class in the gxpy source code (again don't run anything). and seequent's
+public GX developer wiki has a dedicated page on them. Does those help you?"
+
+1. **Sources read, nothing run.** `gxpy/coordinate_system.py` (S24) is a
+   wrapper over the compiled `GXIPJ` API. It defines a coordinate system
+   by five GXF strings and points to the GXF specification for them. The
+   wiki page (S24) gives the same strings. GXF Revision 3 (S23, a Geosoft
+   document hosted by USGS) defines them and, in Table 1, lists every
+   projection method's parameters in order.
+2. **Slot names confirmed.** Table 1's parameter order, with unused EPSG
+   parameters kept as unset slots, names every binary slot for the three
+   decoded methods. The Lambert and Polar Stereographic names go from
+   [LIKELY] to [CONFIRMED].
+3. **The rest of IPJ member 0 found**, using the registry's GXF text as
+   a key:
+   - prime meridian `+324`;
+   - the 7 Bursa-Wolf transform parameters `+396..+451` (rotations in
+     radians, scale as `1 + ppm/10⁶`, exact against three datums);
+   - units name `+452` and factor `+516`;
+   - projection name `+524`.
+
+   Every field's offset now tiles `+104..+652` without gaps.
+4. **Registry text vs. binary slots, corpus-wide** (`pjtext.py`). For
+   every projected IPJ object, `_PJ_PROJECTION` values were collected
+   from the registries' flat entries under a matching `_PJ_NAME` (the
+   value is quoted). 43 of 50 projected objects have text; 7 have none
+   (three in `AG106386`, `DB_Mag_1212`, `DB_Mag_1213`, both systems in
+   `Brunt_mag_2017`). On all 43, the text holds exactly as many values
+   as the binary has set slots, equal in order (41 Transverse Mercator,
+   1 Lambert (2SP), 1 Polar Stereographic). No geographic object has
+   `_PJ_PROJECTION` text. This is what lets the text name the slots of a
+   method whose code has no known layout. The reader now does so, keeping
+   the binary's values.
+5. **The "no transform" shape** (`pjcheck.py`). All 25 datum transforms
+   with registry text convert back to it (arc-seconds, ppm) within
+   1e-6. The 5 objects whose transform name field is empty (the three
+   `GDA2020` systems in `AG106386`, `NAD83(2011)` in
+   `HawthorneGrav_wMasks_MF20240116`, `NAD83` in `long_valley_ed`)
+   hold dX = `rDUMMY` (−1e32), dY..Rz = 0 and scale = 1. A `WGS 84`
+   datum instead holds all zeros and scale 1. The empty name field can
+   hold leftover bytes after its leading NUL.
+
+## Session 15 -- baselines for the unseen-feature notices (2026-09-29)
+
+Prompted by: "are we at the stage where we could notify the user if their
+file has something we haven't seen yet that would help us narrow down
+those last few pieces?" The notices themselves are a reader feature
+(`pygdb.unseen`). Checking each "always seen" fact before building on it
+was format work. Scripts: `baselines.py`, `notices.py`. Recorded in
+notes.md section 6.2e.
+
+1. **Header words 8-20 and 68.** Tallied as int32 on all 49 files (48
+   public plus the supplied file): one combination only, word 8
+   `0x10020000`, word 12 `264`, words 16/20/68 zero.
+2. **Channel `+108`/`+116`.** 1,247 genuine channels read 1.0 and 5.
+   Every one.
+3. **User table.** Every file has exactly one live user record, category
+   `0x20000`, `+124` = −1.
+4. **Line records, read at true offsets.** Of 5,575 live lines, the types
+   are 0, 2 or 6, and the 20-byte block at true `+104..+123` is the same
+   bytes on all of them. The spec's earlier "all-zero on 18 of 5,003"
+   came from the previous-line view. It does not reproduce at true
+   offsets, and the 18 were not traced.
+5. **IPJ members 1-3.** My first member walk was wrong (next member at
+   `offset + 8 + 28 + length`, which never lined up). Printing the frame
+   positions (`652`, `776`, `872` after a 560-byte member 0 at `60`) gave
+   `offset + 32 + length`, which ends exactly at the payload end on all
+   107 objects. From each member's 16-byte index onward, the bytes are
+   identical everywhere:
+   - member 1: 28 zero bytes and eight `rDUMMY`;
+   - members 2 and 3: 64 zero bytes.
+
+   The first draft of the check assumed 40 zero bytes and six dummies,
+   then 44 and six; both fired on every file until the bytes were dumped
+   and counted. The 8 bytes between the length field and the index vary
+   between objects.
+6. **Nothing in the corpus trips any check**: 0 notices over all 49 files
+   with channels, lines, projections and makers read. This is now an
+   integration test.
+
+## Session 16 -- four new samples surface a real bug in the unseen-feature checks (2026-09-30)
+
+Prompted by: "Can you search for more gdb files online, for us to test
+against?" and "after downloading them, first run them through our new
+helper function to see if they trigger any of the warninigs."
+
+1. **New source: Geoscience BC's Golden Triangle compilation** (project
+   2018-056, report GBCR2021-15, `cdn.geosciencebc.com`). Ten legacy
+   contractor surveys (2013-2020), each area's zip a few hundred MB to a
+   few GB, `accept-ranges: bytes` supported. Used `remotezip.py` (as for
+   the OpenEI BRIDGE zips, Session 12) to list and extract single small
+   `.gdb` members without downloading a whole zip. Added
+   `samples/geosciencebc_golden_triangle/`: `Area_I1_airborne_MAG_2020`
+   (39 MB), `Area_H1_MAG_2020` (50 MB), `Area_G1_MAG_VTEM_2013` (81 MB),
+   `Area_F1_MAG_2017` (104 MB).
+2. **Dead ends, not pursued further:** the Ontario GeologyOntario hub
+   domain no longer resolves at all (DNS failure, was merely
+   JS-blocked before); GeosoftInc/gxpy's own `test_free_gdb.py` fixture
+   is explicitly out of scope (Session 1.12: engine-generated binary
+   output, even in a public repo, is not a clean-room source); modern
+   USGS EarthMRI ScienceBase items now bundle everything (report, grids,
+   database) into one multi-GB zip, no smaller Geosoft-only sub-item;
+   South Africa's Council for Geoscience and Brazil's CPRM have no
+   direct `.gdb` downloads found.
+3. **`Area_F1_MAG_2017.gdb` immediately surfaced a real bug** in
+   `pygdb.unseen`, per the new "run the report on every new file"
+   instruction: a `projection method code 0` notice, with an empty
+   coordinate-system name (`'?'`) and every parameter slot unset.
+4. **Not a new format discovery.** `_live_admin_objects` (which
+   `unseen.check_admin_objects` scans) surfaces every live `IPJ`-tagged,
+   gated object -- including a kind `find_projection_parameters` already
+   silently skips: an object with no decodable embedded name. Checking
+   the corpus (`_live_admin_objects` + the gate check, 46 of 49 files)
+   found 133 such gated objects. All 118 with a decodable name have one
+   of the four known method codes (68 TM, 43 geographic, 5 PS, 2 LCC);
+   all 15 without one read method code 0 -- a clean split, not a
+   coincidence. Their blob-symbol names are `?|IPJ_<channel>:<channel>`
+   (e.g. `?|IPJ_x:y`, `?|IPJ_Longitude:Latitude`), one per (channel,
+   channel) pairing -- real, common objects (46 of 49 files, so present
+   in the corpus all along, just never scanned by symbol name before),
+   evidently a per-channel-pair placeholder distinct from the named
+   working-coordinate-system object, not a genuinely novel projection
+   method.
+5. **Fixed:** `unseen._find_ipj` now skips an object with no decodable
+   name, exactly like `find_projection_parameters`. Also tightened the
+   gate `unseen.check_admin_objects` applies before trusting an
+   `IPJ`-tagged object's fixed offsets at all, to require the `" JPI"`
+   marker at `+96` (matching `find_projection_parameters`'s own gate) --
+   not the cause of this particular false notice (the real objects do
+   carry the marker), but a latent gap the same investigation surfaced.
+   Two regression tests added (`tests/test_unseen.py`): a gated object
+   with no name (must not fire), and a same-shaped, ungated object
+   (must not fire either). Full suite re-run clean on all 285 tests,
+   including the corpus-wide "no notice on any real file" test now
+   covering the four new samples too.
+6. **All four new files otherwise pass every existing rule.**
+   `Area_G1_MAG_VTEM_2013.gdb` has one already-known, already-handled
+   `GDBParseWarning` (a channel's creation record has two differing
+   stale copies) -- not a new finding.

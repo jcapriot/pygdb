@@ -55,6 +55,7 @@ from typing import BinaryIO, Dict, List, Optional, Tuple
 import numpy as np
 
 from . import lzrw1 as _lzrw1
+from . import unseen
 
 try:
     from . import _native as _native_ext
@@ -691,6 +692,10 @@ def read_channels(path: str) -> List[ChannelRecord]:
             # DB_CHAN_FORMAT_* range -- garbage doesn't. See docs/provenance/notes.md.
             continue
         channels.append(rec)
+    unseen.check_channels(path, channels)
+    if fields["users_max"] is not None:
+        # The user table directly follows the channel table (docs/spec.md section 2.1).
+        unseen.check_users(path, data, table_start + chans_max * SYMBOL_RECORD_SIZE, fields["users_max"])
     return channels
 
 
@@ -1010,6 +1015,7 @@ def _read_lines(path: str) -> Tuple[List[LineRecord], bool]:
             rec = _parse_line_record(data, exact_start + i * SYMBOL_RECORD_SIZE, i)
             if rec.name and rec.name_is_clean and rec.category_code in DB_CATEGORY_LINE_NAMES:
                 lines.append(rec)
+        unseen.check_lines(path, data, lines)
         return lines, True
 
     try:

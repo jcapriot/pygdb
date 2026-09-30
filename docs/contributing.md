@@ -25,6 +25,14 @@ specific blob that fails) is a good substitute — see
 [the format specification](spec.md) for what each region should look
 like.
 
+If the reader printed an **unseen-feature notice**
+(`GDBUnseenFeatureWarning`), please report it with the
+[unseen format feature](https://github.com/jcapriot/pygdb/issues/new?template=unseen-feature.yml)
+issue form, pasting the output of `pygdb.unseen_feature_report(path)` (or
+`python -m pygdb.report path`). It holds only the file's structure, not
+its data or name, and is usually all we need, so the file itself isn't
+required.
+
 ## What we will not do: reverse engineering the original software
 
 This project was produced by **clean-room** methods only: reading

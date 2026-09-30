@@ -50,6 +50,7 @@ from .registry import (
     find_display_lists,
     find_projection_parameters,
 )
+from . import unseen
 
 # docs/spec.md section 7
 _DB_COMP_NAMES = {
@@ -187,6 +188,8 @@ class GDB:
                 f"not a recognized .gdb file"
             )
         self._fields = header_fields(header)
+        unseen.check_header(path, header)
+        unseen.check_admin_objects(path)
         self._channels: Optional[List[ChannelRecord]] = None
         self._lines: Optional[List[LineRecord]] = None
         self._lines_exact = False

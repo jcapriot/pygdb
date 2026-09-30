@@ -47,6 +47,7 @@ from .registry import (
     find_display_lists,
     find_projection_parameters,
 )
+from .unseen import GDBUnseenFeatureWarning, unseen_feature_report
 
 __all__ = [
     "GDB",
@@ -57,6 +58,7 @@ __all__ = [
     "CompressionInfo",
     "DisplayListEntry",
     "GDBParseWarning",
+    "GDBUnseenFeatureWarning",
     "GRDParseWarning",
     "GrdHeader",
     "LZRW1DecodeError",
@@ -81,6 +83,7 @@ __all__ = [
     "read_channels",
     "read_grd",
     "read_lines",
+    "unseen_feature_report",
 ]
 
 from importlib.metadata import PackageNotFoundError, version

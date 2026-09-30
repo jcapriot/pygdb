@@ -24,6 +24,15 @@ def _find_gdb_files():
     return sorted(glob.glob(os.path.join(SAMPLES_DIR, "**", "*.gdb"), recursive=True))
 
 
+@pytest.fixture(autouse=True)
+def _fresh_unseen_feature_notices(monkeypatch):
+    """Unseen-feature notices are reported once per file per process;
+    start every test with none reported, and with notices on."""
+    from pygdb import unseen
+    unseen._reported.clear()
+    monkeypatch.delenv("PYGDB_UNSEEN_FEATURE_NOTICES", raising=False)
+
+
 @pytest.fixture(scope="session")
 def samples_dir():
     if not os.path.isdir(SAMPLES_DIR) or not _find_gdb_files():

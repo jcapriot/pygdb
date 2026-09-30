@@ -25,10 +25,11 @@ tied to one corpus's line-numbering conventions.
 
 from __future__ import annotations
 
+import math
 import re
 import struct
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from .gdb_reader import (
@@ -521,7 +522,14 @@ _IPJ_DATUM_NAME_OFFSET = 180
 _IPJ_ELLIPSOID_NAME_OFFSET = 244
 _IPJ_SEMI_MAJOR_AXIS_OFFSET = 308
 _IPJ_ECCENTRICITY_OFFSET = 316
+_IPJ_PRIME_MERIDIAN_OFFSET = 324
 _IPJ_DATUM_TRANSFORM_NAME_OFFSET = 332
+# Seven float64 Bursa-Wolf parameters: dX, dY, dZ (metres), Rx, Ry, Rz
+# (radians), scale (a 1 + ppm/1e6 multiplier) -- docs/spec.md section 8.
+_IPJ_DATUM_TRANSFORM_OFFSET = 396
+_IPJ_UNITS_NAME_OFFSET = 452
+_IPJ_UNITS_FACTOR_OFFSET = 516
+_IPJ_PROJECTION_NAME_OFFSET = 524
 # Eight float64 projection parameters at +588..+651; which slot holds which
 # parameter depends on the projection method at +168 (docs/spec.md section
 # 8, confirmed for the three methods below).
@@ -556,6 +564,99 @@ _IPJ_SLOTS = {
 # ellipsoid/datum-only IPJ object (one that defines no projection) -- a
 # real, confirmed marker, not undecoded garbage.
 _IPJ_DUMMY_FLOAT = -1.0e32
+
+# Geosoft's GXF Revision 3 specification, Table 1 ("Projection
+# Transformation Methods", docs/provenance/notes.md source S23): each
+# method's parameters in the order its text form lists them, the EPSG
+# enumerated order with unused parameters omitted. Names are Table 1's own
+# wording, lowercased with underscores.
+_NATURAL_ORIGIN_PARAMETERS = (
+    "latitude_of_natural_origin", "longitude_of_natural_origin",
+    "scale_factor_at_natural_origin", "false_easting", "false_northing",
+)
+_FALSE_ORIGIN_2SP_PARAMETERS = (
+    "latitude_of_first_standard_parallel", "latitude_of_second_standard_parallel",
+    "latitude_of_false_origin", "longitude_of_false_origin",
+    "easting_at_false_origin", "northing_at_false_origin",
+)
+_GXF_METHOD_PARAMETERS: Dict[str, Tuple[str, ...]] = {
+    "Geographic": (),
+    "Hotine Oblique Mercator": (
+        "latitude_of_projection_centre", "longitude_of_projection_centre",
+        "azimuth_of_initial_line", "angle_from_rectified_to_skew_grid",
+        "scale_factor_on_initial_line", "false_easting", "false_northing",
+    ),
+    "Laborde Oblique Mercator": (
+        "latitude_of_projection_centre", "longitude_of_projection_centre",
+        "azimuth_of_initial_line", "scale_factor_on_initial_line",
+        "false_easting", "false_northing",
+    ),
+    "Lambert Conic Conformal (1SP)": _NATURAL_ORIGIN_PARAMETERS,
+    "Lambert Conic Conformal (2SP)": _FALSE_ORIGIN_2SP_PARAMETERS,
+    "Lambert Conformal (2SP Belgium)": _FALSE_ORIGIN_2SP_PARAMETERS,
+    "Mercator (1SP)": _NATURAL_ORIGIN_PARAMETERS,
+    "Mercator (2SP)": (
+        "latitude_of_first_standard_parallel", "longitude_of_natural_origin",
+        "false_easting", "false_northing",
+    ),
+    "New Zealand Map Grid": (
+        "latitude_of_natural_origin", "longitude_of_natural_origin",
+        "false_easting", "false_northing",
+    ),
+    "Oblique Stereographic": _NATURAL_ORIGIN_PARAMETERS,
+    "Polar Stereographic": _NATURAL_ORIGIN_PARAMETERS,
+    "Swiss Oblique Cylindrical": (
+        "latitude_of_projection_centre", "longitude_of_projection_centre",
+        "easting_at_projection_centre", "northing_at_projection_centre",
+    ),
+    "Transverse Mercator": _NATURAL_ORIGIN_PARAMETERS,
+    "Transverse Mercator (South Oriented)": _NATURAL_ORIGIN_PARAMETERS,
+    # Table 1's note: EPSG's spelling of the same method.
+    "Transverse Mercator (South Orientated)": _NATURAL_ORIGIN_PARAMETERS,
+    "*Albers Conic": _FALSE_ORIGIN_2SP_PARAMETERS,
+    "*Equidistant Conic": _FALSE_ORIGIN_2SP_PARAMETERS,
+    "*Polyconic": (
+        "latitude_of_false_origin", "longitude_of_false_origin",
+        "scale_factor_at_natural_origin", "easting_at_false_origin",
+        "northing_at_false_origin",
+    ),
+}
+# The method codes whose binary slot positions are confirmed
+# (docs/spec.md section 8): {code: (GXF method name, the slot holding each
+# of that method's Table 1 parameters, in Table 1 order)}.
+_IPJ_METHOD_LAYOUTS: Dict[int, Tuple[str, Tuple[int, ...]]] = {
+    _IPJ_METHOD_GEOGRAPHIC: ("Geographic", ()),
+    _IPJ_METHOD_TRANSVERSE_MERCATOR: ("Transverse Mercator", (0, 1, 4, 5, 6)),
+    _IPJ_METHOD_LAMBERT_CONIC_2SP: ("Lambert Conic Conformal (2SP)", (0, 1, 2, 3, 5, 6)),
+    _IPJ_METHOD_POLAR_STEREOGRAPHIC: ("Polar Stereographic", (0, 1, 4, 5, 6)),
+}
+# `"Method name",p1,p2,...` -- a registry `_PJ_PROJECTION` value.
+_GXF_PROJECTION_RE = re.compile(r'\s*"([^"]*)"\s*(?:,(.*))?')
+_RADIANS_TO_ARC_SECONDS = 180.0 / math.pi * 3600.0
+
+
+def _parse_gxf_projection(text: str) -> Optional[Tuple[str, Tuple[float, ...]]]:
+    """`(method name, parameter values)` from a GXF projection string,
+    or `None` if it doesn't parse."""
+    m = _GXF_PROJECTION_RE.fullmatch(text)
+    if not m:
+        return None
+    values: Tuple[float, ...] = ()
+    if m.group(2) is not None and m.group(2).strip():
+        try:
+            values = tuple(float(v) for v in m.group(2).split(","))
+        except ValueError:
+            return None
+    return m.group(1), values
+
+
+def _values_fill_slots(values: Tuple[float, ...], slots: Tuple[Optional[float], ...]) -> bool:
+    """Whether `values` equal the set (non-`None`) entries of `slots`, in
+    order -- how a GXF text relates to the binary parameter vector."""
+    used = [v for v in slots if v is not None]
+    return len(used) == len(values) and all(
+        abs(a - b) <= 1e-9 * max(1.0, abs(b)) for a, b in zip(values, used)
+    )
 
 
 def _read_ascii_cstr(buf: bytes, offset: int, max_len: int = 64) -> Optional[str]:
@@ -598,8 +699,8 @@ class ProjectionParameters:
     method_code : int or None
         The projection-method code at `+168`: `1` geographic (datum
         only), `11` Transverse Mercator, `3` Lambert Conic Conformal
-        (2SP), `14` Polar Stereographic. Other values are real but not
-        decoded.
+        (2SP), `14` Polar Stereographic. Other codes are real, but their
+        slot layout isn't known; see `method_parameters`.
     latitude_of_origin : float or None
         Transverse Mercator or Lambert latitude of origin; for Polar
         Stereographic, the latitude in the same slot, which the source
@@ -608,19 +709,64 @@ class ProjectionParameters:
         Lambert Conic Conformal (2SP) standard parallels.
     parameters : tuple of (float or None)
         All eight raw parameter slots (`+588..+651`) in order, `rDUMMY`
-        mapped to `None` -- the only way to reach the values of a method
-        this reader does not name.
+        mapped to `None`.
+    method : str or None
+        The projection method's GXF name, e.g. `"Transverse Mercator"`,
+        `"Geographic"`. `None` when neither the method code nor the
+        file's own registry text identifies it.
+    method_parameters : dict of {str : float or None}
+        The method's parameters keyed by their GXF Table 1 names
+        (lowercased, underscores), e.g. `latitude_of_natural_origin`,
+        `scale_factor_at_natural_origin`, `false_easting`, in Table 1
+        order. `{}` for a geographic system, or when the parameters can't
+        be named (`parameter_source` is `None`).
+    parameter_source : {"text", "binary"} or None
+        Where the names in `method_parameters` came from (see Notes).
+        `"text"`: the file's own `_PJ_PROJECTION` text, checked against
+        the binary. `"binary"`: this reader's confirmed slot layout for
+        the method code. `None`: neither is available, and only
+        `parameters` holds the values.
+    prime_meridian : float or None
+        Degrees from Greenwich. `None` if unset.
+    datum_transform_parameters : tuple of float or None
+        The 7-parameter Bursa-Wolf datum transform to WGS 84, in GXF
+        units: dX, dY, dZ in metres, Rx, Ry, Rz in arc-seconds, scale in
+        ppm. All zero for a datum that is already WGS 84. `None` if any
+        value is the unset sentinel.
+    units_name : str or None
+        The coordinate units, e.g. `"m"`, or `"dega"` (degrees) for a
+        geographic system.
+    units_factor : float or None
+        The units' factor to metres. `None` if unset.
+    projection_name : str or None
+        The projection's name without its datum, e.g. `"UTM zone 11N"`.
+        `None` for a geographic system.
 
     Notes
     -----
     **[CONFIRMED]** structure and slot positions for the method codes
     above (docs/spec.md section 8, docs/provenance/notes.md section
-    6.7b), each against the file's own `_PJ_PROJECTION` text; the Lambert
-    and Polar Stereographic slot *names* are **[LIKELY]**. The on-disk value of an
-    unset parameter is the vendor's float64 `rDUMMY` sentinel
-    (`-1.0e32`, docs/spec.md section 4), mapped to `None` here rather
-    than returned as a raw dummy a caller could mistake for a real
+    6.7b), each against the file's own `_PJ_PROJECTION` text, with the
+    slot names from Geosoft's GXF Revision 3 specification, Table 1. The
+    on-disk value of an unset parameter is the vendor's float64 `rDUMMY`
+    sentinel (`-1.0e32`, docs/spec.md section 4), mapped to `None` here
+    rather than returned as a raw dummy a caller could mistake for a real
     coordinate -- this reader's own convention.
+
+    **Methods without a known code.** A registry's `_PJ_PROJECTION` text
+    (`"Method name",p1,p2,...`) lists a method's parameters in GXF Table 1
+    order, leaving out the unused ones; the binary keeps those as unset
+    slots. So the text names the binary's set slots, in order, for any
+    method in Table 1. The text is used only when its values equal the
+    binary's set slots exactly (43 of 43 corpus objects with text) --
+    the values returned are always the binary's. Text whose method
+    isn't in Table 1, or has a different parameter count, gives `method`
+    but no names.
+
+    The existing named fields (`central_meridian`, `scale_factor`,
+    `false_easting`, `false_northing`, `latitude_of_origin`,
+    `standard_parallel_1`, `standard_parallel_2`) are filled only for
+    the method codes with a confirmed slot layout, as before.
     """
 
     name: str
@@ -638,6 +784,72 @@ class ProjectionParameters:
     standard_parallel_1: Optional[float] = None
     standard_parallel_2: Optional[float] = None
     parameters: Tuple[Optional[float], ...] = ()
+    method: Optional[str] = None
+    method_parameters: Dict[str, Optional[float]] = field(default_factory=dict)
+    parameter_source: Optional[str] = None
+    prime_meridian: Optional[float] = None
+    datum_transform_parameters: Optional[Tuple[float, ...]] = None
+    units_name: Optional[str] = None
+    units_factor: Optional[float] = None
+    projection_name: Optional[str] = None
+
+
+def _name_method_parameters(
+    params: ProjectionParameters, texts: List[str],
+) -> Tuple[ProjectionParameters, bool]:
+    """
+    Fill `method`, `method_parameters` and `parameter_source`.
+
+    Parameters
+    ----------
+    params : ProjectionParameters
+        One decoded IPJ object, with `parameters` and `method_code` set.
+    texts : list of str
+        The `_PJ_PROJECTION` texts registered under this object's name, in
+        blob-chain order.
+
+    Returns
+    -------
+    params : ProjectionParameters
+        A copy with the three fields filled where possible.
+    disagreed : bool
+        True if text was present but none of it matched the binary.
+
+    Notes
+    -----
+    The latest text whose values equal the binary's set slots in order
+    (and whose method agrees with a known method code) names them; else
+    the confirmed binary layout for the method code does; else nothing.
+    """
+    slots = params.parameters
+    used = [v for v in slots if v is not None]
+    layout = _IPJ_METHOD_LAYOUTS.get(params.method_code)
+    disagreed = False
+    for text in reversed(texts):
+        parsed = _parse_gxf_projection(text)
+        if parsed is None or not _values_fill_slots(parsed[1], slots):
+            disagreed = True
+            continue
+        method = parsed[0]
+        if layout is not None and layout[0] != method:
+            disagreed = True
+            continue
+        names = _GXF_METHOD_PARAMETERS.get(method)
+        if names is None or len(names) != len(used):
+            return replace(params, method=method), False
+        return replace(
+            params, method=method,
+            method_parameters=dict(zip(names, used)), parameter_source="text",
+        ), False
+    if layout is not None:
+        method, positions = layout
+        names = _GXF_METHOD_PARAMETERS[method]
+        return replace(
+            params, method=method,
+            method_parameters={n: slots[s] for n, s in zip(names, positions)},
+            parameter_source="binary",
+        ), disagreed
+    return params, disagreed
 
 
 def find_projection_parameters(
@@ -678,7 +890,10 @@ def find_projection_parameters(
         raised, once per name, if two of a coordinate system's `IPJ`
         entries decode to genuinely *different* parameter sets -- the
         last one in blob-chain order is kept, but this is never decided
-        silently (the same convention `find_channel_settings` uses).
+        silently (the same convention `find_channel_settings` uses). Also
+        raised, once per name, if the registry's `_PJ_PROJECTION` text
+        for a coordinate system doesn't match its binary parameters; the
+        text is then not used (see `ProjectionParameters`).
 
     Notes
     -----
@@ -709,6 +924,8 @@ def find_projection_parameters(
         max_real_line_slot = max((line.index for line in lines), default=-1)
 
     candidates: Dict[str, List[ProjectionParameters]] = {}
+    # {coordinate-system name: [_PJ_PROJECTION text, ...]}, in blob-chain order.
+    texts: Dict[str, List[str]] = {}
     with open(path, "rb") as f:
         for blob in iter_blobs(path):
             line_slot, _channel_slot = blob.line_channel(chans_max)
@@ -717,6 +934,10 @@ def find_projection_parameters(
             f.seek(blob.offset)
             blob_size = min(blob.n_pages * page_size, 50_000_000)
             chunk = f.read(blob_size)
+            kv = _decode_reg_flat_keyvalues(chunk)
+            if kv and "_PJ_NAME" in kv and "_PJ_PROJECTION" in kv:
+                texts.setdefault(kv["_PJ_NAME"].strip('"'), []).append(kv["_PJ_PROJECTION"])
+                continue
             if (
                 len(chunk) < _IPJ_MIN_LENGTH
                 or chunk[96:100] != _IPJ_GATE_TAG
@@ -738,7 +959,21 @@ def find_projection_parameters(
             slots = tuple(None if v == _IPJ_DUMMY_FLOAT else v for v in raw)
             method = struct.unpack_from("<i", chunk, _IPJ_METHOD_OFFSET)[0]
             layout = _IPJ_SLOTS.get(method, {})
-            named = {field: slots[slot] for field, slot in layout.items()}
+            named = {key: slots[slot] for key, slot in layout.items()}
+
+            def _double(offset: int) -> Optional[float]:
+                v = struct.unpack_from("<d", chunk, offset)[0]
+                return None if v == _IPJ_DUMMY_FLOAT else v
+
+            transform = struct.unpack_from("<7d", chunk, _IPJ_DATUM_TRANSFORM_OFFSET)
+            if _IPJ_DUMMY_FLOAT in transform:
+                transform_gxf = None
+            else:
+                transform_gxf = (
+                    transform[:3]
+                    + tuple(v * _RADIANS_TO_ARC_SECONDS for v in transform[3:6])
+                    + ((transform[6] - 1.0) * 1e6,)
+                )
 
             params = ProjectionParameters(
                 name=name,
@@ -756,8 +991,27 @@ def find_projection_parameters(
                 standard_parallel_1=named.get("standard_parallel_1"),
                 standard_parallel_2=named.get("standard_parallel_2"),
                 parameters=slots,
+                prime_meridian=_double(_IPJ_PRIME_MERIDIAN_OFFSET),
+                datum_transform_parameters=transform_gxf,
+                units_name=_read_ascii_cstr(chunk, _IPJ_UNITS_NAME_OFFSET) or None,
+                units_factor=_double(_IPJ_UNITS_FACTOR_OFFSET),
+                projection_name=_read_ascii_cstr(chunk, _IPJ_PROJECTION_NAME_OFFSET) or None,
             )
             candidates.setdefault(name, []).append(params)
+
+    disagreeing_text = set()
+    for name, params_list in candidates.items():
+        for i, params in enumerate(params_list):
+            params_list[i], disagreed = _name_method_parameters(params, texts.get(name, []))
+        if disagreed:  # only the copy that is kept (the last) matters
+            disagreeing_text.add(name)
+
+    for name in sorted(disagreeing_text):
+        _warn(
+            f"{path}: registry _PJ_PROJECTION text for coordinate system "
+            f"{name!r} does not match its IPJ binary parameters -- not "
+            f"using the text"
+        )
 
     result: Dict[str, ProjectionParameters] = {}
     for name, params_list in candidates.items():
@@ -886,19 +1140,30 @@ def _live_admin_objects(path: str) -> Dict[int, bytes]:
     return objects
 
 
-def _decode_maker(nested: bytes) -> Optional[ChannelMaker]:
-    """A `MAKER` nested object (docs/spec.md section 9), or `None` if
-    `nested` does not have that shape."""
+def _maker_field_offset(nested: bytes) -> Optional[int]:
+    """Offset of the 2-byte field after a `MAKER` record's tool string
+    (docs/spec.md section 9), or `None` if `nested` is not that shape."""
     if (
         len(nested) < 84 or nested[:4] != _OBJECT_FRAME or nested[16:21] != b"MAKER"
         or nested[32:36] != _MEMBER_FRAME or nested[64:72] != _TAG_BLOCK + b"MAKE"
     ):
         return None
+    tool_len = struct.unpack_from("<i", nested, 76)[0]  # after the tag block and its int32 (1)
+    field_at = 80 + tool_len
+    if tool_len < 0 or field_at + 2 > len(nested):
+        return None
+    return field_at
+
+
+def _decode_maker(nested: bytes) -> Optional[ChannelMaker]:
+    """A `MAKER` nested object (docs/spec.md section 9), or `None` if
+    `nested` does not have that shape."""
+    field_at = _maker_field_offset(nested)
+    if field_at is None:
+        return None
     try:
-        pos = 76  # after the tag block and its int32 (1)
-        tool_len = struct.unpack_from("<i", nested, pos)[0]
-        tool = nested[pos + 4:pos + 4 + tool_len].split(b"\x00")[0].decode("latin-1")
-        pos += 4 + tool_len + 2  # the tool string is followed by a 2-byte field
+        tool = nested[80:field_at].split(b"\x00")[0].decode("latin-1")
+        pos = field_at + 2  # the tool string is followed by a 2-byte field
         label_len = struct.unpack_from("<i", nested, pos)[0]
         label = nested[pos + 4:pos + 4 + label_len].split(b"\x00")[0].decode("latin-1")
         pos += 4 + label_len
@@ -920,13 +1185,39 @@ def _decode_reg_maker(blob_bytes: bytes) -> Optional[ChannelMaker]:
     """The `MAKER` record of one registry object, if it has one: after the
     object's `+124` entries comes an int32 count of nested objects, and a
     count of 1 is followed by the record (docs/spec.md section 9)."""
+    nested = _reg_nested_object(blob_bytes)
+    return None if nested is None else _decode_maker(nested)
+
+
+def _reg_nested_object(blob_bytes: bytes) -> Optional[bytes]:
+    """The bytes of a registry object's single nested object, if it has
+    exactly one (see `_decode_reg_maker`)."""
     if blob_bytes[44:48] != _REG_OBJECT_NAME or len(blob_bytes) < _REG_PREAMBLE_SIZE + 4:
         return None
     n_entries = max(struct.unpack_from("<i", blob_bytes, _REG_ENTRY_COUNT_OFFSET)[0], 0)
     count_at = _REG_PREAMBLE_SIZE + n_entries * _REG_FLAT_KV_SLOT_SIZE
     if count_at + 8 > len(blob_bytes) or struct.unpack_from("<i", blob_bytes, count_at)[0] != 1:
         return None
-    return _decode_maker(blob_bytes[count_at + 4:])
+    return blob_bytes[count_at + 4:]
+
+
+def _reg_maker_field(blob_bytes: bytes) -> Optional[int]:
+    """The 2-byte field after the tool string of a registry object's
+    `MAKER` record (always 0 in the corpus), or `None` without one."""
+    nested = _reg_nested_object(blob_bytes)
+    if nested is None:
+        return None
+    field_at = _maker_field_offset(nested)
+    return None if field_at is None else struct.unpack_from("<H", nested, field_at)[0]
+
+
+def _reg_maker_tool(blob_bytes: bytes) -> Optional[str]:
+    """The tool name of a registry object's `MAKER` record, or `None`."""
+    nested = _reg_nested_object(blob_bytes)
+    field_at = None if nested is None else _maker_field_offset(nested)
+    if field_at is None:
+        return None
+    return nested[80:field_at].split(b"\x00")[0].decode("latin-1")
 
 
 def _channel_handles(path: str, channels: Optional[Iterable[ChannelRecord]]):

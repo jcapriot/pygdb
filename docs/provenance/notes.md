@@ -60,6 +60,8 @@ how each claim was actually derived and tested.
 | S19 | Alaska DGGS GPR 2015-4 (Fortymile mining district), `https://dggs.alaska.gov/webpubs/data/gpr2015_004_fortymile-geophys-geosoft-database.zip` (DOI 10.14509/29411) | Real published survey data (State of Alaska, free download) | First non-WGS84/GRS80 ellipsoid (Clarke 1866, NAD27) (Session 12) |
 | S20 | British Antarctic Survey / UK Polar Data Centre, *Aeromagnetic survey across the Brunt Ice Shelf, 2017* (`GB/NERC/BAS/PDC/01072`), `Brunt_2017_mag_Geosoft.zip` via `ramadda.data.bas.ac.uk` | Real published survey data (UK Open Government Licence) | First Polar Stereographic projection, a second Lambert object, a fourth non-zero header word 116 (Session 12) |
 | S21 | USGS OFR 2006-1204, `https://pubs.usgs.gov/of/2006/1204/German_mag/GDR_clmag.gdb` | Real published data (US Government work, public domain) | International 1924 ellipsoid on the Herat North datum (Session 12) |
+| S23 | Geosoft, *GXF Grid eXchange File, Revision 3.0, draft 9.1* (12 April 1999), `https://pubs.usgs.gov/of/1999/of99-514/grids/gxf.pdf` | Vendor-published specification | Table 1 names every projection method's parameters in order; the datum, datum-transform and units string formats (Session 14) |
+| S24 | Geosoft GX Developer 9.3 wiki, "Coordinate Systems" (`geosoftgxdev.atlassian.net/wiki/spaces/GXD93/pages/102957255`) and `github.com/GeosoftInc/gxpy` `geosoft/gxpy/coordinate_system.py` (read, not run) | Vendor-published documentation and source | The five GXF strings that define a coordinate system (Session 14) |
 | S22 | OpenEI Geothermal Data Repository submission 1682 (BRIDGE, Sandia), `BRIDGE_Bell-Flat_Exploration-Data-Package.zip` (members extracted with HTTP range requests) | Real published data (CC-BY 4.0) | 2024-vintage ground-gravity databases; 11 of 12 carry the `f0f0f0f0` header variant; also `HawthorneGrav_wMasks_MF20240116.gdb` (East Hawthorne) and `GP_Master_Gravity_11082023.gdb` (Grover Point), the first file with non-blob pages in the blob region and the first resized database (Session 12) |
 
 Sources checked but **not usable** (see `LOG.md` §1.10, 1.13, 1.14 for
@@ -1537,6 +1539,81 @@ the data range.
   `02`/`03` + a kind letter; the meaning of their link fields is not
   decoded.
 
+**Session 14: IPJ member 0 fully laid out, against Geosoft's GXF
+specification -- [CONFIRMED].** Prompted by the user pointing at gxpy's
+`Coordinate_system` class and the GX developer wiki (S24). gxpy wraps the
+compiled `GXIPJ` API and defines a coordinate system by five GXF strings:
+
+- name;
+- datum: `name, semi-major axis, eccentricity, prime meridian`;
+- projection: `method, parameters`;
+- units: `name, factor`;
+- local datum transform: `name, dX, dY, dZ, Rx, Ry, Rz, scale`.
+
+The registry's `_PJ_*` keys are exactly these strings. GXF Revision 3
+(S23) defines them, and its Table 1 lists every method's parameters.
+
+- **Parameter slot names** come from Table 1, in order, with unused
+  EPSG parameters kept as unset binary slots. This upgrades the Lambert
+  (2SP) and Polar Stereographic names from [LIKELY] to [CONFIRMED].
+- **Datum-transform parameters at `+396..+451`**, identified from files
+  with non-zero transforms:
+
+  | File | Datum | Registry text | Binary |
+  |---|---|---|---|
+  | `DB_EM_MountGordon_1003` | AGD66 | `-129.193,-41.212,130.73,0.246,0.374,0.329,-2.955...` | `-129.193, -41.212, 130.73, 1.19264e-06, 1.81320e-06, 1.59504e-06, 0.999997045` |
+  | `fortymile_linedata` | NAD27 | `-5,135,172,0,0,0,0` | `-5, 135, 172, 0, 0, 0, 1.0` |
+  | `GDR_clmag` | Herat North | `-333,-222,114,0,0,0,0` | `-333, -222, 114, 0, 0, 0, 1.0` |
+
+  The rotations are radians: they convert back to exactly 0.246, 0.374
+  and 0.329 arc-seconds. The scale is `1 + ppm/10⁶`. The text's
+  `-2.95500000002669` is that conversion's float noise, so the text is
+  derived from the binary.
+- **`+324` prime meridian** (0.0 on 106 of 106).
+- **`+452` units name, 64-byte field.** `m` on all 68 projected objects,
+  `dega` on all 38 geographic ones.
+- **`+516` units factor** (1.0 everywhere).
+- **`+524` projection name, 64-byte field**, e.g. `UTM zone 11N`,
+  `Map Grid of Australia zone 54`, `*bas_polar`; empty on every
+  geographic object. It ends at `+588`, where the parameter vector
+  begins.
+
+Member 0 is now: name `+104` (64 bytes), method `+168`, zeros
+`+172..+179`, datum `+180` (64), ellipsoid `+244` (64), `a` `+308`, `e`
+`+316`, prime meridian `+324`, transform name `+332` (64), transform
+parameters `+396` (7 doubles), units `+452` (64), units factor `+516`,
+projection name `+524` (64), parameters `+588` (8 doubles), ending at
+`+652`.
+
+**`_PJ_PROJECTION` text lists the parameter vector's set slots in order
+-- [CONFIRMED], 43 of 43.** Text is matched to an IPJ object by the
+registry's `_PJ_NAME` (a quoted copy of the object's name). 43 of the
+corpus's 50 projected objects have it:
+
+| Method | Objects | Text values = set slots, in order |
+|---|---|---|
+| Transverse Mercator (11) | 41 | 41 |
+| Lambert Conic Conformal (2SP) (3) | 1 | 1 |
+| Polar Stereographic (14) | 1 | 1 |
+
+The other 7 have none: three in `AG106386`, one each in `DB_Mag_1212` and
+`DB_Mag_1213`, and both systems in `Brunt_mag_2017`. No geographic object
+has `_PJ_PROJECTION` text. Combined with Table 1, the text names the
+values of a method whose code has no known layout. The reader does this,
+keeping the binary's values (spec §8).
+
+**No transform: dX unset -- [CONFIRMED], 5 of 5.** An object whose
+transform-name field is empty holds dX = `rDUMMY` and dY..Rz = 0, scale
+= 1:
+
+- the three `GDA2020` systems in `AG106386`;
+- `NAD83(2011)` in `HawthorneGrav_wMasks_MF20240116`;
+- `NAD83` in `long_valley_ed`.
+
+A `WGS 84` datum holds all zeros and scale 1 instead. All 25
+transforms with registry text convert to it (arc-seconds, ppm) within
+1e-6.
+
 **IPJ member 0: a 64-byte name field and a type word -- [CONFIRMED]
 layout.**
 
@@ -1595,6 +1672,50 @@ landed on `Fiducial`, `GPS_Height` and `Ground_Speed` as well as on
 `Easting`/`Northing`. They came from leftover slots past each object's
 entry count (section 6.8c), not from reused handles. Honouring the count
 removes them.
+
+### 6.2e Constant fields re-measured on 49 files -- [CONFIRMED] values, [UNKNOWN] meanings
+
+Re-measured in Session 15, on all 48 public files plus the supplied
+file, as the baselines for the reader's unseen-feature notices
+(`pygdb.unseen`). Scripts: `baselines.py`, `notices.py`. Every value
+below holds on every file. None of the fields' meanings is known.
+
+| Field | Value | Count |
+|---|---|---|
+| Header word 8 | `0x10020000` | 49 of 49 files |
+| Header word 12 | `264` | 49 of 49 files |
+| Header words 16, 20, 68 | 0 | 49 of 49 files |
+| Channel `+108` (float64) / `+116` (int16) | 1.0 / 5 | 1,247 of 1,247 genuine channels |
+| Live user records | exactly one, category `0x20000`, `+124` = −1 | 49 of 49 files |
+| Line type (true `+96`) | 0 (5,307), 2 (265), 6 (3) | 5,575 live lines |
+| Line true `+104..+123` | `aec59df4 14e384bcd6bf91c6 176e05b5b5b89346` | 5,575 of 5,575 |
+
+- **Live user records:** "live" means a non-empty name without the free
+  bit `0x10000`.
+- **Line types:** 126 of the 5,307 type-0 lines are group lines.
+- **Line block:** the bytes decode as float32 −1e32, float64 −9e31 and
+  float64 +1e32. Read at each live line's true offsets, every line has
+  this block, group lines included. Section 6.2d's previous-line view
+  counted 18 all-zero blocks among 5,003 lines. Those were not traced to
+  specific records, and they do not appear at the true offsets.
+
+**IPJ members 1-3 (section 6.7b), 107 of 107 IPJ objects.** Members
+chain from `+60`, each next member at `offset + 32 + length`, and the
+walk lands on the payload end every time.
+
+| Member | Bytes 8-15 | From the 16-byte index onward |
+|---|---|---|
+| 1 | vary: an int32, then 0 or 1 | 28 zero bytes, then eight float64 `rDUMMY` |
+| 2 | vary, as above | 64 zero bytes |
+| 3 | vary, as above | 64 zero bytes |
+
+From the index onward, the members are byte-identical on every object
+that has them: member 1 on 107, member 2 on 94, member 3 on 86. What the
+varying 8 bytes mean is **[UNKNOWN]**.
+
+**Also re-measured:** the `Database Extension Objects` payload is 80
+bytes on 49 of 49 files, and the `MAKER` field after the tool name is 0
+wherever a record decodes.
 
 ### 6.3 Line table — [LIKELY] existence and stride, [UNKNOWN] full layout
 
@@ -3474,6 +3595,31 @@ hint; the exact contents of `+136..+176`.
 investigation only, kept out of `pygdb/registry.py` pending a decision
 on whether a real decoder (e.g. a `find_projection_parameters`
 alongside `find_channel_settings`) is worth building on this.
+
+### 6.7c Per-(channel, channel) `IPJ` objects — [CONFIRMED] real and common; [UNKNOWN] purpose
+
+Session 16, prompted by a false unseen-feature notice on a newly added
+sample (`pygdb.unseen`, method code 0). `_live_admin_objects` surfaces
+every live `IPJ\0`-tagged, `" JPI"`-gated object, not just the one or two
+per file that name a working coordinate system. Across 46 of 49 corpus
+files, most `IPJ` objects are a second kind: blob-symbol name
+`?|IPJ_<channel>:<channel>` (e.g. `?|IPJ_x:y`, `?|IPJ_Longitude:Latitude`,
+`?|IPJ_radar:Temp99`), one per pairing of two real channels. 133 gated
+`IPJ` objects total, corpus-wide:
+
+| | Count | Method code (`+168`) |
+|---|---|---|
+| Has a decodable `" JPI"`+name marker (section 6.7b) | 118 | 68 Transverse Mercator, 43 geographic, 5 Polar Stereographic, 2 Lambert (2SP) |
+| No decodable name | 15 | 0, every time |
+
+The split is exact: every named object has one of the four known method
+codes, and every one of the 15 nameless objects reads method code 0. Not
+itself a projection method -- `find_projection_parameters` already skips
+an object it can't find a name in, unaffected by this. Plausibly one
+placeholder per coordinate-role pairing a channel can appear in (X:Y,
+lat:lon, ...), but this is **[UNKNOWN]**: not traced to any specific
+mechanism, and the rest of the object's content past `+168` wasn't
+compared against the named form's layout.
 
 ### 6.8 The `"REG "` blobs: Geosoft Desktop's own settings/processing-history registry — [CONFIRMED] rich real content, [UNKNOWN] exact binary framing
 
