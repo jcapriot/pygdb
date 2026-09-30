@@ -78,6 +78,10 @@ them.
 
 ::: pygdb.GDBParseWarning
 
+::: pygdb.GDBUnseenFeatureWarning
+
+::: pygdb.unseen_feature_report
+
 ::: pygdb.GRDParseWarning
 
 ::: pygdb.LZRW1DecodeError

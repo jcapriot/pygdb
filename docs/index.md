@@ -107,6 +107,63 @@ right index and size. A duplicate the directory resolves is not reported.
   the last blob in chain order is used and a `GDBParseWarning` says so; that
   is a guess, and not always the current copy.
 
+## Unseen-feature notices
+
+A few details of the format are still unknown (the specification's
+[§11](spec.md#11-known-real-world-oddities-recorded-not-resolved)), and most can only be settled
+by a file that does something none of the project's sample files do: a
+second database user, a projection method other than the four seen, a
+channel scale factor other than 1. `pygdb` checks for these, and when a
+file has one it issues a `GDBUnseenFeatureWarning`:
+
+```text
+survey.gdb: this file has a feature pygdb hasn't seen before (projection
+method code 7). The data was read normally. To help finish the format spec,
+please run pygdb.unseen_feature_report(r"survey.gdb") (or: python -m
+pygdb.report "survey.gdb") and paste its output into an issue at
+https://github.com/jcapriot/pygdb/issues/new?template=unseen-feature.yml.
+Please don't attach the file unless it's public.
+  Evidence: coordinate system '...', method code 7, slots [...]
+```
+
+Nothing is wrong with the file, and nothing is sent anywhere: the notice
+is a local warning, shown at most once per file and feature.
+
+To report it, run the report and paste what it prints into the
+[issue form](https://github.com/jcapriot/pygdb/issues/new?template=unseen-feature.yml):
+
+```python
+print(pygdb.unseen_feature_report("survey.gdb"))
+```
+
+```sh
+python -m pygdb.report survey.gdb
+```
+
+The report lists every unseen feature in the file, each with its
+evidence and the surrounding structural bytes we need to decode it. It
+says nothing about the data in your file, only about how the file is
+laid out: no survey values, user names, paths or processing parameters,
+and not even the file's name. But don't take our word for it: check
+[the source code](https://github.com/jcapriot/pygdb/blob/main/pygdb/unseen.py)
+for yourself, and read the report before posting it.
+
+Most checks cost nothing. Opening a file also scans its administrative
+objects (projections, channel creation records), which adds a few tens of
+milliseconds on a large file. To turn the notices off, filter the warning,
+or set an environment variable, which also skips that scan:
+
+```python
+import warnings
+import pygdb
+
+warnings.simplefilter("ignore", pygdb.GDBUnseenFeatureWarning)
+```
+
+```sh
+export PYGDB_UNSEEN_FEATURE_NOTICES=0
+```
+
 ## Exporting to xarray
 
 ```sh

@@ -1673,6 +1673,50 @@ landed on `Fiducial`, `GPS_Height` and `Ground_Speed` as well as on
 entry count (section 6.8c), not from reused handles. Honouring the count
 removes them.
 
+### 6.2e Constant fields re-measured on 49 files -- [CONFIRMED] values, [UNKNOWN] meanings
+
+Re-measured in Session 15, on all 48 public files plus the supplied
+file, as the baselines for the reader's unseen-feature notices
+(`pygdb.unseen`). Scripts: `baselines.py`, `notices.py`. Every value
+below holds on every file. None of the fields' meanings is known.
+
+| Field | Value | Count |
+|---|---|---|
+| Header word 8 | `0x10020000` | 49 of 49 files |
+| Header word 12 | `264` | 49 of 49 files |
+| Header words 16, 20, 68 | 0 | 49 of 49 files |
+| Channel `+108` (float64) / `+116` (int16) | 1.0 / 5 | 1,247 of 1,247 genuine channels |
+| Live user records | exactly one, category `0x20000`, `+124` = −1 | 49 of 49 files |
+| Line type (true `+96`) | 0 (5,307), 2 (265), 6 (3) | 5,575 live lines |
+| Line true `+104..+123` | `aec59df4 14e384bcd6bf91c6 176e05b5b5b89346` | 5,575 of 5,575 |
+
+- **Live user records:** "live" means a non-empty name without the free
+  bit `0x10000`.
+- **Line types:** 126 of the 5,307 type-0 lines are group lines.
+- **Line block:** the bytes decode as float32 −1e32, float64 −9e31 and
+  float64 +1e32. Read at each live line's true offsets, every line has
+  this block, group lines included. Section 6.2d's previous-line view
+  counted 18 all-zero blocks among 5,003 lines. Those were not traced to
+  specific records, and they do not appear at the true offsets.
+
+**IPJ members 1-3 (section 6.7b), 107 of 107 IPJ objects.** Members
+chain from `+60`, each next member at `offset + 32 + length`, and the
+walk lands on the payload end every time.
+
+| Member | Bytes 8-15 | From the 16-byte index onward |
+|---|---|---|
+| 1 | vary: an int32, then 0 or 1 | 28 zero bytes, then eight float64 `rDUMMY` |
+| 2 | vary, as above | 64 zero bytes |
+| 3 | vary, as above | 64 zero bytes |
+
+From the index onward, the members are byte-identical on every object
+that has them: member 1 on 107, member 2 on 94, member 3 on 86. What the
+varying 8 bytes mean is **[UNKNOWN]**.
+
+**Also re-measured:** the `Database Extension Objects` payload is 80
+bytes on 49 of 49 files, and the `MAKER` field after the tool name is 0
+wherever a record decodes.
+
 ### 6.3 Line table — [LIKELY] existence and stride, [UNKNOWN] full layout
 
 Searching for the real line name `"L1000"` (from the CSV) found 631

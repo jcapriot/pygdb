@@ -56,6 +56,7 @@ def pack_channel_record(
     struct.pack_into("<h", rec, 94, 10)
     struct.pack_into("<i", rec, 96, 0)
     struct.pack_into("<d", rec, 108, scale)
+    struct.pack_into("<h", rec, 116, 5)  # 5 on every real channel (docs/spec.md section 3.1)
     struct.pack_into("<h", rec, 118, array_width)
     return bytes(rec)
 
@@ -68,11 +69,19 @@ def pack_line_record(name: str, category_code: int = 100) -> bytes:
     return bytes(rec)
 
 
-def pack_user_record(name: str) -> bytes:
-    """One 128-byte user-table record -- only the name field matters here."""
+def pack_user_record(name: str, category: int = 0x20000, plus_124: int = -1) -> bytes:
+    """One 128-byte user-table record, with the category and `+124` every
+    real superuser record has (docs/spec.md section 3.3)."""
     rec = bytearray(SYMBOL_RECORD_SIZE)
     rec[8:8 + 64] = pad_name(name, 64)
+    struct.pack_into("<i", rec, 84, category)
+    struct.pack_into("<i", rec, 124, plus_124)
     return bytes(rec)
+
+
+# The line record's true +104..+123, identical on every real line
+# (docs/spec.md section 3.2).
+LINE_BLOCK = bytes.fromhex("aec59df414e384bcd6bf91c6176e05b5b5b89346")
 
 
 def empty_record() -> bytes:
@@ -232,6 +241,9 @@ def build_real_layout_gdb_bytes(
     blobs_max: int = 4,
     admin_blobs: Sequence[bytes] = (),
     leading_junk_pages: int = 0,
+    user_records: Optional[Sequence[bytes]] = None,
+    line_types: Optional[dict] = None,
+    line_blocks: Optional[dict] = None,
 ) -> bytes:
     """
     Like `build_gdb_bytes`, but laid out the way real files are
@@ -282,8 +294,16 @@ def build_real_layout_gdb_bytes(
         the first blob -- a real file was found with one (docs/spec.md
         section 6.2). Directory start pages still count from the region
         start.
+    user_records : sequence of bytes, optional
+        The user table's records (default: one real superuser record,
+        then empty slots).
+    line_types, line_blocks : dict, optional
+        By line name, a line type (true `+96`, default 0) or 20-byte
+        block (true `+104..+123`, default the real constant pattern).
     """
     corrupt_entries = corrupt_entries or {}
+    line_types = line_types or {}
+    line_blocks = line_blocks or {}
     chans_max = len(channels)
     phantom = len(line_table_prefix) // SYMBOL_RECORD_SIZE
     lines_max = phantom + len(lines) + spare_line_slots
@@ -379,8 +399,17 @@ def build_real_layout_gdb_bytes(
         for c in channels
     )
     buf[channel_table_start:channel_table_start + len(channel_table)] = channel_table
-    user_table = pack_user_record("SUPER") + empty_record() * (users_max - 1)
+    if user_records is None:
+        user_records = [pack_user_record("SUPER")] + [empty_record()] * (users_max - 1)
+    user_table = b"".join(user_records)
     buf[user_table_start:user_table_start + len(user_table)] = user_table
+    # Each line's true +96 (type) and +104..+123 fall in the next 128-byte
+    # window; the last line's reach into the channel table's leading bytes,
+    # as in real files. Written last so nothing overwrites them.
+    for i in range(len(lines)):
+        start = line_table_start + (phantom + i) * SYMBOL_RECORD_SIZE + 32
+        struct.pack_into("<i", buf, start + 96, line_types.get(lines[i].name, 0))
+        buf[start + 104:start + 124] = line_blocks.get(lines[i].name, LINE_BLOCK)
     for (_key, _live, raw), offset in zip(chain, offsets):
         buf[blob_start + offset:blob_start + offset + len(raw)] = raw
     for i in range(leading_junk_pages * page_size):

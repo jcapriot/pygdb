@@ -4153,3 +4153,41 @@ public GX developer wiki has a dedicated page on them. Does those help you?"
    hold dX = `rDUMMY` (−1e32), dY..Rz = 0 and scale = 1. A `WGS 84`
    datum instead holds all zeros and scale 1. The empty name field can
    hold leftover bytes after its leading NUL.
+
+## Session 15 -- baselines for the unseen-feature notices (2026-09-29)
+
+Prompted by: "are we at the stage where we could notify the user if their
+file has something we haven't seen yet that would help us narrow down
+those last few pieces?" The notices themselves are a reader feature
+(`pygdb.unseen`). Checking each "always seen" fact before building on it
+was format work. Scripts: `baselines.py`, `notices.py`. Recorded in
+notes.md section 6.2e.
+
+1. **Header words 8-20 and 68.** Tallied as int32 on all 49 files (48
+   public plus the supplied file): one combination only, word 8
+   `0x10020000`, word 12 `264`, words 16/20/68 zero.
+2. **Channel `+108`/`+116`.** 1,247 genuine channels read 1.0 and 5.
+   Every one.
+3. **User table.** Every file has exactly one live user record, category
+   `0x20000`, `+124` = −1.
+4. **Line records, read at true offsets.** Of 5,575 live lines, the types
+   are 0, 2 or 6, and the 20-byte block at true `+104..+123` is the same
+   bytes on all of them. The spec's earlier "all-zero on 18 of 5,003"
+   came from the previous-line view. It does not reproduce at true
+   offsets, and the 18 were not traced.
+5. **IPJ members 1-3.** My first member walk was wrong (next member at
+   `offset + 8 + 28 + length`, which never lined up). Printing the frame
+   positions (`652`, `776`, `872` after a 560-byte member 0 at `60`) gave
+   `offset + 32 + length`, which ends exactly at the payload end on all
+   107 objects. From each member's 16-byte index onward, the bytes are
+   identical everywhere:
+   - member 1: 28 zero bytes and eight `rDUMMY`;
+   - members 2 and 3: 64 zero bytes.
+
+   The first draft of the check assumed 40 zero bytes and six dummies,
+   then 44 and six; both fired on every file until the bytes were dumped
+   and counted. The 8 bytes between the length field and the index vary
+   between objects.
+6. **Nothing in the corpus trips any check**: 0 notices over all 49 files
+   with channels, lines, projections and makers read. This is now an
+   integration test.

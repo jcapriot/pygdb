@@ -1140,19 +1140,30 @@ def _live_admin_objects(path: str) -> Dict[int, bytes]:
     return objects
 
 
-def _decode_maker(nested: bytes) -> Optional[ChannelMaker]:
-    """A `MAKER` nested object (docs/spec.md section 9), or `None` if
-    `nested` does not have that shape."""
+def _maker_field_offset(nested: bytes) -> Optional[int]:
+    """Offset of the 2-byte field after a `MAKER` record's tool string
+    (docs/spec.md section 9), or `None` if `nested` is not that shape."""
     if (
         len(nested) < 84 or nested[:4] != _OBJECT_FRAME or nested[16:21] != b"MAKER"
         or nested[32:36] != _MEMBER_FRAME or nested[64:72] != _TAG_BLOCK + b"MAKE"
     ):
         return None
+    tool_len = struct.unpack_from("<i", nested, 76)[0]  # after the tag block and its int32 (1)
+    field_at = 80 + tool_len
+    if tool_len < 0 or field_at + 2 > len(nested):
+        return None
+    return field_at
+
+
+def _decode_maker(nested: bytes) -> Optional[ChannelMaker]:
+    """A `MAKER` nested object (docs/spec.md section 9), or `None` if
+    `nested` does not have that shape."""
+    field_at = _maker_field_offset(nested)
+    if field_at is None:
+        return None
     try:
-        pos = 76  # after the tag block and its int32 (1)
-        tool_len = struct.unpack_from("<i", nested, pos)[0]
-        tool = nested[pos + 4:pos + 4 + tool_len].split(b"\x00")[0].decode("latin-1")
-        pos += 4 + tool_len + 2  # the tool string is followed by a 2-byte field
+        tool = nested[80:field_at].split(b"\x00")[0].decode("latin-1")
+        pos = field_at + 2  # the tool string is followed by a 2-byte field
         label_len = struct.unpack_from("<i", nested, pos)[0]
         label = nested[pos + 4:pos + 4 + label_len].split(b"\x00")[0].decode("latin-1")
         pos += 4 + label_len
@@ -1174,13 +1185,39 @@ def _decode_reg_maker(blob_bytes: bytes) -> Optional[ChannelMaker]:
     """The `MAKER` record of one registry object, if it has one: after the
     object's `+124` entries comes an int32 count of nested objects, and a
     count of 1 is followed by the record (docs/spec.md section 9)."""
+    nested = _reg_nested_object(blob_bytes)
+    return None if nested is None else _decode_maker(nested)
+
+
+def _reg_nested_object(blob_bytes: bytes) -> Optional[bytes]:
+    """The bytes of a registry object's single nested object, if it has
+    exactly one (see `_decode_reg_maker`)."""
     if blob_bytes[44:48] != _REG_OBJECT_NAME or len(blob_bytes) < _REG_PREAMBLE_SIZE + 4:
         return None
     n_entries = max(struct.unpack_from("<i", blob_bytes, _REG_ENTRY_COUNT_OFFSET)[0], 0)
     count_at = _REG_PREAMBLE_SIZE + n_entries * _REG_FLAT_KV_SLOT_SIZE
     if count_at + 8 > len(blob_bytes) or struct.unpack_from("<i", blob_bytes, count_at)[0] != 1:
         return None
-    return _decode_maker(blob_bytes[count_at + 4:])
+    return blob_bytes[count_at + 4:]
+
+
+def _reg_maker_field(blob_bytes: bytes) -> Optional[int]:
+    """The 2-byte field after the tool string of a registry object's
+    `MAKER` record (always 0 in the corpus), or `None` without one."""
+    nested = _reg_nested_object(blob_bytes)
+    if nested is None:
+        return None
+    field_at = _maker_field_offset(nested)
+    return None if field_at is None else struct.unpack_from("<H", nested, field_at)[0]
+
+
+def _reg_maker_tool(blob_bytes: bytes) -> Optional[str]:
+    """The tool name of a registry object's `MAKER` record, or `None`."""
+    nested = _reg_nested_object(blob_bytes)
+    field_at = None if nested is None else _maker_field_offset(nested)
+    if field_at is None:
+        return None
+    return nested[80:field_at].split(b"\x00")[0].decode("latin-1")
 
 
 def _channel_handles(path: str, channels: Optional[Iterable[ChannelRecord]]):

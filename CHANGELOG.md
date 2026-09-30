@@ -35,6 +35,19 @@ from there.
 
 ### Added
 
+- Unseen-feature notices: when a file has a format feature no sample file
+  has shown (a second database user, an unknown projection method, a
+  channel scale other than 1, and a few more fixed fields), `pygdb` issues
+  a `GDBUnseenFeatureWarning` once per file and feature. It gives the
+  exact values seen and asks the user to run
+  `pygdb.unseen_feature_report(path)` (or `python -m pygdb.report path`)
+  and post its output through a new GitHub issue form. The report gives
+  each unseen feature with the surrounding structural bytes needed to
+  decode it. It holds nothing about the file's data, and not even its
+  name. The data is read normally, and nothing is sent anywhere. Opening a file now scans its administrative objects for
+  these, adding up to ~70 ms on the largest sample files. Turn the notices
+  off with `warnings.simplefilter("ignore", pygdb.GDBUnseenFeatureWarning)`
+  or `PYGDB_UNSEEN_FEATURE_NOTICES=0`, which also skips the scan.
 - `pygdb.find_channel_makers` / `GDB.channel_makers`: how each channel was
   made, from the `MAKER` records in the file's registry -- the tool
   (`newchan.gx`, the math expression builder, `newxy.gx`, ...), its label,

@@ -269,6 +269,38 @@ def test_projection_parameters_polar_stereographic_and_second_lambert(samples_di
     assert lcc.method_parameters["latitude_of_false_origin"] == -80.0
 
 
+def test_no_unseen_feature_notice_on_any_real_file(all_gdb_sample_paths):
+    """
+    Every baseline `pygdb.unseen` checks against was measured on this
+    corpus, so no real file here may trigger a notice. A new sample that
+    does has found something new: log it in docs/provenance and widen
+    the baseline, rather than silencing this test.
+    """
+    from pygdb import GDBUnseenFeatureWarning
+    noticed = []
+    for path in all_gdb_sample_paths:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            db = GDB(path)
+            db.channels
+            db.lines
+            db.projection_parameters
+            db.channel_makers
+        noticed += [f"{_basename(path)}: {w.message}" for w in caught
+                    if w.category is GDBUnseenFeatureWarning]
+    assert not noticed, "\n".join(noticed)
+
+
+def test_unseen_feature_report_finds_nothing_on_any_real_file(all_gdb_sample_paths):
+    """The report runs the same checks as the notices, so it agrees: nothing
+    unseen anywhere in the corpus, and the file is never named."""
+    from pygdb import unseen_feature_report
+    for path in all_gdb_sample_paths:
+        text = unseen_feature_report(path)
+        assert "No unseen features found in this file." in text, _basename(path)
+        assert os.path.basename(path) not in text
+
+
 def test_projection_text_agrees_with_binary_on_every_real_file(all_gdb_sample_paths):
     """
     Regression for the naming rule in docs/spec.md section 8: a

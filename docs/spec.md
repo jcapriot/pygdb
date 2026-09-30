@@ -101,7 +101,7 @@ from the start of the file.
 | 84, 88, 92, 96 | int32 (each) | Capacities of the blob, line, channel and user symbol tables, **in the vendor's `DB_SYMB_*` order** (`BLOB=0, LINE=1, CHAN=2, USER=3`) | **[CONFIRMED]** | 92 == `chans_max`, 96 == `users_max`, 88 == `lines_max`, 84 == `blobs_max` in 23 of 23 files. |
 | 72, 76, 80, 64 | int32 (each) | Running totals of those capacities: blobs, + lines, + channels, + users (= **total symbol slots**) | **[CONFIRMED]** | Exact cumulative sums in 23 of 23 files. |
 | 44, 48, 52, 56, 60 | int32 (each) | Partition of the `blob_index` space (§6.1) **and of the blob directory (§2.2)**: 48 = `lines_max × chans_max` (first index past the (line, channel) data blobs); 52 = 48 + `blobs_max`; 56 = 52 + `users_max`; 60 = 56; 44 = 60 + `cache` (the total number of directory slots) | **[CONFIRMED]** arithmetic and directory slot count | Exact in 23 of 23 files. It explains why administrative/registry blobs are addressed at `blob_index = lines_max × chans_max + slot`: one slot per blob symbol. |
-| 8–20, 68 | int32 (each) | Constant in every file examined | **[UNKNOWN]** | Not resolved. |
+| 8–20, 68 | int32 (each) | Constant in every file examined: word 8 `0x10020000` and word 12 `264` (bytes 8–15 of the fixed sub-block above), words 16, 20 and 68 zero -- 49 of 49 files | **[UNKNOWN]** meaning | Not resolved. The reader issues an unseen-feature notice for any other value. |
 
 ### 2.1 Layout of everything before the first blob
 
@@ -359,8 +359,8 @@ first channel.
 | `+92` | int16 | Display format code (§4) — matches `DB_CHAN_FORMAT_DATE`/`TIME` exactly on real date/time channels, `0` (NORMAL) elsewhere | **[CONFIRMED]** |
 | `+94` | int16 | **Display width** (vendor `get_chan_width`). Equals `NEWCHAN.DISPWIDTH` in the channel's own `MAKER` record (§9) on 32 of 32 channels created by `newchan.gx`, and the ASEG-GDF2 `.dfn` field width on 34 of 35 scalar channels of `AG106386` | **[CONFIRMED]** |
 | `+96` | int32 | **Display decimals** (vendor `get_chan_decimal`). Equals `NEWCHAN.DISPDIG` in the channel's `MAKER` record on 32 of 32, and the `.dfn` decimal count on 37 of 37 channels of `AG106386` | **[CONFIRMED]** |
-| `+108` | float64 | Exactly `1.0` on every genuine channel (535 of 535) | **[UNKNOWN]** — plausible scale-factor field, never seen a non-1.0 value on a real channel |
-| `+116` | int16 | Exactly `5` on every genuine channel (535 of 535), regardless of the channel's own dtype at `+84` — confirmed independent, not a copy of the type code, by checking it against every non-`GS_DOUBLE` dtype in the corpus (`GS_USHORT` incl. 512-wide array channels, `GS_SHORT`, `GS_LONG`, `GS_FLOAT`, and 9 string widths — all still read `5`) | **[UNKNOWN]** |
+| `+108` | float64 | Exactly `1.0` on every genuine channel (1,247 of 1,247 in 49 files) | **[UNKNOWN]** — plausible scale-factor field, never seen a non-1.0 value on a real channel |
+| `+116` | int16 | Exactly `5` on every genuine channel (1,247 of 1,247 in 49 files), regardless of the channel's own dtype at `+84` — confirmed independent, not a copy of the type code, by checking it against every non-`GS_DOUBLE` dtype in the corpus (`GS_USHORT` incl. 512-wide array channels, `GS_SHORT`, `GS_LONG`, `GS_FLOAT`, and 9 string widths — all still read `5`) | **[UNKNOWN]** |
 | `+118` | int16 | **Array width**: number of elements per fiducial. `1` = scalar (the overwhelming majority); `>1` = true VA/array channel | **[CONFIRMED]** — see §5 |
 
 Unused channel-table capacity (slots beyond the real channel count, up
@@ -387,7 +387,7 @@ notes.md` §6.3b) resolved most of what was previously `[UNKNOWN]`.
 |---|---|---|---|
 | `+0` | int32 | **Previous line's type** — true `+96` of the previous record (§2.1): `DB_LINE_TYPE_*`, `0` = `NORMAL` on every `"L"` line, `2` = `TIE` on every `"T"` line, 5,003 of 5,003 once read against the right line; `6` = `RANDOM` on the `"D"` line of `afgrav.gdb` | **[CONFIRMED]** |
 | `+4` | int32 | **Previous line's flight number** (true `+100`) — mostly `0`; where it varies, adjacent line pairs share values; no independent ground truth | **[LIKELY]** |
-| `+8` | 20 bytes | Previous line's true `+104..+123`. Always the identical byte pattern when populated (4,985 of 5,003 real lines) — a float32 `-1e32` at `+8`, a float64 `+1e32` at `+20` (both the vendor's `rDUMMY` sentinels, §4), and a middle 8 bytes (`+12`) that decode exactly to the nearest float64 to a round `-9×10^31` — not itself a catalogued vendor dummy; all-zero on the other 18 | **[CONFIRMED]** structure, real content never observed |
+| `+8` | 20 bytes | Previous line's true `+104..+123`. Always the identical byte pattern when populated (4,985 of 5,003 real lines) — a float32 `-1e32` at `+8`, a float64 `+1e32` at `+20` (both the vendor's `rDUMMY` sentinels, §4), and a middle 8 bytes (`+12`) that decode exactly to the nearest float64 to a round `-9×10^31` — not itself a catalogued vendor dummy. Read at the true offsets of every live line (5,575 lines in 49 files, normal and group), the pattern is identical on all of them. An earlier count through this previous-line view found 18 all-zero blocks, which were not traced to specific records | **[CONFIRMED]** structure, real content never observed |
 | `+28` | int32 | **Previous line's version** (true `+124`) — the number after the dot in a repeat-line name: `1` for each of the 9 `.1` lines, `0` for every other line, 5,003 of 5,003 | **[CONFIRMED]** |
 | `+32` | up to 64 bytes | NUL-padded line name (note: **not** at `+8` the way channel names are — line records reserve more leading fields) | **[CONFIRMED]** |
 | `+96` | 12 bytes | Always exactly zero, 5,003 of 5,003 | **[CONFIRMED]** reserved/unused |
@@ -1102,8 +1102,8 @@ It uses the same framing as a registry (§9).
 | Member | Length | Content |
 |---|---|---|
 | 0 (`+60`) | 560 | The projection record: every fixed offset in the table above |
-| 1 | 92 | Zeros, then float64 `rDUMMY` values: an unused parameter array (63 of 63) |
-| 2, 3 | 64 each | All zero (57 of 57 objects that have them) |
+| 1 | 92 | After 8 bytes that vary between objects (an int32, then `0` or `1`), the 16-byte index, 28 zero bytes and eight float64 `rDUMMY` values: an unused parameter array. Byte-identical from the index onward on 107 of 107 objects |
+| 2, 3 | 64 each | The same varying 8 bytes, then the index and 64 zero bytes: identical from the index onward on all 94 (member 2) and 86 (member 3) objects that have them |
 | 4, 5 | 72, 258 | Seen once (East_Isa). Member 4 holds ASCII `EPSG` and int32 `28354`, the EPSG code of that object's own name, "GDA94 / MGA zone 54". Member 5 begins `GDA94`. **[LIKELY]** an authority-code member |
 
 **What's still open, deliberately not force-completed:**
@@ -1472,7 +1472,12 @@ file by a completely unrelated toolchain.
 
 These are real, observed, and safe to ignore for correct reading (a
 conforming reader already handles or skips all of them defensively),
-but their actual meaning is genuinely **[UNKNOWN]**:
+but their actual meaning is genuinely **[UNKNOWN]**. Where a single
+field value would help (the header words, channel `+108`/`+116`, the user
+table, line types and the line block, projection method codes, slot 7,
+IPJ members 1-3, the `MAKER` field and the `EXT` list), the reader issues
+a `GDBUnseenFeatureWarning` when a file differs from every file seen, so
+a user can report it (`pygdb.unseen`):
 
 - The `f0f0f0f0` header-signature variant (§2) — seen twice, in two
   unrelated real deliveries, always the identical 4 bytes.
