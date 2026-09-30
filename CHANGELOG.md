@@ -73,6 +73,15 @@ from there.
   defines no projection (a datum/ellipsoid-only entry), or the method is
   not one the reader names, the named fields are `None` rather than the
   on-disk dummy sentinel.
+- `ProjectionParameters` also gives the method's GXF name (`method`) and
+  its parameters keyed by the GXF specification's names
+  (`method_parameters`), with `parameter_source` saying where the names
+  came from. A projection method the reader has no layout for is still
+  named when the file's registry holds its `_PJ_PROJECTION` text, which
+  is used only when it matches the binary values exactly. New fields
+  `prime_meridian`, `datum_transform_parameters` (the 7-parameter
+  Bursa-Wolf transform, in metres, arc-seconds and ppm), `units_name`,
+  `units_factor` and `projection_name`.
 
 ## [0.3.0] - 2026-09-26
 

@@ -4108,3 +4108,48 @@ before; this session only strengthens the "independent constant"
 framing with an explicit non-`GS_DOUBLE` cross-check, since the
 existing "535 of 535" figure did not previously call out that it spans
 every real dtype in the corpus, not just `GS_DOUBLE`.
+
+## Session 14 -- the coordinate-system definition, from vendor documentation (2026-09-29)
+
+Prompted by: "On the coordinate systems, I see there's a Coordinate_system
+class in the gxpy source code (again don't run anything). and seequent's
+public GX developer wiki has a dedicated page on them. Does those help you?"
+
+1. **Sources read, nothing run.** `gxpy/coordinate_system.py` (S24) is a
+   wrapper over the compiled `GXIPJ` API. It defines a coordinate system
+   by five GXF strings and points to the GXF specification for them. The
+   wiki page (S24) gives the same strings. GXF Revision 3 (S23, a Geosoft
+   document hosted by USGS) defines them and, in Table 1, lists every
+   projection method's parameters in order.
+2. **Slot names confirmed.** Table 1's parameter order, with unused EPSG
+   parameters kept as unset slots, names every binary slot for the three
+   decoded methods. The Lambert and Polar Stereographic names go from
+   [LIKELY] to [CONFIRMED].
+3. **The rest of IPJ member 0 found**, using the registry's GXF text as
+   a key:
+   - prime meridian `+324`;
+   - the 7 Bursa-Wolf transform parameters `+396..+451` (rotations in
+     radians, scale as `1 + ppm/10⁶`, exact against three datums);
+   - units name `+452` and factor `+516`;
+   - projection name `+524`.
+
+   Every field's offset now tiles `+104..+652` without gaps.
+4. **Registry text vs. binary slots, corpus-wide** (`pjtext.py`). For
+   every projected IPJ object, `_PJ_PROJECTION` values were collected
+   from the registries' flat entries under a matching `_PJ_NAME` (the
+   value is quoted). 43 of 50 projected objects have text; 7 have none
+   (three in `AG106386`, `DB_Mag_1212`, `DB_Mag_1213`, both systems in
+   `Brunt_mag_2017`). On all 43, the text holds exactly as many values
+   as the binary has set slots, equal in order (41 Transverse Mercator,
+   1 Lambert (2SP), 1 Polar Stereographic). No geographic object has
+   `_PJ_PROJECTION` text. This is what lets the text name the slots of a
+   method whose code has no known layout. The reader now does so, keeping
+   the binary's values.
+5. **The "no transform" shape** (`pjcheck.py`). All 25 datum transforms
+   with registry text convert back to it (arc-seconds, ppm) within
+   1e-6. The 5 objects whose transform name field is empty (the three
+   `GDA2020` systems in `AG106386`, `NAD83(2011)` in
+   `HawthorneGrav_wMasks_MF20240116`, `NAD83` in `long_valley_ed`)
+   hold dX = `rDUMMY` (−1e32), dY..Rz = 0 and scale = 1. A `WGS 84`
+   datum instead holds all zeros and scale 1. The empty name field can
+   hold leftover bytes after its leading NUL.

@@ -946,7 +946,12 @@ verified corpus-wide (63 of 63 real instances, all 22 real files):
 | `+244` | Ellipsoid name (NUL-terminated ASCII) — `"GRS 1980"`, `"WGS 84"` seen | **[CONFIRMED]** |
 | `+308` | Semi-major axis, float64 | **[CONFIRMED]** — `6378137.0` on every WGS 84 / GRS 1980 instance; `6378206.4` (Clarke 1866, NAD27, Alaska DGGS `fortymile_linedata.gdb`) and `6378388.0` (International 1924, Herat North datum, USGS `GDR_clmag.gdb`), each matching the published ellipsoid |
 | `+316` | Eccentricity, float64 | **[CONFIRMED]** — matches the ellipsoid at `+244` exactly |
+| `+324` | Prime meridian, float64, degrees from Greenwich (the fourth value of a GXF datum string) | **[CONFIRMED]** position, `0.0` on 106 of 106 instances |
 | `+332` | Datum-transformation name (NUL-terminated ASCII) — `"GDA94 to WGS 84 (1)"`, `"NAD83 to WGS 84 (1)"`, `"NAD83(CSRS98) to WGS 84 (1)"` seen | **[CONFIRMED]** on all 36 of 36 real instances corpus-wide that define one (a datum already stated in WGS 84 has nothing here to name); every one of the 3 agencies agrees |
+| `+396..+451` | The datum transformation's 7 Bursa-Wolf parameters, float64: dX, dY, dZ (metres), Rx, Ry, Rz (**radians**), scale (a **multiplier**, `1 + ppm/10⁶`) | **[CONFIRMED]** against the registry's `_PJ_DATUM_TRANSFORM` text on four datums: `AGD66 to WGS 84 (12)` reads −129.193, −41.212, 130.73 m, rotations converting exactly to 0.246/0.374/0.329 arc-seconds, and scale 0.999997045 (−2.955 ppm). The text is generated from these: it carries the float noise of the conversion (`-2.95500000002669`). With no transform (empty name field, 5 objects), dX is `rDUMMY` and the rest hold their defaults, `0` and scale `1` |
+| `+452` | Units name, NUL-terminated in a 64-byte field — `m` on every projected object (68), `dega` (degrees) on every geographic one (38) | **[CONFIRMED]** |
+| `+516` | Units factor to metres, float64 (`m,1` in GXF) | **[CONFIRMED]** position, `1.0` everywhere |
+| `+524` | Projection name without the datum, NUL-terminated in a 64-byte field — `UTM zone 11N`, `Australian Map Grid zone 54`, `*bas_polar`; empty for geographic objects. The field ends exactly where the parameters begin | **[CONFIRMED]**, 106 of 106 |
 | `+168` | Projection method code, int32: `1` geographic (datum only), `11` Transverse Mercator, `3` Lambert Conic Conformal (2SP), `14` Polar Stereographic | **[CONFIRMED]** for these four -- 1 and 11 throughout the corpus, 3 on two Lambert objects in two files, 14 on two objects in `Brunt_mag_2017.gdb` |
 | `+588..+651` | 8 float64 parameter slots; their meaning depends on the method at `+168` (table below) | **[CONFIRMED]** layout |
 
@@ -954,13 +959,13 @@ verified corpus-wide (63 of 63 real instances, all 22 real files):
 
 | Slot (offset) | Transverse Mercator (`11`) | Lambert Conic Conformal 2SP (`3`) | Polar Stereographic (`14`) |
 |---|---|---|---|
-| 0 (`+588`) | latitude of origin | first standard parallel | latitude (the survey metadata's "standard parallel") |
-| 1 (`+596`) | central meridian | second standard parallel | central meridian |
-| 2 (`+604`) | unused | latitude of origin | unused |
-| 3 (`+612`) | unused | central meridian | unused |
-| 4 (`+620`) | scale factor | unused | scale factor |
-| 5 (`+628`) | false easting | false easting | false easting |
-| 6 (`+636`) | false northing | false northing | false northing |
+| 0 (`+588`) | latitude of natural origin | latitude of first standard parallel | latitude of natural origin |
+| 1 (`+596`) | longitude of natural origin | latitude of second standard parallel | longitude of natural origin |
+| 2 (`+604`) | unused | latitude of false origin | unused |
+| 3 (`+612`) | unused | longitude of false origin | unused |
+| 4 (`+620`) | scale factor at natural origin | unused | scale factor at natural origin |
+| 5 (`+628`) | false easting | easting at false origin | false easting |
+| 6 (`+636`) | false northing | northing at false origin | false northing |
 | 7 (`+644`) | unused | unused | unused |
 
 Unused slots hold `rDUMMY` (`-1.0e32`, §4), and a datum-only object has all
@@ -977,18 +982,34 @@ Afghanistan, central meridian 66°E). A second, independent Lambert object
 parallels −82/−78, origin −80, central meridian −81 in the same slots.
 Polar Stereographic's text `"Polar Stereographic",-71,0,0.994,0,2082760.109`
 fills slots 0, 1, 4, 5, 6 like Transverse Mercator, and that survey's own
-metadata calls −71 the standard parallel. **[LIKELY]** for the Lambert and
-Polar Stereographic slot names; the positions are [CONFIRMED]. On every Transverse Mercator object in the rest
+metadata calls −71 the standard parallel.
+
+**The slot names are [CONFIRMED]** by Geosoft's own GXF Revision 3
+specification (Table 1, "Projection Transformation Methods"). It lists
+each method's parameters "in the order required", taken from EPSG's
+enumerated parameter order "with unused parameters omitted". The text
+form omits unused parameters; the binary keeps them as unset slots. For
+Polar Stereographic, GXF names slot 0 the latitude of natural origin, which
+the British Antarctic Survey's own metadata calls the standard parallel.
+Table 1 also lists methods not yet seen here (Hotine and Laborde Oblique
+Mercator, Lambert Conic Conformal (1SP), Mercator (1SP) and (2SP), New
+Zealand Map Grid, Oblique Stereographic, Swiss Oblique Cylindrical,
+Transverse Mercator (South Oriented), `*Albers Conic`, `*Equidistant
+Conic`, `*Polyconic`). Their parameter names are known, but not their
+method codes or slot positions. On every Transverse Mercator object in the rest
 of the corpus, slot 0 reads `0`.
 
-**`+588..+651` is one vector of 8 float64 projection parameters -- [LIKELY]**,
-and it ends exactly where the first IPJ member does (`+652`, below). The
-text form in the registry's `_PJ_PROJECTION` key lists Transverse
-Mercator's five parameters in the same order as the populated slots: 0
-(latitude of origin), 1 (central meridian), 4 (scale), 5 (false easting)
-and 6 (false northing). The unused slots 2, 3 and 7 plausibly hold
-parameters only other projections use, such as standard parallels, but
-no other projection exists in the corpus to test that.
+**`+588..+651` is one vector of 8 float64 projection parameters --
+[CONFIRMED]**, ending exactly where the first IPJ member does (`+652`,
+below). **The registry's `_PJ_PROJECTION` text lists the vector's set
+slots, in order -- [CONFIRMED], 43 of 43.** Every corpus object with
+matching text (matched by `_PJ_NAME`; 43 of 50 projected objects) has
+exactly as many text values as set slots, equal in order: 41 Transverse
+Mercator, 1 Lambert (2SP), 1 Polar Stereographic. So for a method whose
+code has no known layout, its text still names its values: the text
+gives the method name, Table 1 gives that method's parameter names in
+order, and the binary's set slots give the values. Slot 7 is unset on
+every object.
 
 **A clean, self-consistent confirmation, not a gap:** an `IPJ` object
 that defines only a datum/ellipsoid (no projection) reads the real
@@ -1047,6 +1068,26 @@ stay `None`, and all eight raw slots are always available as
 for every object, and reported `central_meridian=38` for the Lambert
 system in `afgrav.gdb`.)
 
+It also returns the method's GXF name (`method`) and its parameters keyed
+by Table 1 names (`method_parameters`, e.g. `latitude_of_natural_origin`,
+`false_easting`), with `parameter_source` saying where the names came
+from:
+
+- `"text"`: the file's own `_PJ_PROJECTION` text. It is used only when
+  its values equal the binary's set slots in order, and, for a known
+  method code, when it names that code's method. Otherwise the reader
+  warns and ignores it. This is what decodes a method whose code has no
+  known layout.
+- `"binary"`: the confirmed slot layout for method codes 1, 3, 11 and 14.
+- `None`: neither is available. Only `parameters` holds the values.
+
+The values are always the binary's, never the text's. The text is
+generated from the binary. Also returned: `prime_meridian` (`+324`), the
+datum transform (`+396`) converted to GXF units (arc-seconds, ppm) as
+`datum_transform_parameters`, `units_name`/`units_factor` (`+452`/`+516`)
+and `projection_name` (`+524`). The older named fields are unchanged and
+still filled only for the four known codes.
+
 **The IPJ object is a chain of member frames -- [CONFIRMED], 63 of 63.**
 It uses the same framing as a registry (§9).
 
@@ -1066,10 +1107,10 @@ It uses the same framing as a registry (§9).
 | 4, 5 | 72, 258 | Seen once (East_Isa). Member 4 holds ASCII `EPSG` and int32 `28354`, the EPSG code of that object's own name, "GDA94 / MGA zone 54". Member 5 begins `GDA94`. **[LIKELY]** an authority-code member |
 
 **What's still open, deliberately not force-completed:**
-- Slot layouts for methods other than Transverse Mercator and Lambert
-  (2SP), and slot 7, unused by both.
-- The rest of member 0 between the name and the datum, and the content
-  of members 1-3, which are unset or zero everywhere.
+- The method codes and slot positions of methods other than codes 1, 3,
+  11 and 14. The reader can still name their values when the registry
+  holds their text (above), but an object without text stays unnamed.
+- The content of members 1-3, which are unset or zero everywhere.
 - **Not every out-of-range-`line_slot` blob is projection-related** —
   scanning ~1700 such blobs in one real file found only 3 with `IPJ`
   content; most instead carry a different tag (`"REG "`) — see §9 for

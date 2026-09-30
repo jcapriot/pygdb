@@ -60,6 +60,8 @@ how each claim was actually derived and tested.
 | S19 | Alaska DGGS GPR 2015-4 (Fortymile mining district), `https://dggs.alaska.gov/webpubs/data/gpr2015_004_fortymile-geophys-geosoft-database.zip` (DOI 10.14509/29411) | Real published survey data (State of Alaska, free download) | First non-WGS84/GRS80 ellipsoid (Clarke 1866, NAD27) (Session 12) |
 | S20 | British Antarctic Survey / UK Polar Data Centre, *Aeromagnetic survey across the Brunt Ice Shelf, 2017* (`GB/NERC/BAS/PDC/01072`), `Brunt_2017_mag_Geosoft.zip` via `ramadda.data.bas.ac.uk` | Real published survey data (UK Open Government Licence) | First Polar Stereographic projection, a second Lambert object, a fourth non-zero header word 116 (Session 12) |
 | S21 | USGS OFR 2006-1204, `https://pubs.usgs.gov/of/2006/1204/German_mag/GDR_clmag.gdb` | Real published data (US Government work, public domain) | International 1924 ellipsoid on the Herat North datum (Session 12) |
+| S23 | Geosoft, *GXF Grid eXchange File, Revision 3.0, draft 9.1* (12 April 1999), `https://pubs.usgs.gov/of/1999/of99-514/grids/gxf.pdf` | Vendor-published specification | Table 1 names every projection method's parameters in order; the datum, datum-transform and units string formats (Session 14) |
+| S24 | Geosoft GX Developer 9.3 wiki, "Coordinate Systems" (`geosoftgxdev.atlassian.net/wiki/spaces/GXD93/pages/102957255`) and `github.com/GeosoftInc/gxpy` `geosoft/gxpy/coordinate_system.py` (read, not run) | Vendor-published documentation and source | The five GXF strings that define a coordinate system (Session 14) |
 | S22 | OpenEI Geothermal Data Repository submission 1682 (BRIDGE, Sandia), `BRIDGE_Bell-Flat_Exploration-Data-Package.zip` (members extracted with HTTP range requests) | Real published data (CC-BY 4.0) | 2024-vintage ground-gravity databases; 11 of 12 carry the `f0f0f0f0` header variant; also `HawthorneGrav_wMasks_MF20240116.gdb` (East Hawthorne) and `GP_Master_Gravity_11082023.gdb` (Grover Point), the first file with non-blob pages in the blob region and the first resized database (Session 12) |
 
 Sources checked but **not usable** (see `LOG.md` §1.10, 1.13, 1.14 for
@@ -1536,6 +1538,81 @@ the data range.
   `LABEL`/`UNITS` values and X/Y channel assignment. Node records begin
   `02`/`03` + a kind letter; the meaning of their link fields is not
   decoded.
+
+**Session 14: IPJ member 0 fully laid out, against Geosoft's GXF
+specification -- [CONFIRMED].** Prompted by the user pointing at gxpy's
+`Coordinate_system` class and the GX developer wiki (S24). gxpy wraps the
+compiled `GXIPJ` API and defines a coordinate system by five GXF strings:
+
+- name;
+- datum: `name, semi-major axis, eccentricity, prime meridian`;
+- projection: `method, parameters`;
+- units: `name, factor`;
+- local datum transform: `name, dX, dY, dZ, Rx, Ry, Rz, scale`.
+
+The registry's `_PJ_*` keys are exactly these strings. GXF Revision 3
+(S23) defines them, and its Table 1 lists every method's parameters.
+
+- **Parameter slot names** come from Table 1, in order, with unused
+  EPSG parameters kept as unset binary slots. This upgrades the Lambert
+  (2SP) and Polar Stereographic names from [LIKELY] to [CONFIRMED].
+- **Datum-transform parameters at `+396..+451`**, identified from files
+  with non-zero transforms:
+
+  | File | Datum | Registry text | Binary |
+  |---|---|---|---|
+  | `DB_EM_MountGordon_1003` | AGD66 | `-129.193,-41.212,130.73,0.246,0.374,0.329,-2.955...` | `-129.193, -41.212, 130.73, 1.19264e-06, 1.81320e-06, 1.59504e-06, 0.999997045` |
+  | `fortymile_linedata` | NAD27 | `-5,135,172,0,0,0,0` | `-5, 135, 172, 0, 0, 0, 1.0` |
+  | `GDR_clmag` | Herat North | `-333,-222,114,0,0,0,0` | `-333, -222, 114, 0, 0, 0, 1.0` |
+
+  The rotations are radians: they convert back to exactly 0.246, 0.374
+  and 0.329 arc-seconds. The scale is `1 + ppm/10⁶`. The text's
+  `-2.95500000002669` is that conversion's float noise, so the text is
+  derived from the binary.
+- **`+324` prime meridian** (0.0 on 106 of 106).
+- **`+452` units name, 64-byte field.** `m` on all 68 projected objects,
+  `dega` on all 38 geographic ones.
+- **`+516` units factor** (1.0 everywhere).
+- **`+524` projection name, 64-byte field**, e.g. `UTM zone 11N`,
+  `Map Grid of Australia zone 54`, `*bas_polar`; empty on every
+  geographic object. It ends at `+588`, where the parameter vector
+  begins.
+
+Member 0 is now: name `+104` (64 bytes), method `+168`, zeros
+`+172..+179`, datum `+180` (64), ellipsoid `+244` (64), `a` `+308`, `e`
+`+316`, prime meridian `+324`, transform name `+332` (64), transform
+parameters `+396` (7 doubles), units `+452` (64), units factor `+516`,
+projection name `+524` (64), parameters `+588` (8 doubles), ending at
+`+652`.
+
+**`_PJ_PROJECTION` text lists the parameter vector's set slots in order
+-- [CONFIRMED], 43 of 43.** Text is matched to an IPJ object by the
+registry's `_PJ_NAME` (a quoted copy of the object's name). 43 of the
+corpus's 50 projected objects have it:
+
+| Method | Objects | Text values = set slots, in order |
+|---|---|---|
+| Transverse Mercator (11) | 41 | 41 |
+| Lambert Conic Conformal (2SP) (3) | 1 | 1 |
+| Polar Stereographic (14) | 1 | 1 |
+
+The other 7 have none: three in `AG106386`, one each in `DB_Mag_1212` and
+`DB_Mag_1213`, and both systems in `Brunt_mag_2017`. No geographic object
+has `_PJ_PROJECTION` text. Combined with Table 1, the text names the
+values of a method whose code has no known layout. The reader does this,
+keeping the binary's values (spec §8).
+
+**No transform: dX unset -- [CONFIRMED], 5 of 5.** An object whose
+transform-name field is empty holds dX = `rDUMMY` and dY..Rz = 0, scale
+= 1:
+
+- the three `GDA2020` systems in `AG106386`;
+- `NAD83(2011)` in `HawthorneGrav_wMasks_MF20240116`;
+- `NAD83` in `long_valley_ed`.
+
+A `WGS 84` datum holds all zeros and scale 1 instead. All 25
+transforms with registry text convert to it (arc-seconds, ppm) within
+1e-6.
 
 **IPJ member 0: a 64-byte name field and a type word -- [CONFIRMED]
 layout.**

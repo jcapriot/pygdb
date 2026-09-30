@@ -510,6 +510,10 @@ def _inject_ipj_blob_full(
     method: int = None,
     slots: list = None,
     gate_tag: bytes = b" JPI",
+    prime_meridian: float = 0.0,
+    transform: tuple = (_IPJ_DUMMY, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+    units: tuple = ("m", 1.0),
+    projection_name: str = None,
 ) -> bytes:
     """
     An IPJ registry object shaped like a real one (docs/spec.md section 8):
@@ -517,7 +521,9 @@ def _inject_ipj_blob_full(
     field (+44), the `" JPI"` name marker at +96 (`" JPI"` + int32(1) +
     name + NUL -- the same position real files were found to use it at),
     the projection-method code at +168, the geodetic fields at +180/+244/
-    +308/+316/+332, and eight float64 parameter slots at +588..+651.
+    +308/+316/+324/+332, the raw Bursa-Wolf doubles at +396 (default: the
+    real "no transform" shape, dX unset), units at +452/+516, projection
+    name at +524, and eight float64 parameter slots at +588..+651.
 
     By default a Transverse Mercator object (method 11) is built from the
     named keywords, laid out in that method's slots; with no
@@ -555,6 +561,12 @@ def _inject_ipj_blob_full(
         write_cstr(332, datum_transform_name)
     struct.pack_into("<d", blob, 308, semi_major_axis)
     struct.pack_into("<d", blob, 316, eccentricity)
+    struct.pack_into("<d", blob, 324, prime_meridian)
+    struct.pack_into("<7d", blob, 396, *transform)
+    write_cstr(452, units[0])
+    struct.pack_into("<d", blob, 516, units[1])
+    if projection_name is not None:
+        write_cstr(524, projection_name)
     struct.pack_into("<8d", blob, 588, *[_IPJ_DUMMY if v is None else v for v in slots])
     return bytes(data) + bytes(blob)
 
@@ -569,7 +581,7 @@ _UTM54S = dict(
 def test_find_projection_parameters_extracts_a_full_projection(tmp_path):
     page_size = 1024
     data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
-    data = _inject_ipj_blob_full(data, 50, page_size, **_UTM54S)
+    data = _inject_ipj_blob_full(data, 50, page_size, projection_name="UTM zone 54S", **_UTM54S)
     path = tmp_path / "ipj.gdb"
     path.write_bytes(data)
 
@@ -581,6 +593,15 @@ def test_find_projection_parameters_extracts_a_full_projection(tmp_path):
             central_meridian=141.0, scale_factor=0.9996, false_easting=500000.0, false_northing=10000000.0,
             method_code=11, latitude_of_origin=0.0,
             parameters=(0.0, 141.0, None, None, 0.9996, 500000.0, 10000000.0, None),
+            method="Transverse Mercator",
+            method_parameters={
+                "latitude_of_natural_origin": 0.0, "longitude_of_natural_origin": 141.0,
+                "scale_factor_at_natural_origin": 0.9996, "false_easting": 500000.0,
+                "false_northing": 10000000.0,
+            },
+            parameter_source="binary",
+            prime_meridian=0.0, datum_transform_parameters=None,
+            units_name="m", units_factor=1.0, projection_name="UTM zone 54S",
         )
     }
 
@@ -747,6 +768,167 @@ def test_find_projection_parameters_bad_magic_returns_empty(tmp_path):
     path.write_bytes(b"NOPE" + b"\x00" * 60)
     with pytest.warns(GDBParseWarning):
         assert find_projection_parameters(str(path)) == {}
+
+
+# An Oblique Stereographic system (Amersfoort / RD New's public EPSG
+# values) under a method code this reader has no slot layout for.
+_RD_NEW_NAME = "Amersfoort / RD New"
+_RD_NEW_SLOTS = [52.1561605555556, 5.38763888888889, None, None, 0.9999079, 155000.0, 463000.0, None]
+_RD_NEW_TEXT = '"Oblique Stereographic",52.1561605555556,5.38763888888889,0.9999079,155000,463000'
+
+
+def _projection_file(tmp_path, method, slots, texts, **fields):
+    """An IPJ object plus one REG object per `_PJ_PROJECTION` text,
+    registered under the IPJ object's own name (quoted, as real files
+    store `_PJ_NAME`)."""
+    page_size = 1024
+    fields = dict(_UTM54S, **fields)
+    data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
+    data = _inject_ipj_blob_full(data, 50, page_size, method=method, slots=slots, **fields)
+    for i, text in enumerate(texts):
+        data += _reg_flat_kv_blob(
+            51 + i, {"_PJ_NAME": f'"{fields["name"]}"', "_PJ_PROJECTION": text}, page_size,
+        )
+    path = tmp_path / "ipj.gdb"
+    path.write_bytes(data)
+    return str(path)
+
+
+def test_find_projection_parameters_names_an_unseen_method_from_its_text(tmp_path):
+    """GXF Table 1 lists a method's parameters in order, unused ones
+    omitted; the binary keeps those as unset slots. The text therefore
+    names the binary's set slots in order, whatever the method code."""
+    path = _projection_file(tmp_path, 99, _RD_NEW_SLOTS, [_RD_NEW_TEXT], name=_RD_NEW_NAME)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        params = find_projection_parameters(path)[_RD_NEW_NAME]
+    assert params.method == "Oblique Stereographic"
+    assert params.parameter_source == "text"
+    assert params.method_parameters == {
+        "latitude_of_natural_origin": 52.1561605555556,
+        "longitude_of_natural_origin": 5.38763888888889,
+        "scale_factor_at_natural_origin": 0.9999079,
+        "false_easting": 155000.0,
+        "false_northing": 463000.0,
+    }
+    # The older named fields stay limited to confirmed method codes.
+    assert params.central_meridian is None and params.false_easting is None
+
+
+def test_find_projection_parameters_takes_values_from_the_binary_not_the_text(tmp_path):
+    """The text is generated from the binary (it carries the conversion's
+    float noise, docs/spec.md section 8); a tiny rounding difference
+    still matches, and the binary's value is the one returned."""
+    slots = list(_RD_NEW_SLOTS)
+    slots[0] = 52.15616055555562
+    path = _projection_file(tmp_path, 99, slots, [_RD_NEW_TEXT], name=_RD_NEW_NAME)
+    params = find_projection_parameters(path)[_RD_NEW_NAME]
+    assert params.method_parameters["latitude_of_natural_origin"] == 52.15616055555562
+
+
+def test_find_projection_parameters_ignores_text_that_disagrees_with_the_binary(tmp_path):
+    text = '"Oblique Stereographic",52.1561605555556,5.38763888888889,0.9999079,155000,999999'
+    path = _projection_file(tmp_path, 99, _RD_NEW_SLOTS, [text], name=_RD_NEW_NAME)
+    with pytest.warns(GDBParseWarning, match="does not match its IPJ binary"):
+        params = find_projection_parameters(path)[_RD_NEW_NAME]
+    assert (params.method, params.method_parameters, params.parameter_source) == (None, {}, None)
+    assert params.parameters == tuple(_RD_NEW_SLOTS)
+
+
+def test_find_projection_parameters_uses_the_text_that_matches(tmp_path):
+    """A stale text for the same name (append-only storage) is passed
+    over, without a warning, when another one matches."""
+    stale = '"Oblique Stereographic",0,0,1,0,0'
+    path = _projection_file(tmp_path, 99, _RD_NEW_SLOTS, [_RD_NEW_TEXT, stale], name=_RD_NEW_NAME)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        params = find_projection_parameters(path)[_RD_NEW_NAME]
+    assert params.parameter_source == "text"
+
+
+def test_find_projection_parameters_rejects_text_naming_a_different_method(tmp_path):
+    """A confirmed method code wins over text that names another method,
+    even when the values line up."""
+    slots = [0.0, 141.0, None, None, 0.9996, 500000.0, 10000000.0, None]
+    text = '"Oblique Stereographic",0,141,0.9996,500000,10000000'
+    path = _projection_file(tmp_path, 11, slots, [text])
+    with pytest.warns(GDBParseWarning, match="does not match"):
+        params = find_projection_parameters(path)["WGS 84 / UTM zone 54S"]
+    assert (params.method, params.parameter_source) == ("Transverse Mercator", "binary")
+
+
+def test_find_projection_parameters_text_method_outside_table_1_is_unnamed(tmp_path):
+    """A method name GXF Table 1 doesn't list (e.g. a user-defined one)
+    gives the method's name but no parameter names."""
+    slots = [1.0, 2.0, None, None, None, None, None, None]
+    path = _projection_file(tmp_path, 99, slots, ['"*My projection",1,2'])
+    params = find_projection_parameters(path)["WGS 84 / UTM zone 54S"]
+    assert (params.method, params.method_parameters, params.parameter_source) == ("*My projection", {}, None)
+
+
+def test_find_projection_parameters_known_code_with_matching_text(tmp_path):
+    """Real (every text-bearing object in the corpus, 43 of 43): the text
+    and the confirmed binary layout name the same slots."""
+    slots = [-71.0, 0.0, None, None, 0.994, 0.0, 2082760.109, None]
+    path = _projection_file(tmp_path, 14, slots, ['"Polar Stereographic",-71,0,0.994,0,2082760.109'])
+    params = find_projection_parameters(path)["WGS 84 / UTM zone 54S"]
+    assert params.parameter_source == "text"
+    assert params.method_parameters == {
+        "latitude_of_natural_origin": -71.0, "longitude_of_natural_origin": 0.0,
+        "scale_factor_at_natural_origin": 0.994, "false_easting": 0.0,
+        "false_northing": 2082760.109,
+    }
+
+
+def test_find_projection_parameters_lambert_binary_layout_names(tmp_path):
+    slots = [30.0, 38.0, 0.0, 66.0, None, 0.0, 0.0, None]
+    path = _projection_file(tmp_path, 3, slots, [])
+    params = find_projection_parameters(path)["WGS 84 / UTM zone 54S"]
+    assert params.method == "Lambert Conic Conformal (2SP)"
+    assert params.method_parameters == {
+        "latitude_of_first_standard_parallel": 30.0,
+        "latitude_of_second_standard_parallel": 38.0,
+        "latitude_of_false_origin": 0.0, "longitude_of_false_origin": 66.0,
+        "easting_at_false_origin": 0.0, "northing_at_false_origin": 0.0,
+    }
+
+
+def test_find_projection_parameters_geographic(tmp_path):
+    page_size = 1024
+    data = build_gdb_bytes(CHANNELS, LINES, page_size=page_size)
+    data = _inject_ipj_blob_full(
+        data, 50, page_size, name="GDA2020", datum_name="GDA2020",
+        ellipsoid_name="GRS 1980", semi_major_axis=6378137.0, eccentricity=0.0818191910428158,
+        units=("dega", 1.0),
+    )
+    path = tmp_path / "ipj.gdb"
+    path.write_bytes(data)
+    params = find_projection_parameters(str(path))["GDA2020"]
+    assert (params.method, params.method_parameters, params.parameter_source) == ("Geographic", {}, "binary")
+    assert (params.units_name, params.projection_name) == ("dega", None)
+
+
+def test_find_projection_parameters_converts_the_datum_transform_to_gxf_units(tmp_path):
+    """Real (docs/spec.md section 8): the binary stores rotations in
+    radians and scale as a multiplier; the registry text, and GXF, use
+    arc-seconds and ppm. `AGD66 to WGS 84 (12)`'s values."""
+    arcsec = math.pi / 180.0 / 3600.0
+    raw = (-129.193, -41.212, 130.73, 0.246 * arcsec, 0.374 * arcsec, 0.329 * arcsec, 0.999997045)
+    fields = dict(name="AGD66 / AMG zone 54", datum_name="AGD66", datum_transform_name="AGD66 to WGS 84 (12)")
+    path = _projection_file(tmp_path, 11, [0.0, 141.0, None, None, 0.9996, 500000.0, 10000000.0, None],
+                            [], transform=raw, **fields)
+    params = find_projection_parameters(path)["AGD66 / AMG zone 54"]
+    assert params.datum_transform_parameters == pytest.approx(
+        (-129.193, -41.212, 130.73, 0.246, 0.374, 0.329, -2.955), abs=1e-9,
+    )
+
+
+def test_find_projection_parameters_no_transform_is_none(tmp_path):
+    """Real (5 corpus objects, all without a transform name): dX holds
+    the unset sentinel and the rest keep their defaults (0, and 1 for
+    the scale)."""
+    path = _projection_file(tmp_path, 11, [0.0, 141.0, None, None, 0.9996, 500000.0, 10000000.0, None], [])
+    assert find_projection_parameters(path)["WGS 84 / UTM zone 54S"].datum_transform_parameters is None
 
 
 # -- find_channel_makers / find_display_lists (docs/spec.md section 9) --------

@@ -264,6 +264,48 @@ def test_projection_parameters_polar_stereographic_and_second_lambert(samples_di
     assert lcc.method_code == 3
     assert (lcc.standard_parallel_1, lcc.standard_parallel_2) == (-82.0, -78.0)
     assert (lcc.latitude_of_origin, lcc.central_meridian) == (-80.0, -81.0)
+    assert (ps.method, ps.projection_name) == ("Polar Stereographic", "*bas_polar")
+    assert ps.method_parameters["latitude_of_natural_origin"] == -71.0
+    assert lcc.method_parameters["latitude_of_false_origin"] == -80.0
+
+
+def test_projection_text_agrees_with_binary_on_every_real_file(all_gdb_sample_paths):
+    """
+    Regression for the naming rule in docs/spec.md section 8: a
+    registry's `_PJ_PROJECTION` text lists the binary's set parameter
+    slots in order (43 of 43 corpus objects with text). No real file
+    should trip the mismatch warning, and every projected object with a
+    known method code is named from one source or the other.
+    """
+    from pygdb.registry import find_projection_parameters
+    mismatches, unnamed = [], []
+    for path in all_gdb_sample_paths:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            params = find_projection_parameters(path)
+        mismatches += [f"{_basename(path)}: {w.message}" for w in caught if "_PJ_PROJECTION" in str(w.message)]
+        unnamed += [f"{_basename(path)}: {n}" for n, p in params.items()
+                    if p.method_code in (1, 3, 11, 14) and p.parameter_source is None]
+    assert not mismatches, "\n".join(mismatches)
+    assert not unnamed, "\n".join(unnamed)
+
+
+def test_projection_datum_transform_matches_registry_text(samples_dir):
+    """
+    docs/spec.md section 8: `DB_EM_MountGordon_1003`'s `AGD66 to WGS 84
+    (12)` transform, stored with rotations in radians and scale as a
+    multiplier, converts back to its registry text
+    `-129.193,-41.212,130.73,0.246,0.374,0.329,-2.955...`.
+    """
+    path = os.path.join(samples_dir, "GSQ_Data", "extracted", "mountgordon", "em001003",
+                        "DB_EM_MountGordon_1003.gdb")
+    if not os.path.exists(path):
+        pytest.skip("DB_EM_MountGordon_1003.gdb not present locally")
+    transforms = {p.datum_transform_name: p.datum_transform_parameters
+                  for p in GDB(path).projection_parameters.values()}
+    assert transforms["AGD66 to WGS 84 (12)"] == pytest.approx(
+        (-129.193, -41.212, 130.73, 0.246, 0.374, 0.329, -2.955), abs=1e-6,
+    )
 
 
 def test_every_real_file_has_reg_or_ipj_content(all_gdb_sample_paths):
