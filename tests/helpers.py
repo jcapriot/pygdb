@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 import struct
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Union
 
 SYMBOL_RECORD_SIZE = 128
@@ -106,11 +106,15 @@ def pack_plain_blob(
     string_width: Optional[int] = None,
     page_size: int = 64,
     timestamp: int = 0,
+    fid_start: float = 0.0,
+    fid_increment: float = 1.0,
 ) -> bytes:
     """
     A complete, page-padded DB_COMP_NONE blob: 48-byte header + raw
     values + zero padding out to a whole number of `page_size` pages
-    (docs/spec.md section 6.3).
+    (docs/spec.md section 6.3). The channel's fiducial start and
+    increment go at `+24`/`+32`; the defaults, 0.0 and 1.0, write the
+    same bytes this builder always has.
     """
     data = _encode_values(values, dtype_code, string_width)
     n_pages = max(1, math.ceil((BLOB_HEADER_SIZE + len(data)) / page_size))
@@ -121,7 +125,8 @@ def pack_plain_blob(
     struct.pack_into("<i", header, 12, blob_index)
     struct.pack_into("<i", header, 16, timestamp)
     struct.pack_into("<i", header, 20, 200)
-    struct.pack_into("<d", header, 32, 1.0)
+    struct.pack_into("<d", header, 24, fid_start)
+    struct.pack_into("<d", header, 32, fid_increment)
     struct.pack_into("<i", header, 40, len(values))
     struct.pack_into("<i", header, 44, dtype_code if dtype_code >= 0 else 5)
     blob = bytes(header) + data
@@ -145,6 +150,10 @@ class LineSpec:
     # line; a channel omitted here has no blob at all (a real, common,
     # sparse case -- docs/spec.md section 1).
     data: dict
+    # channel name -> (fiducial start, fiducial increment) for that
+    # channel's blob on this line; a channel omitted here gets the
+    # builder's default (0.0, 1.0).
+    fiducials: dict = field(default_factory=dict)
 
 
 def build_gdb_bytes(
@@ -155,6 +164,7 @@ def build_gdb_bytes(
     comp_level: int = 0,
     super_name: str = "SUPER",
     line_table_prefix: bytes = b"",
+    compressed: bool = False,
 ) -> bytes:
     """
     Assemble a complete, minimal, byte-exact synthetic `.gdb` file:
@@ -172,8 +182,12 @@ def build_gdb_bytes(
     forward by `len(line_table_prefix) // SYMBOL_RECORD_SIZE`, exactly
     as it would for a real file with such a prefix.
 
+    `compressed=True` writes every blob as a one-chunk DB_COMP_SIZE blob
+    (`pack_size_compressed_blob`, numeric channels only) and, if
+    `comp_level` is left at 0, sets it to 2 (DB_COMP_SIZE) in the header.
+
     Deliberately does not attempt every real-world variant this format
-    has (compression, VA sub-array grouping beyond a flat value list,
+    has (Speed compression, VA sub-array grouping beyond a flat value list,
     the REG/IPJ registry, older-file quirks) -- those are covered by
     smaller, targeted byte fragments elsewhere in this test suite
     instead of folding everything into one mega-builder.
@@ -203,9 +217,17 @@ def build_gdb_bytes(
             if c.name not in line.data:
                 continue
             blob_index = (line_index + phantom_lines) * chans_max + chan_index
+            fid_start, fid_increment = line.fiducials.get(c.name, (0.0, 1.0))
+            if compressed:
+                blobs += pack_size_compressed_blob(
+                    blob_index, line.data[c.name], c.dtype_code, page_size=page_size,
+                    fid_start=fid_start, fid_increment=fid_increment,
+                )
+                continue
             blobs += pack_plain_blob(
                 blob_index, line.data[c.name], c.dtype_code,
                 string_width=c.string_width, page_size=page_size,
+                fid_start=fid_start, fid_increment=fid_increment,
             )
 
     total_size = blob_start + len(blobs)
@@ -216,7 +238,7 @@ def build_gdb_bytes(
     struct.pack_into("<i", buf, 40, users_max)
     struct.pack_into("<i", buf, 100, page_size)
     struct.pack_into("<i", buf, 108, blob_start // page_size)
-    struct.pack_into("<i", buf, 120, comp_level)
+    struct.pack_into("<i", buf, 120, comp_level or (2 if compressed else 0))
 
     buf[channel_table_start:channel_table_start + len(channel_table)] = channel_table
     buf[user_table_start:user_table_start + len(user_table)] = user_table
@@ -426,6 +448,36 @@ def pack_size_chunk_wrapper(payload: bytes) -> bytes:
     return header + zlib.compress(payload)
 
 
+def pack_size_compressed_blob(
+    blob_index: int,
+    values: Sequence[Union[int, float]],
+    dtype_code: int,
+    page_size: int = 64,
+    fid_start: float = 0.0,
+    fid_increment: float = 1.0,
+) -> bytes:
+    """
+    A complete, page-padded DB_COMP_SIZE data blob: the 56-byte
+    compressed header (docs/spec.md section 7.4) -- blob class 202 at
+    `+20`, decompressed size at `+24`, chunk span at `+28`, the
+    fiducial start and increment at `+32`/`+40`, row count at `+48`,
+    type code at `+52` -- then one zlib chunk, zero-padded to whole
+    pages. Numeric channels only.
+    """
+    data = _encode_values(values, dtype_code, None)
+    chunk = pack_size_chunk_wrapper(data)
+    n_pages = max(1, math.ceil((56 + len(chunk)) / page_size))
+    header = bytearray(56)
+    header[0:4] = BLOB_MAGIC
+    struct.pack_into("<iiii", header, 4, n_pages, n_pages, blob_index, 0)
+    struct.pack_into("<i", header, 20, 202)
+    struct.pack_into("<ii", header, 24, len(data), len(chunk))
+    struct.pack_into("<dd", header, 32, fid_start, fid_increment)
+    struct.pack_into("<ii", header, 48, len(values), dtype_code)
+    blob = bytes(header) + chunk
+    return blob + b"\x00" * (n_pages * page_size - len(blob))
+
+
 def pack_speed_chunk_wrapper(payload: bytes, decompressed_length: int, marker: int) -> bytes:
     """
     The 16-byte shared magic + DB_COMP_SPEED subtype, then the 12-byte
@@ -450,15 +502,24 @@ def pack_speed_continuation_chunk(payload: bytes, decompressed_length: int, mark
     return struct.pack("<iii", decompressed_length, 12 + len(payload), marker) + payload
 
 
-def pack_compressed_blob_header(total_decompressed_length: int) -> bytes:
+def pack_compressed_blob_header(
+    total_decompressed_length: int,
+    fid_start: Optional[float] = None,
+    fid_increment: Optional[float] = None,
+) -> bytes:
     """
     The 56-byte header preceding a compressed blob's chunk chain
     (docs/spec.md section 7.4), zero-filled except for the one field
     the reader needs: `+24`, the blob's total decompressed size across
-    every chunk.
+    every chunk. With `fid_start`/`fid_increment`, also the blob class
+    (202, `+20`) and the channel's fiducial pair at `+32`/`+40`.
     """
     header = bytearray(56)
     struct.pack_into("<i", header, 24, total_decompressed_length)
+    if fid_start is not None:
+        header[0:4] = BLOB_MAGIC
+        struct.pack_into("<i", header, 20, 202)
+        struct.pack_into("<dd", header, 32, fid_start, fid_increment)
     return bytes(header)
 
 

@@ -1065,6 +1065,20 @@ BLOB_HEADER_SIZE = 48  # [CONFIRMED] -- see docs/provenance/notes.md section 6.6
 # known real constant value 5027.
 COMPRESSED_BLOB_HEADER_SIZE = 56
 
+# Blob class at header +20 -- [CONFIRMED], docs/spec.md section 6.3: 200
+# for a plain data blob (DB_COMP_NONE, and the "bare" blobs of a
+# compressing file), 202 for a compressed one, 100 for an administrative
+# blob.
+_BLOB_CLASS_PLAIN = 200
+_BLOB_CLASS_COMPRESSED = 202
+
+# Where a data blob's header keeps its channel's fiducial start and
+# increment (two float64s), by blob class -- docs/spec.md sections 6.3 and
+# 7.4. Both header layouts end in the same four fields (fiducial start,
+# fiducial increment, row count, GS type code); the compressed header's
+# two extra int32 size fields at +24/+28 put them 8 bytes later.
+_FIDUCIAL_OFFSET = {_BLOB_CLASS_PLAIN: 24, _BLOB_CLASS_COMPRESSED: 32}
+
 
 @dataclass
 class BlobHeader:
@@ -1085,15 +1099,33 @@ class BlobHeader:
     timestamp : int
         **[LIKELY]**, modern files only -- see Notes.
     reserved_200 : int
-        **[UNKNOWN]**.
+        The blob class at `+20`: 200 plain data, 202 compressed data,
+        100 administrative -- **[CONFIRMED]**, docs/spec.md section 6.3
+        (the field keeps its older name).
     scale : float
-        **[LIKELY]**, modern files only.
+        The float64 at `+32`, read the same way for every blob. In a
+        plain blob it is the fiducial increment, in a compressed blob
+        the fiducial start (see `fid_increment`/`fid_start`, which read
+        the right offset for each blob class). Kept under its older name.
     row_count : int
-        **[CONFIRMED]**, modern files only (verified against real
-        ground-truth-matching decoded values).
+        **[CONFIRMED]**, modern plain blobs only (verified against real
+        ground-truth-matching decoded values). In a compressed blob
+        `+40` is part of the fiducial increment and the row count sits
+        at `+48` (docs/provenance/notes.md section 6.6e).
     gs_type_code : int
         **[CONFIRMED]**, modern files only (matches owning channel's
         own symbol-table dtype exactly).
+    fid_start : float or None
+        The fiducial of this channel's first row on this line: the
+        float64 at `+24` in a plain blob, `+32` in a compressed one.
+        **[CONFIRMED]** for compressed blobs, **[LIKELY]** for plain
+        ones (docs/spec.md sections 6.3 and 7.4). `None` where the pair
+        doesn't decode: an administrative blob, an older file whose
+        header tail isn't this layout, or a non-finite value.
+    fid_increment : float or None
+        The fiducial step from one row to the next: the float64 right
+        after `fid_start`. Same ratings; `None` with `fid_start`, or
+        when it isn't a positive, finite number.
 
     Notes
     -----
@@ -1105,6 +1137,14 @@ class BlobHeader:
     and are known NOT to decode sensibly at these byte offsets in at
     least one real older (1991 GSQ) file -- kept here for the modern
     (2020 USGS) case where they were verified, not assumed general.
+    `fid_start`/`fid_increment` are gated so that such a file gives
+    `None` rather than a wrong number (`_parse_fiducial`).
+
+    The fiducials describe the rows as the file records them. They are
+    not used to move any channel's values: a real file has a channel
+    with no creation record (unlike the file's other channels) whose
+    values match another channel's row for row while its fiducial
+    start differs (docs/provenance/notes.md section 6.6g).
     """
 
     offset: int
@@ -1116,6 +1156,8 @@ class BlobHeader:
     scale: float
     row_count: int
     gs_type_code: int
+    fid_start: Optional[float] = None
+    fid_increment: Optional[float] = None
 
     def line_channel(self, chans_max: int):
         """
@@ -1159,12 +1201,39 @@ def _parse_blob_header(raw: bytes, offset: int) -> Optional[BlobHeader]:
     scale = struct.unpack_from("<d", raw, 32)[0]
     row_count = struct.unpack_from("<i", raw, 40)[0]
     gs_type_code = struct.unpack_from("<i", raw, 44)[0]
+    fid_start, fid_increment = _parse_fiducial(raw, reserved_200)
     return BlobHeader(
         offset=offset, n_pages=n_pages, n_pages_dup=n_pages_dup,
         blob_index=blob_index, timestamp=timestamp,
         reserved_200=reserved_200, scale=scale, row_count=row_count,
         gs_type_code=gs_type_code,
+        fid_start=fid_start, fid_increment=fid_increment,
     )
+
+
+def _parse_fiducial(raw: bytes, blob_class: int) -> Tuple[Optional[float], Optional[float]]:
+    """
+    A data blob's fiducial `(start, increment)` from its header, or `(None, None)`.
+
+    The pair is read only where the header is known to have this layout
+    (docs/spec.md sections 6.3 and 7.4): a plain blob (class 200) whose
+    `+44` holds a valid `GS_*` type code -- the older files where that
+    field decodes as nonsense fail this -- or a compressed blob (class
+    202), whose type code sits at `+52`, past the 48 bytes parsed here.
+    An increment that isn't positive and finite, or a start that isn't
+    finite, also gives `(None, None)`.
+    """
+    offset = _FIDUCIAL_OFFSET.get(blob_class)
+    if offset is None:
+        return None, None
+    if blob_class == _BLOB_CLASS_PLAIN:
+        type_code = struct.unpack_from("<i", raw, 44)[0]
+        if not (type_code in GS_TYPE_NAMES or -256 <= type_code < 0):
+            return None, None
+    start, increment = struct.unpack_from("<dd", raw, offset)
+    if not (np.isfinite(start) and np.isfinite(increment) and increment > 0):
+        return None, None
+    return float(start), float(increment)
 
 
 def blob_region_start(data: bytes) -> Optional[int]:

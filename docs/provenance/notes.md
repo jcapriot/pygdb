@@ -3379,6 +3379,98 @@ identified, or a flag in a place not yet examined" -- was right in kind. The
 data-driven fallback this paragraph declined to implement was later implemented
 as `row_order`, then removed.
 
+### 6.6g The blob header's fiducial start and increment -- [CONFIRMED] in compressed blobs, [LIKELY] in plain ones; and why the compressed `+40` is not a row count
+
+*(Session 17. Prompted by a privately held helicopter TEM database whose
+lines had two constant channels 9 rows shorter than the rest, which raised
+the question of where those rows fall. The files are not public and are
+described here only by kind; every claim is about bytes and is checked
+against the files' own channel values.)*
+
+**Both data blob headers end in the same four fields.** Plain (class 200,
+48 bytes) and compressed (class 202, 56 bytes) headers end in a fiducial
+start (float64), a fiducial increment (float64), a row count (int32) and a
+`GS_*` type code (int32). The compressed header's two int32 size fields at
+`+24`/`+28` (section 6.6e) push them 8 bytes later:
+
+| Field | Plain | Compressed |
+|---|---|---|
+| fiducial start | `+24` | `+32` |
+| fiducial increment | `+32` | `+40` |
+| row count | `+40` | `+48` |
+| type code | `+44` | `+52` |
+
+**Evidence.** Seven private databases (two 10 Hz helicopter TEM databases,
+an AEM inversion export, four borehole databases; 4,883 compressed and 180
+plain data blobs):
+
+- On every data blob, the pair decodes to a finite start and a positive,
+  finite increment, and the row count and type code after it match the
+  decoded data and the owning channel's dtype (5,052 of 5,052 checkable
+  blobs; 11 more sit on lines or channels not in the tables and could not
+  be decoded by name). The two fields already [CONFIRMED] (sections 6.3,
+  6.6e) therefore fix where the pair sits.
+- In the two TEM databases (1,176 compressed data blobs, increment 0.1),
+  84 blobs belong to channels whose values are exactly `start + k x
+  increment` on every row of the line, using that blob's own pair.
+- The increments seen are 0.1 (the TEM databases) and 1.0 (everything
+  else). Starts are whole numbers in the borehole and inversion files.
+
+One TEM header, for a channel on a 3,548-row line (blob index 1703):
+
+```
+cccc00ff 13000000 13000000 a7060000 00000080 ca000000 e06e0000 b14a0000
+33333333 1351f140 9a999999 9999b93f
+```
+
+`+20` = `0xca` = 202 (compressed); `+24` = 28,384 bytes decompressed (3,548
+float64); `+32` = 70929.2; `+40` = 0.1. Read as an int32, `+40` is
+`0x9999999a` = -1,717,986,918.
+
+**This corrects two earlier readings.** Section 6.3's plain `+24..31`
+("zero in some real files, non-zero in others", [UNKNOWN]) is the fiducial
+start, and `+32` ("1.0 in modern files ... scale factor", [LIKELY]) is the
+fiducial increment, whose default is 1.0. Section 7.4's compressed `+40`
+("float64 1.0, same scale-factor convention", [LIKELY]) is also the
+increment, and the TEM files' 0.1 there cannot be a scale factor: their
+values decode correctly with no scaling. The compressed `+32` was not
+listed.
+
+**A real reader bug followed from it.** `BlobHeader` parses every blob with
+the plain layout, so a compressed blob's `row_count` is read from `+40`,
+the low half of the increment. That is 0 for 1.0 and 0.5 (and every other
+whole binary fraction), which is why the corpus never showed a problem, but
+`0x9999999a` for 0.1. The administrative-blob filter in
+`GDB._channels_with_data_on_line` (and `_resolve_channel_on_line`) dropped
+any blob with a negative `row_count`, so on the TEM files
+`channels_on_line` and `iter_line` returned nothing for every line, and
+`to_dataframe`/`to_xarray` returned empty results without a warning, while
+`read` by name worked. The filter now skips the test for class-202 blobs,
+which section 6.1e found only on data blobs.
+
+**Why the reader does not realign channels by fiducial.** In the inversion
+export, 24 of 161 lines have one channel whose header says it starts at
+fiducial 0 while the other 22 channels start at 52-71. All 23 have the same
+row count. That channel equals the cumulative distance along the line's
+own easting and northing **row for row** (median difference 0.000 m on
+three lines checked, correlation of the steps 1.0000), and it has no
+creation record, while the file's other channels carry the tool and
+settings that made them (section 6.8). Pairing it by fiducial would shift
+it 52-71 rows against the positions. The pair is the file's record of each
+channel's fiducials and is exposed as such (`GDB.fiducial`); moving values
+by it is left to the caller.
+
+**For the TEM file's short channels:** on the three lines in question they
+share the line's start (70929.2 on the line above) and end 9 rows early, so
+padding them at the end, as `to_dataframe` already does, is right.
+
+**Still open:** plain blobs are [LIKELY] only, from four private files; the
+corpus's plain-blob files would settle it (the integration test
+`test_fiducial_pair_decodes_on_every_modern_data_blob` checks the pair
+decodes; whether some channel matches it row for row is file-dependent).
+Whether older files keep the pair elsewhere is not known; the reader
+returns `None` for a plain blob whose `+44` isn't a `GS_*` type code.
+
 ### 6.7 REG/coordinate-system (IPJ) metadata — [CONFIRMED] located and partially decoded; full record layout [UNKNOWN]
 
 *(Session 3, continued. Prompted by a coordinator ask: REG/coordinate-

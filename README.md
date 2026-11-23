@@ -60,6 +60,8 @@ db.read("L1000", "Easting")    # random access by (line name, channel name)
                                 # -> ndarray, shape (n_rows,) for a scalar
                                 #    channel, (n_rows, array_width) for a
                                 #    VA/array channel (docs/spec.md section 5)
+db.fiducial("L1000", "Easting")  # -> (start, increment): row k is at
+                                 #    fiducial start + k * increment
 ```
 
 See [the docs](docs/index.md) for the lower-level, slot-index-based

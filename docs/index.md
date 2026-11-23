@@ -71,6 +71,8 @@ db.read("L1000", "Easting")   # random access by (line name, channel name)
                                # -> ndarray, shape (n_rows,) for a scalar
                                #    channel, (n_rows, array_width) for a
                                #    VA/array channel (docs/spec.md section 5)
+db.fiducial("L1000", "Easting")  # -> (start, increment): row k is at
+                                 #    fiducial start + k * increment
 
 for channel, values in db.iter_line("L1000"):
     print(channel.name, values[:3])

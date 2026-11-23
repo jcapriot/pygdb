@@ -873,3 +873,30 @@ def test_a_file_with_non_blob_pages_in_the_blob_region_reads(samples_dir):
     assert len(channels) == 72 and rows == 124
     assert any("skipped 97 page(s)" in m for m in messages)
     assert not any("does not point at a blob" in m for m in messages)
+
+
+def test_fiducial_pair_decodes_on_every_modern_data_blob(all_gdb_sample_paths):
+    """
+    Every compressed data blob, and every plain one whose `+44` is a
+    `GS_*` type code, carries a finite fiducial start and a positive,
+    finite increment (docs/spec.md sections 6.3 and 7.4). An older file
+    whose plain-blob tail isn't this layout may give None; that is
+    allowed, and counted rather than asserted.
+    """
+    from pygdb.gdb_reader import GS_TYPE_NAMES
+
+    failures = []
+    for path in all_gdb_sample_paths:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            db = GDB(path)
+            blobs = db._ensure_blob_index().values()
+        for blob in blobs:
+            modern = blob.reserved_200 == 202 or (
+                blob.reserved_200 == 200
+                and (blob.gs_type_code in GS_TYPE_NAMES or -256 <= blob.gs_type_code < 0)
+            )
+            if modern and blob.fid_start is None:
+                failures.append(f"{_basename(path)}: blob_index {blob.blob_index} "
+                                f"(class {blob.reserved_200}) has no usable fiducial pair")
+    assert not failures, "\n".join(failures[:20])
