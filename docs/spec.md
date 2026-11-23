@@ -704,8 +704,8 @@ fields `+0` through `+12`; **[LIKELY]**/**[UNKNOWN]** beyond that
 | `+12` | int32 | `blob_index` (§6.1) | **[CONFIRMED]** |
 | `+16` | int32 | Unix timestamp, or the sentinel `0x80000000` when unset. The sentinel is the norm in every vintage; timestamps appear on whole channels at once (`Magnetic_Data.gdb`: all 631 lines of 9 channels, 2020-03-25, the file's line date; one more channel the next day; derived channels unset) | **[LIKELY]** when-written for imported channel data; not vintage-dependent |
 | `+20` | int32 | **Blob class**: `100` administrative, `200` plain data, `202` compressed data | **[CONFIRMED]**: `202` on all 10,429 data blobs with the compressed-chunk magic after the header and `200` on all 106,681 without, both compression modes; `100` on every administrative blob, corpus-wide |
-| `+24..31` | 8 bytes | Zero in some real files, non-zero in others | **[UNKNOWN]**, varies |
-| `+32` | float64 | `1.0` in modern files examined (matches the channel-record `+108` "scale factor" convention) | **[LIKELY]** in modern files |
+| `+24` | float64 | **Fiducial start**: the fiducial of this channel's first row on this line (`BlobHeader.fid_start`, `GDB.fiducial`). Zero in many files, so it read as "zero in some files, non-zero in others" before | **[LIKELY]** in modern files: the same field as the compressed header's `+32` (§7.4), which is [CONFIRMED]; all 180 plain data blobs in four private databases read a finite start and a positive increment here, with the row count and type code after them matching the decoded data (provenance notes §6.6g) |
+| `+32` | float64 | **Fiducial increment**: the fiducial step from one row to the next. `1.0`, the default, in most files, which is why it was taken for a scale factor before | **[LIKELY]** in modern files, as `+24` |
 | `+40` | int32 | **Row count** for this specific blob | **[CONFIRMED]** in modern files (decoding exactly this many values reproduces real, ground-truth-matching data); **[UNKNOWN]** in older files, where this offset decodes nonsensically |
 | `+44` | int32 | **`GS_*` type code** for this blob's data, matching the owning channel's own symbol-table dtype | **[CONFIRMED]** in modern files; same caveat for older files |
 | `+48` | — | Real data begins here | **[CONFIRMED]** |
@@ -713,6 +713,18 @@ fields `+0` through `+12`; **[LIKELY]**/**[UNKNOWN]** beyond that
 Real row data occupies `row_count × element_width` bytes starting at
 `+48`; any remaining bytes out to `n_pages × page_size` are padding
 (observed as zero).
+
+**The header ends in the same four fields as the compressed header
+(§7.4)**: fiducial start (float64), fiducial increment (float64), row
+count (int32), `GS_*` type code (int32), at `+24` here and at `+32`
+there, where two extra int32 size fields come first. Row `k` of the
+blob's data sits at fiducial `start + k × increment`. Channels on one
+line can differ in start and length; the reader reports the pair
+(`GDB.fiducial`) and does not move any channel's values by it, because
+a real file has a channel whose values match another channel's row
+for row while its recorded start differs (provenance notes §6.6g). The
+pair is read only where `+44` holds a valid `GS_*` type code, so the
+older files where that field decodes as nonsense give `None`.
 
 ### 6.4 The reserved/administrative blob variant
 
@@ -723,7 +735,10 @@ thousands seen, well past any real survey's line count), and offset
 specific non-`GS_*` constant, `4670802`, instead of a valid type code.
 These are cleanly distinguishable and safely skipped by a reader
 (negative or implausible `row_count`, or the tell-tale `4670802`
-constant).
+constant). The negative-`row_count` test applies to the plain header
+layout only: in a compressed data blob (class 202 at `+20`), `+40` is
+the low half of the fiducial increment (§7.4) and reads negative for an
+increment such as 0.1, so a reader must not drop class-202 blobs on it.
 
 **The `4670802` constant is explained — [CONFIRMED].** It is not a
 sentinel value: read as bytes rather than an int32, it is exactly the
@@ -859,7 +874,8 @@ records, not exhaustively decoded:
 | `+0..+15` | Same magic/`n_pages`/`n_pages_dup`/`blob_index` layout as the plain header | **[CONFIRMED]** |
 | `+24` | **Total decompressed size of the blob, in bytes, across every chunk** (§7.3). For a single-chunk blob this equals the chunk's own `decompressed_length`. `DB_COMP_SIZE` blobs too: their one zlib stream decompresses to exactly this many bytes | **[CONFIRMED]** — 7,015 Speed blobs and 3,414 Size blobs in the corpus, plus every real-line blob of a separately supplied file, zero exceptions |
 | `+28` | `16 + Σ chunk_length` over the whole chain — the chain's total on-disk span including the first chunk's magic | **[CONFIRMED]** — same 7,015 Speed blobs and the separately supplied file's, zero exceptions |
-| `+40` | float64 `1.0` (same scale-factor convention as elsewhere) | **[LIKELY]** |
+| `+32` | **Fiducial start**, float64: the fiducial of this channel's first row on this line (`BlobHeader.fid_start`, `GDB.fiducial`) | **[CONFIRMED]** -- on all 1,176 data blobs of two private 10 Hz databases, start and increment reproduce, row for row, a channel on the same line whose values are exactly `start + k × increment` (provenance notes §6.6g) |
+| `+40` | **Fiducial increment**, float64: the fiducial step from one row to the next. `1.0`, the default, in most files, which is why it was read as a scale factor before | **[CONFIRMED]**, same evidence |
 | `+48` | **Real row count** of the whole blob (`+24` ÷ element width, for numeric types) | **[CONFIRMED]** for numeric channels — 7,015 of 7,015 corpus Speed blobs |
 | `+52` | `GS_*` type code | **[LIKELY]** |
 | `+56` | The 16-byte page-primitive magic (§7.1) begins here | **[CONFIRMED]** |

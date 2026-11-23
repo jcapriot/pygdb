@@ -4251,3 +4251,55 @@ helper function to see if they trigger any of the warninigs."
    `Area_G1_MAG_VTEM_2013.gdb` has one already-known, already-handled
    `GDBParseWarning` (a channel's creation record has two differing
    stale copies) -- not a new finding.
+
+## Session 17 -- each channel's fiducial start and increment, and channels lost on 10 Hz files (2026-11-18)
+
+Prompted by a privately held helicopter TEM database (10 Hz,
+Speed-compressed) in which, on three lines, two constant channels have 9
+rows fewer than every other channel. Where do those rows fall? The files
+used here are not public and are described by kind only. Byte-level
+analysis with this reader only; no Geosoft software involved.
+
+1. **Looked for a per-channel fiducial start.** On one of those lines,
+   dumped the 48 header bytes of a full-length channel's blob and of the
+   two short ones. All three had the float64 70929.2 at `+32` and 0.1 at
+   `+40`, and the line has a channel whose values run 70929.2, 70929.3, ...
+   on every row. `+24` held exactly `rows x 8` (or `x 4` for 4-byte types).
+   So the short channels start where the others do and end 9 rows early.
+2. **Found the plain layout by blob class.** In files with plain blobs
+   (class 200), `+24` and `+32` read as a whole-number start and 1.0; in
+   compressed ones (class 202), `+32` and `+40` do. With the start and
+   increment there, the row count and type code fall at `+40`/`+44`
+   (plain) and `+48`/`+52` (compressed), the positions sections 6.3 and
+   6.6e already [CONFIRMED]. Checked on seven private databases (TEM,
+   an AEM inversion export, boreholes): 5,052 of 5,052 checkable data
+   blobs match on row count and type, and every data blob's pair is a
+   finite start with a positive increment (notes section 6.6g).
+3. **Corrected two fields.** The plain header's `+24..31` ([UNKNOWN]) is
+   the fiducial start, and the "scale factor, 1.0" at plain `+32` and
+   compressed `+40` is the fiducial increment, whose default is 1.0. The
+   TEM files' 0.1 there decodes values correctly with no scaling.
+4. **Found a reader bug through it.** `channels_on_line`/`iter_line`
+   returned nothing for any line of the TEM files, and `to_dataframe`
+   gave a 0 x 0 frame, with no warning. `BlobHeader.row_count` is read at
+   `+40` for every blob; for a compressed blob that is the low half of the
+   increment, `0x9999999a` (negative) for 0.1 but 0 for 1.0, 0.5 and other
+   whole binary fractions. The administrative-blob filter dropped negative
+   row counts. Now class-202 blobs are not tested on it. Regression test
+   `test_compressed_line_with_a_tenth_fiducial_step_keeps_its_channels`
+   fails on the old code with `assert [] == ['T', 'Z']`.
+5. **Decided not to realign exports by fiducial.** In the inversion export,
+   24 of 161 lines have one channel recorded as starting at fiducial 0
+   while the line's other 22 start at 52-71, with equal row counts. Its
+   values equal the cumulative distance along the line's own easting and
+   northing row for row, and it has no creation record, unlike the other
+   channels. Realigning by fiducial would shift it against the positions.
+   Added `GDB.fiducial(line, channel)` and `BlobHeader.fid_start` /
+   `fid_increment` to report the pair; exports keep rows as recorded.
+6. **Tests.** `tests/test_fiducial.py` (synthetic: both header layouts, the
+   gates that give `None`, `GDB.fiducial`, the regression above, exports
+   unchanged); `tests/helpers.py` writes the pair in plain and compressed
+   blobs (`pack_size_compressed_blob`, `build_gdb_bytes(compressed=True)`),
+   defaults byte-identical to before; one skip-safe corpus test,
+   `test_fiducial_pair_decodes_on_every_modern_data_blob`. Full suite: 252
+   passed, 52 skipped (no local `samples/`), pure-Python path.

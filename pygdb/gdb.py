@@ -35,6 +35,7 @@ from .gdb_reader import (
     read_blob_values,
     read_channels,
     _read_lines,
+    _BLOB_CLASS_COMPRESSED,
     DIRECTORY_ABSENT,
     DIRECTORY_INVALID,
     DIRECTORY_LIVE,
@@ -74,6 +75,21 @@ _DB_COMP_CODECS = {
 # that's ambiguous). Accepted anywhere a plain name is.
 LineRef = Union[str, Tuple[str, int], "LineRecord"]
 ChannelRef = Union[str, Tuple[str, int], "ChannelRecord"]
+
+
+def _is_data_blob(blob: BlobHeader) -> bool:
+    """
+    Whether a blob holds channel data rather than an administrative record.
+
+    A negative row count at `+40` marks an administrative blob
+    (docs/spec.md section 6.4), but only in the plain header layout. In
+    a compressed blob (class 202, data only) `+40` is the low half of
+    the fiducial increment, which reads negative for an increment such
+    as 0.1 (docs/spec.md section 7.4), so it isn't tested there.
+    """
+    if blob.reserved_200 == _BLOB_CLASS_COMPRESSED:
+        return True
+    return blob.row_count is None or blob.row_count >= 0
 
 
 @dataclass
@@ -758,7 +774,7 @@ class GDB:
         return [
             (c, blob) for c in self.channels
             if (blob := index.get((line_rec.index, c.index))) is not None
-            and (blob.row_count is None or blob.row_count >= 0)
+            and _is_data_blob(blob)
         ]
 
     def _resolve_channel_on_line(
@@ -811,7 +827,7 @@ class GDB:
         with_data = [
             (c, blob) for c in matches
             if (blob := index.get((line_rec.index, c.index))) is not None
-            and (blob.row_count is None or blob.row_count >= 0)
+            and _is_data_blob(blob)
         ]
         if len(with_data) > 1:
             raise ValueError(
@@ -898,6 +914,73 @@ class GDB:
             decode-time problems, as opposed to a plain lookup-by-name
             mistake (which does raise).
         """
+        line_rec, chan_rec, blob = self._blob_for(line, channel)
+        if blob is None:
+            return np.array([])
+        return read_blob_values(
+            self.path, blob, chan_rec,
+            comp_level=self.comp_level or 0, page_size=self.page_size,
+            file=self._file,
+        )
+
+    def fiducial(self, line: LineRef, channel: ChannelRef) -> Optional[Tuple[float, float]]:
+        """
+        The fiducial start and increment the file records for `channel` on `line`.
+
+        Row `k` of `read(line, channel)` sits at fiducial `start + k *
+        increment`. Channels on one line can differ in start (a channel
+        whose data begins later) and in length, so this is how to tell
+        where each one's rows fall.
+
+        Parameters
+        ----------
+        line : str or tuple or LineRecord
+            As for `read()`.
+        channel : str or tuple or ChannelRecord
+            As for `read()`.
+
+        Returns
+        -------
+        tuple of (float, float) or None
+            `(start, increment)` from the channel's data blob header
+            (`BlobHeader.fid_start`/`fid_increment`, docs/spec.md
+            sections 6.3 and 7.4), or `None` when the pair isn't there
+            to read: no data blob for this (line, channel), or a header
+            that doesn't carry it (an older file).
+
+        Raises
+        ------
+        KeyError
+            As for `read()`.
+        ValueError
+            As for `read()`.
+
+        Warns
+        -----
+        GDBParseWarning
+            If this (line, channel) pair has no data blob, as `read()`
+            does.
+
+        Notes
+        -----
+        This only reports what the header says; no reader method moves
+        a channel's values by it. A real file has a channel whose values
+        match another channel's row for row while its recorded start
+        differs (docs/provenance/notes.md section 6.6g), so whether to
+        line channels up by fiducial is left to the caller.
+
+        Examples
+        --------
+        >>> db.fiducial("L1000", "Easting")  # doctest: +SKIP
+        (70929.2, 0.1)
+        """
+        _line_rec, _chan_rec, blob = self._blob_for(line, channel)
+        if blob is None or blob.fid_start is None:
+            return None
+        return blob.fid_start, blob.fid_increment
+
+    def _blob_for(self, line: LineRef, channel: ChannelRef):
+        """Resolve `line`/`channel` to their records and data blob (or None, with a warning)."""
         line_rec = self._resolve_line(line)
         if isinstance(channel, ChannelRecord):
             chan_rec = channel
@@ -913,14 +996,9 @@ class GDB:
                 f"channel {chan_rec.name!r} -- this (line, channel) pair "
                 f"was likely never recorded (the format's grid is sparse, "
                 f"docs/spec.md section 1)",
-                GDBParseWarning, stacklevel=2,
+                GDBParseWarning, stacklevel=3,
             )
-            return np.array([])
-        return read_blob_values(
-            self.path, blob, chan_rec,
-            comp_level=self.comp_level or 0, page_size=self.page_size,
-            file=self._file,
-        )
+        return line_rec, chan_rec, blob
 
     def iter_line(self, line: LineRef) -> Iterator[Tuple[ChannelRecord, np.ndarray]]:
         """

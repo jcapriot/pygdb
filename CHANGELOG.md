@@ -8,6 +8,35 @@ minor releases may change behavior, patch releases fix bugs).
 The version number lives in `rust/Cargo.toml`; `pyproject.toml` reads it
 from there.
 
+## [Unreleased]
+
+### Fixed
+
+- A compressed file whose fiducial increment is not a whole binary
+  fraction (0.1 s, as in 10 Hz data with time fiducials) now lists its
+  channels. `channels_on_line` and `iter_line` returned nothing for every
+  line, so `to_dataframe` gave an empty frame and `to_xarray` an empty
+  dataset, with no warning; `read` by name still worked. The
+  administrative-blob filter read a compressed header's `+40` as a row
+  count, and there it is the low half of the fiducial increment, which
+  reads negative for 0.1.
+
+### Added
+
+- `GDB.fiducial(line, channel)`: the fiducial start and increment the file
+  records for a channel on a line, from its data blob header.
+  `BlobHeader.fid_start` and `BlobHeader.fid_increment` carry the same
+  pair, or `None` where the header doesn't (administrative blobs, older
+  files). No export moves values by it.
+
+### Changed (docs)
+
+- `docs/spec.md` sections 6.3, 6.4 and 7.4: both blob header layouts end
+  in fiducial start, fiducial increment, row count and type code (plain at
+  `+24`, compressed at `+32`). The plain header's `+24..31` ("[UNKNOWN]")
+  is the fiducial start, and the float64 read as a "scale factor, 1.0" is
+  the fiducial increment, whose default is 1.0.
+
 ## [0.4.0] - 2026-09-29
 
 ### Fixed
